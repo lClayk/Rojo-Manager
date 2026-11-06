@@ -1,0 +1,31 @@
+[package]
+name = "rojo-manager-core"
+description = "Rojo Manager's engine: projects, Rojo processes, port watching, and the local control API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Plain HTTP/1.1 servers for the loopback control and auto-connect APIs.
+tiny_http = "0.12"
+# HTTPS to GitHub and Roblox through Windows' own TLS (schannel).
+ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
+getrandom = "0.4"
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+sha2 = "0.11"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

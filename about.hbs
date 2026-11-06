@@ -1,0 +1,12 @@
+Rust crates included in Rojo Manager, grouped by license.
+{{#each licenses}}
+
+================================================================================
+{{name}} ({{id}})
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

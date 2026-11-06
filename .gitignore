@@ -1,0 +1,25 @@
+# User data and local evidence must never be published.
+config.json
+config-*.tmp
+*.log
+*-preview.png
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local tooling and generated releases.
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+.release/
+.agents/
+.codex/
+.DS_Store
+Thumbs.db
+
+# Rust builds.
+target/

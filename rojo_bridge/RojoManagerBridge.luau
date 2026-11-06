@@ -1,0 +1,167 @@
+--!strict
+-- SPDX-License-Identifier: MPL-2.0
+-- Rojo Manager bridge for the Rojo Studio plugin (https://github.com/rojo-rbx/rojo).
+--
+-- patch_rojo_plugin.luau adds this module to the official Rojo plugin on the user's machine.
+-- In Edit mode it publishes CoreGui.RojoManagerBridge, a BindableFunction that plugin code
+-- (such as robloxstudio-mcp's execute_luau) can invoke. Game scripts cannot reach CoreGui.
+--
+--   bridge:Invoke("status")              -> { status, host, port, projectName, address, error }
+--   bridge:Invoke("connect", host, port) -> status; connects in the background
+--   bridge:Invoke("disconnect")          -> status
+--   bridge:Invoke("accept" | "abort")    -> status; answers Rojo's initial sync confirmation
+--
+-- When a place opens, it also asks Rojo Manager (on a fixed local port) whether a running project
+-- with auto-connect is linked to this place, and connects to that server if so. It also tells
+-- Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
+
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+local NAME = "RojoManagerBridge"
+local VERSION = 5
+local AUTO_CONNECT_URL = "http://localhost:34871/auto-connect/"
+local REPORT_URL = "http://localhost:34871/rojo-plugins/"
+
+local published: { [any]: BindableFunction } = {}
+
+local function status(app)
+	local state = app.state or {}
+	return {
+		bridge = VERSION,
+		status = state.appStatus,
+		host = app.host:getValue(),
+		port = app.port:getValue(),
+		projectName = state.projectName,
+		address = state.address,
+		-- Rojo keeps the last error message after reconnecting; only report a current one.
+		error = if state.appStatus == "Error" then state.errorMessage else nil,
+	}
+end
+
+local function answer(app, choice: string)
+	if (app.state or {}).appStatus ~= "Confirming" then
+		error("Rojo is not waiting for a sync confirmation", 0)
+	end
+	app.confirmationBindable:Fire(choice)
+	return status(app)
+end
+
+-- End the current session. A session waiting for its sync confirmation is aborted first, so its
+-- waiting thread does not resume and apply its sync when a later session is accepted.
+local function endSession(app)
+	if (app.state or {}).appStatus == "Confirming" then
+		app.confirmationBindable:Fire("Abort")
+	end
+	if app.serveSession ~= nil then
+		app:endSession()
+	end
+end
+
+local actions = {
+	status = status,
+	connect = function(app, host: string?, port: string?)
+		-- Any plugin can call this bridge, so it only connects Rojo to servers on this computer.
+		if host ~= nil and host ~= "" and host ~= "localhost" and host ~= "127.0.0.1" then
+			error("Rojo Manager's bridge only connects to Rojo servers on this computer", 0)
+		end
+		endSession(app)
+		app.setHost(host or "")
+		app.setPort(port or "")
+		-- Starting can yield on the sync lock; return so the caller can poll status.
+		task.spawn(app.startSession, app)
+		return status(app)
+	end,
+	disconnect = function(app)
+		endSession(app)
+		return status(app)
+	end,
+	accept = function(app)
+		return answer(app, "Accept")
+	end,
+	abort = function(app)
+		return answer(app, "Abort")
+	end,
+}
+
+local function autoConnect(app)
+	if game.PlaceId == 0 then
+		return
+	end
+	local ok, response = pcall(HttpService.RequestAsync, HttpService, {
+		Url = AUTO_CONNECT_URL .. game.PlaceId,
+		Method = "GET",
+	})
+	if not ok or not response.Success then
+		return -- Rojo Manager is closed, or no running project auto-connects to this place
+	end
+	local decoded, body = pcall(HttpService.JSONDecode, HttpService, response.Body)
+	if not decoded or type(body) ~= "table" or type(body.port) ~= "number" then
+		return
+	end
+	-- Rojo's own auto-reconnect, or the user, may have connected while this request ran.
+	if app.serveSession ~= nil or (app.state or {}).appStatus ~= "NotConnected" then
+		return
+	end
+	actions.connect(app, "localhost", tostring(body.port))
+end
+
+-- Each running Rojo plugin opens one "Rojo <version>" widget.
+local function countRojoPlugins(): number
+	local count = 0
+	for _, gui in game:GetService("PluginGuiService"):GetChildren() do
+		if gui:IsA("DockWidgetPluginGui") and string.match(gui.Name, "^Rojo %d") then
+			count += 1
+		end
+	end
+	return count
+end
+
+local function reportRojoPlugins()
+	-- Other plugins finish loading after this one; give them time to open their widgets.
+	task.wait(5)
+	pcall(HttpService.RequestAsync, HttpService, {
+		Url = REPORT_URL .. countRojoPlugins(),
+		Method = "GET",
+	})
+end
+
+local Bridge = {}
+
+-- Called from App:init. Only the Edit-mode plugin is controllable.
+function Bridge.attach(app)
+	if not RunService:IsEdit() then
+		return
+	end
+	local previous = CoreGui:FindFirstChild(NAME)
+	if previous then
+		previous:Destroy()
+	end
+	local bindable = Instance.new("BindableFunction")
+	bindable.Name = NAME
+	bindable.Archivable = false
+	bindable.OnInvoke = function(action: string, ...)
+		local handler = actions[action]
+		if not handler then
+			error(`Unknown Rojo Manager bridge action: {tostring(action)}`, 0)
+		end
+		return handler(app, ...)
+	end
+	bindable.Parent = CoreGui
+	published[app] = bindable
+	-- The request yields, so the app has mounted by the time it can connect.
+	task.spawn(autoConnect, app)
+	task.spawn(reportRojoPlugins)
+end
+
+-- Called from App:willUnmount when the plugin unloads.
+function Bridge.detach(app)
+	local bindable = published[app]
+	if bindable then
+		published[app] = nil
+		bindable:Destroy()
+	end
+end
+
+return Bridge

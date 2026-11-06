@@ -1,0 +1,1397 @@
+//! The engine: projects, Rojo processes, the port watcher, logs, update checks, and tool jobs.
+//! The tray app and the control API both drive it from any thread; it reports changes through an
+//! event callback, so it runs the same whether or not a window is loaded.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value, json};
+
+use crate::config::{self, Config, Place, Settings};
+use crate::control::{ControlError, ControlHandler};
+use crate::localnet::{self, port_in_use};
+use crate::studio::{self, ResolveError};
+use crate::tooling::{self, Job, RojoState, RojoStatus};
+use crate::updates::{self, UpdateState, UpdateStatus};
+use crate::{rojo_api, startup};
+
+pub const LOG_CAP: usize = 2000;
+/// New projects take the first free port from here; 34871 is the auto-connect port.
+pub const FIRST_PORT: u16 = 34872;
+/// A crashed server is restarted at most this many times within CRASH_WINDOW.
+const CRASH_RESTARTS: usize = 3;
+const CRASH_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerState {
+    /// No server on the port.
+    Off,
+    /// A launch or restart is in flight.
+    Starting,
+    /// Running here, nothing connected.
+    Serving,
+    /// Running here with a Studio connected.
+    Connected,
+    /// A Rojo server started outside this app (or kept through a restart of it).
+    External,
+    /// Another application holds the port.
+    Blocked,
+}
+
+impl ServerState {
+    pub fn running(self) -> bool {
+        matches!(self, ServerState::Serving | ServerState::Connected | ServerState::External)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectView {
+    pub name: String,
+    pub path: String,
+    pub project_file: String,
+    pub port: u16,
+    pub autostart: bool,
+    pub auto_connect: bool,
+    pub place: Option<Place>,
+    pub state: ServerState,
+    /// Installers that apply: "Wally", then "Rokit" or "Aftman".
+    pub badges: Vec<String>,
+}
+
+/// A project as the tray menu shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayProject {
+    pub name: String,
+    pub state: ServerState,
+    /// It has a linked place to open in Studio.
+    pub linked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolJobView {
+    pub operation: String,
+    pub tool: String,
+}
+
+/// Everything a window needs to draw itself. The window process receives it as JSON; the fields
+/// that are constants of the build are not sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    #[serde(skip, default = "version")]
+    pub version: &'static str,
+    pub projects: Vec<ProjectView>,
+    pub settings: Settings,
+    pub launch_at_startup: bool,
+    pub rojo: RojoStatus,
+    pub app_update: UpdateStatus,
+    pub tool_job: Option<ToolJobView>,
+    /// Tool name -> `--version` output (None when missing); empty until first checked.
+    pub tool_versions: HashMap<String, Option<String>>,
+    #[serde(skip, default = "tools")]
+    pub tools: &'static [tooling::Tool],
+    pub studio_plugin: tooling::StudioPlugin,
+    pub creator_store_rojo: bool,
+    /// How many Rojo plugins the bridge last saw running in Studio, if it has reported.
+    pub studio_rojo_plugins: Option<u32>,
+    /// RojoManagerMCP.exe, for the agent setup commands.
+    pub mcp_path: String,
+}
+
+fn version() -> &'static str {
+    crate::VERSION
+}
+
+fn tools() -> &'static [tooling::Tool] {
+    &tooling::TOOLS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Event {
+    /// Something in the snapshot changed.
+    Changed,
+    /// A short message for the person using the app.
+    Notice(String),
+    /// A problem worth a Windows notification when the window is closed, such as a crash.
+    Alert(String),
+    /// A line of a project's Rojo output.
+    Log { project: String, seq: u64, line: String },
+}
+
+/// Changes to one project, checked as a whole before any is applied. `place: Some(None)` unlinks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Update {
+    pub name: Option<String>,
+    pub port: Option<u16>,
+    pub autostart: Option<bool>,
+    pub auto_connect: Option<bool>,
+    /// Missing keeps the place; `null` unlinks it.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    pub place: Option<Option<Place>>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+struct ToolJob {
+    view: ToolJobView,
+    /// Holds request.json and the installer's result.json; deleted with the job.
+    folder: tempfile::TempDir,
+    process: Child,
+}
+
+#[derive(Default)]
+struct State {
+    config: Config,
+    procs: HashMap<String, Child>,
+    starting: HashSet<String>,
+    restarting: HashSet<String>,
+    cancellations: HashMap<String, Arc<AtomicBool>>,
+    expected_stop: HashMap<String, bool>,
+    /// The watcher's view of each port; Starting is derived, never stored.
+    states: HashMap<String, ServerState>,
+    logs: HashMap<String, VecDeque<(u64, String)>>,
+    /// (project path, manifest mtime) whose pinned Rojo ran fine.
+    rojo_checked: HashSet<(String, Option<SystemTime>)>,
+    rojo: Option<RojoStatus>,
+    rojo_revision: u64,
+    app_update: Option<UpdateStatus>,
+    app_update_revision: u64,
+    tool_job: Option<ToolJob>,
+    tool_versions: HashMap<&'static str, Option<String>>,
+    /// Recent unexpected exits per project, for the crash restart limit.
+    crashes: HashMap<String, Vec<Instant>>,
+    studio_rojo_plugins: Option<u32>,
+}
+
+impl State {
+    fn view_state(&self, name: &str) -> ServerState {
+        let state = self.states.get(name).copied().unwrap_or(ServerState::Off);
+        // The watcher can lag a launch by a tick, so in-flight work wins.
+        if self.starting.contains(name)
+            || self.restarting.contains(name)
+            || (state == ServerState::Off && self.procs.contains_key(name))
+        {
+            ServerState::Starting
+        } else {
+            state
+        }
+    }
+
+    fn busy(&self, name: &str) -> bool {
+        self.starting.contains(name) || self.procs.contains_key(name)
+    }
+
+    fn log(&mut self, name: &str, line: String) -> u64 {
+        let buffer = self.logs.entry(name.to_string()).or_default();
+        let seq = buffer.back().map_or(0, |(seq, _)| seq + 1);
+        if buffer.len() == LOG_CAP {
+            buffer.pop_front();
+        }
+        buffer.push_back((seq, line));
+        seq
+    }
+
+    fn port(&self, name: &str) -> Result<u16, String> {
+        self.config.project(name).map(|p| p.port).ok_or_else(|| missing(name))
+    }
+}
+
+pub struct Engine {
+    state: Mutex<State>,
+    emit: Box<dyn Fn(Event) + Send + Sync>,
+    /// Folder holding ToolInstaller.exe and RojoManagerMCP.exe.
+    app_dir: PathBuf,
+    closing: AtomicBool,
+    wake: (Mutex<bool>, Condvar),
+}
+
+fn missing(name: &str) -> String {
+    format!("No project named {name}")
+}
+
+/// Rojo prints colors; logs show plain text.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+        } else if chars.clone().next() == Some('[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn manifest_key(path: &str) -> (String, Option<SystemTime>) {
+    let modified = ["rokit.toml", "aftman.toml"]
+        .iter()
+        .find_map(|file| std::fs::metadata(Path::new(path).join(file)).ok())
+        .and_then(|meta| meta.modified().ok());
+    (path.to_string(), modified)
+}
+
+fn project_files(folder: &Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_file())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".project.json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+/// Whether the Rojo server on a project's port serves that project, judged by the `name` in its
+/// project file (any name when the file cannot be read). None when no Rojo server answers.
+fn serves_project(project: &config::Project) -> Option<bool> {
+    let info = rojo_api::server_info(project.port, Duration::from_millis(500))?;
+    let file = std::fs::read(Path::new(&project.path).join(&project.project_file)).ok();
+    let value = file.and_then(|data| serde_json::from_slice::<Value>(&data).ok());
+    let name = value.as_ref().and_then(|value| value.get("name")?.as_str());
+    Some(name.is_none_or(|name| name == info.project_name))
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
+}
+
+impl Engine {
+    /// An engine for settings loaded with `config::load`; `app_dir` holds the companion executables.
+    pub fn new(config: Config, app_dir: PathBuf, emit: impl Fn(Event) + Send + Sync + 'static) -> Arc<Engine> {
+        Arc::new(Engine {
+            state: Mutex::new(State { config, ..State::default() }),
+            emit: Box::new(emit),
+            app_dir,
+            closing: AtomicBool::new(false),
+            wake: (Mutex::new(false), Condvar::new()),
+        })
+    }
+
+    /// Start the watcher and update checks, then autostart projects.
+    pub fn run(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || engine.watch());
+        self.check_rojo(false);
+        self.check_app_update(false);
+        self.refresh_tool_versions();
+        let names: Vec<String> =
+            self.lock().config.projects.iter().filter(|p| p.autostart).map(|p| p.name.clone()).collect();
+        for name in names {
+            let _ = self.start(&name);
+        }
+    }
+
+    /// Stop servers this app started; servers started elsewhere keep running.
+    pub fn shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.wake_watcher();
+        let mut state = self.lock();
+        for cancellation in state.cancellations.values() {
+            cancellation.store(true, Ordering::SeqCst);
+        }
+        let children: Vec<_> = state.procs.drain().collect();
+        let ports: Vec<u16> = children.iter().filter_map(|(name, _)| state.port(name).ok()).collect();
+        drop(state);
+        for (_, mut child) in children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // As in stop_server: the real rojo behind Rokit's shim ends a moment later. Waiting lets an
+        // update's restart start these servers again on the same ports.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ports.iter().any(|&port| port_in_use(port)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn changed(&self) {
+        (self.emit)(Event::Changed);
+    }
+
+    pub fn notice(&self, message: impl Into<String>) {
+        (self.emit)(Event::Notice(message.into()));
+    }
+
+    fn alert(&self, message: impl Into<String>) {
+        (self.emit)(Event::Alert(message.into()));
+    }
+
+    fn log(&self, name: &str, line: &str) {
+        let line = strip_ansi(line.trim_end());
+        let seq = self.lock().log(name, line.clone());
+        (self.emit)(Event::Log { project: name.to_string(), seq, line });
+    }
+
+    fn wake_watcher(&self) {
+        *self.wake.0.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.wake.1.notify_all();
+    }
+
+    fn sleep_watcher(&self, timeout: Duration) {
+        let guard = self.wake.0.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut woken, _) =
+            self.wake.1.wait_timeout_while(guard, timeout, |woken| !*woken).unwrap_or_else(|p| p.into_inner());
+        *woken = false;
+    }
+
+    // ------------------------------------------------------------- reading
+
+    fn view(state: &State, name: &str) -> Option<ProjectView> {
+        let p = state.config.project(name)?;
+        Some(ProjectView {
+            name: p.name.clone(),
+            path: p.path.clone(),
+            project_file: p.project_file.clone(),
+            port: p.port,
+            autostart: p.autostart,
+            auto_connect: p.auto_connect,
+            place: p.place,
+            state: state.view_state(&p.name),
+            badges: tooling::project_badges(Path::new(&p.path)).into_iter().map(String::from).collect(),
+        })
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let state = self.lock();
+        let projects = state.config.projects.iter().filter_map(|p| Self::view(&state, &p.name)).collect();
+        Snapshot {
+            version: crate::VERSION,
+            projects,
+            settings: state.config.settings,
+            launch_at_startup: startup::startup_enabled(),
+            rojo: state.rojo.clone().unwrap_or(RojoStatus {
+                state: RojoState::Checking,
+                message: "Checking Rojo...".into(),
+                action: None,
+            }),
+            app_update: state.app_update.clone().unwrap_or(UpdateStatus {
+                state: UpdateState::Checking,
+                message: "Checking for app updates...".into(),
+                url: updates::RELEASES_URL.into(),
+            }),
+            tool_job: state.tool_job.as_ref().map(|job| job.view.clone()),
+            tool_versions: state
+                .tool_versions
+                .iter()
+                .map(|(name, version)| (name.to_string(), version.clone()))
+                .collect(),
+            tools: &tooling::TOOLS,
+            studio_plugin: tooling::studio_plugin(),
+            creator_store_rojo: tooling::creator_store_rojo_installed(),
+            studio_rojo_plugins: state.studio_rojo_plugins,
+            mcp_path: self.app_dir.join("RojoManagerMCP.exe").display().to_string(),
+        }
+    }
+
+    pub fn project(&self, name: &str) -> Option<ProjectView> {
+        Self::view(&self.lock(), name)
+    }
+
+    /// Each project's server state, and whether it has a place to open; cheap enough for the tray.
+    pub fn tray_projects(&self) -> Vec<TrayProject> {
+        let state = self.lock();
+        let project = |p: &config::Project| TrayProject {
+            name: p.name.clone(),
+            state: state.view_state(&p.name),
+            linked: p.place.is_some(),
+        };
+        state.config.projects.iter().map(project).collect()
+    }
+
+    pub fn logs(&self, name: &str) -> Vec<(u64, String)> {
+        self.lock().logs.get(name).map(|buffer| buffer.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    // ------------------------------------------------------------- servers
+
+    /// Launch `rojo serve` for a project. Returns once the launch is underway.
+    pub fn start(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        let project = state.config.project(name).cloned().ok_or_else(|| missing(name))?;
+        // A launch that a stop cancelled may still be checking Rojo's version; it goes ahead after all.
+        if state.starting.contains(name)
+            && let Some(cancellation) = state.cancellations.get(name)
+        {
+            cancellation.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        if self.closing.load(Ordering::SeqCst) || state.busy(name) || port_in_use(project.port) {
+            return Ok(());
+        }
+        let Some(rojo) = tooling::find_tool("Rojo") else {
+            state.rojo = Some(RojoStatus {
+                state: RojoState::Missing,
+                message: "Rojo is not installed.".into(),
+                action: Some("Install Rojo".into()),
+            });
+            drop(state);
+            self.changed();
+            return Err("Rojo is not installed.".into());
+        };
+        state.starting.insert(name.to_string());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.cancellations.insert(name.to_string(), Arc::clone(&cancelled));
+        state.expected_stop.insert(name.to_string(), false);
+        drop(state);
+        self.log(name, &format!("$ rojo serve {} --port {}", project.project_file, project.port));
+        self.changed();
+
+        let engine = Arc::clone(self);
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let launched = engine.launch(&name, &project, &rojo, &cancelled);
+            // A start that came after launch() saw the cancellation clears it again; launch anew.
+            let again = {
+                let mut state = engine.lock();
+                state.starting.remove(&name);
+                matches!(launched, Ok(None))
+                    && !cancelled.load(Ordering::SeqCst)
+                    && !engine.closing.load(Ordering::SeqCst)
+            };
+            if again {
+                let _ = engine.start(&name);
+                return;
+            }
+            engine.changed();
+            engine.wake_watcher();
+            match launched {
+                Ok(Some(output)) => {
+                    let mut reader = BufReader::new(output);
+                    let mut line = Vec::new();
+                    while reader.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
+                        let text = String::from_utf8_lossy(&line);
+                        if !text.trim().is_empty() {
+                            engine.log(&name, &text);
+                        }
+                        line.clear();
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    engine.log(&name, &error);
+                    let help = match tooling::project_manager(Path::new(&project.path)) {
+                        Some(manager) => format!("Click {manager} to install its pinned tools."),
+                        None => "Use Settings > Tools to install Rojo.".into(),
+                    };
+                    engine.notice(format!("Could not start {name}. {help} See Logs for details."));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Spawn the server and adopt it unless the launch was cancelled; returns its output pipe.
+    fn launch(
+        &self,
+        name: &str,
+        project: &config::Project,
+        rojo: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<std::io::PipeReader>, String> {
+        // A missing pinned version needs an install, not a silent fallback to another version.
+        let key = manifest_key(&project.path);
+        if !self.lock().rojo_checked.contains(&key) {
+            tooling::tool_version("Rojo", Some(Path::new(&project.path)))?;
+            self.lock().rojo_checked.insert(key);
+        }
+        if cancelled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let (reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
+        let mut command = Command::new(rojo);
+        command
+            .arg("serve")
+            .arg(Path::new(&project.path).join(&project.project_file))
+            .arg("--port")
+            .arg(project.port.to_string())
+            .current_dir(&project.path)
+            .stdin(std::process::Stdio::null())
+            .stdout(writer.try_clone().map_err(|e| e.to_string())?)
+            .stderr(writer);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, crate::CREATE_NO_WINDOW);
+        let mut child = command.spawn().map_err(|e| format!("Could not run Rojo: {e}"))?;
+        drop(command); // closes our copies of the pipe's write end, so reading ends with the process
+        let mut state = self.lock();
+        if cancelled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            return Ok(None);
+        }
+        state.procs.insert(name.to_string(), child);
+        Ok(Some(reader))
+    }
+
+    pub fn stop(&self, name: &str) {
+        self.lock().restarting.remove(name);
+        self.stop_server(name);
+        self.wake_watcher();
+        self.changed();
+    }
+
+    fn stop_server(&self, name: &str) {
+        let (child, project) = {
+            let mut state = self.lock();
+            if let Some(cancellation) = state.cancellations.get(name) {
+                cancellation.store(true, Ordering::SeqCst);
+            }
+            let Some(project) = state.config.project(name).cloned() else { return };
+            let child = state.procs.remove(name);
+            if child.is_some() {
+                state.expected_stop.insert(name.to_string(), true);
+            }
+            (child, project)
+        };
+        let port = project.port;
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Rokit's shim exits first; the real rojo holding the port ends a moment later. Until
+            // it does, the watcher would take our own dying server for another app's.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while port_in_use(port) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+        if !port_in_use(port) {
+            return;
+        }
+        match serves_project(&project) {
+            None => {
+                return self.notice(format!(
+                    "Port {port} is used by another application. Change the port or close that application."
+                ));
+            }
+            Some(false) => {
+                return self.notice(format!(
+                    "Port {port} is used by a Rojo server for another project. Stop it where it was started."
+                ));
+            }
+            Some(true) => {}
+        }
+        match localnet::port_owner(port) {
+            None => {}
+            Some((_, image)) if !image.eq_ignore_ascii_case("rojo.exe") => {
+                self.notice("The listener is not a Rojo process. Stop it from the application that started it.")
+            }
+            Some((pid, _)) => {
+                if let Err(error) = localnet::kill_process(pid) {
+                    self.notice(format!("Could not stop the existing Rojo server: {error}"));
+                }
+            }
+        }
+    }
+
+    /// Stop, then start again once the port is free (up to 5 seconds).
+    pub fn restart(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        let port = self.lock().port(name)?;
+        self.stop(name);
+        self.lock().restarting.insert(name.to_string());
+        self.changed();
+        let engine = Arc::clone(self);
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if !engine.lock().restarting.contains(&name) || engine.closing.load(Ordering::SeqCst) {
+                    return; // cancelled by a stop, or closing
+                }
+                if !port_in_use(port) {
+                    engine.lock().restarting.remove(&name);
+                    let _ = engine.start(&name);
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    engine.lock().restarting.remove(&name);
+                    engine.changed();
+                    engine.notice(format!("{name}: port {port} is still in use, so the server was not restarted"));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Ok(())
+    }
+
+    /// The row's main button: stop anything running or starting, otherwise start.
+    pub fn toggle(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        let (busy, port) = {
+            let state = self.lock();
+            (state.busy(name) || state.restarting.contains(name), state.port(name)?)
+        };
+        if busy || port_in_use(port) {
+            self.stop(name);
+            Ok(())
+        } else {
+            self.start(name)
+        }
+    }
+
+    pub fn start_all(self: &Arc<Self>) {
+        let names: Vec<(String, u16)> = self.lock().config.projects.iter().map(|p| (p.name.clone(), p.port)).collect();
+        let started = names.iter().filter(|(name, port)| !port_in_use(*port) && self.start(name).is_ok()).count();
+        self.notice(format!("Starting {started} server{}", if started == 1 { "" } else { "s" }));
+    }
+
+    pub fn stop_all(&self) {
+        let names: Vec<(String, u16, bool)> = {
+            let state = self.lock();
+            state.config.projects.iter().map(|p| (p.name.clone(), p.port, state.busy(&p.name))).collect()
+        };
+        for (name, port, busy) in names {
+            if busy || port_in_use(port) {
+                self.stop(&name);
+            }
+        }
+        self.notice("Stopping all servers");
+    }
+
+    /// What holds a blocked project's port, for the Kill confirmation.
+    pub fn port_owner(&self, name: &str) -> Result<Option<(u32, String)>, String> {
+        let port = self.lock().port(name)?;
+        Ok(localnet::port_owner(port))
+    }
+
+    /// Force-end the process holding a project's port, if it is still `pid`.
+    pub fn kill_port_owner(&self, name: &str, pid: u32) -> Result<(), String> {
+        let port = self.lock().port(name)?;
+        let Some((owner, image)) = localnet::port_owner(port) else {
+            self.wake_watcher();
+            return Err(format!("Port {port} is free now."));
+        };
+        if owner != pid {
+            return Err(format!("Port {port} changed hands. Check it again."));
+        }
+        if matches!(pid, 0 | 4) {
+            return Err(format!("Port {port} is held by Windows. Change this project's port instead."));
+        }
+        localnet::kill_process(pid).map_err(|error| format!("Could not end {image}: {error}"))?;
+        self.wake_watcher();
+        self.notice(format!("Ended {image} (PID {pid}). Port {port} is free."));
+        Ok(())
+    }
+
+    /// The Studio bridge's question: the port of a running server whose project auto-connects to this place.
+    pub fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
+        let state = self.lock();
+        let project = state.config.projects.iter().find(|p| {
+            p.auto_connect
+                && p.place.is_some_and(|place| place.place_id == place_id)
+                && state.states.get(&p.name).is_some_and(|s| s.running())
+        })?;
+        let (name, port) = (project.name.clone(), project.port);
+        drop(state);
+        self.notice(format!("{name}: connecting Rojo in Studio"));
+        Some(port)
+    }
+
+    /// An unexpected exit. When restarting is on, the server starts again, up to CRASH_RESTARTS
+    /// times a minute, so a project that fails at once does not loop.
+    fn crashed(self: &Arc<Self>, name: &str, code: &str) {
+        let restart = {
+            let mut state = self.lock();
+            state.config.settings.restart_crashed.then(|| {
+                let recent = state.crashes.entry(name.to_string()).or_default();
+                recent.retain(|at| at.elapsed() < CRASH_WINDOW);
+                recent.push(Instant::now());
+                recent.len() <= CRASH_RESTARTS
+            })
+        };
+        match restart {
+            Some(true) => {
+                self.log(name, "[restarting after the crash]");
+                self.notice(format!("{name} crashed and was restarted"));
+                let _ = self.restart(name);
+            }
+            Some(false) => self.alert(format!("{name} keeps crashing, so it was not restarted. Check Logs.")),
+            None => self.alert(format!("{name} stopped unexpectedly (code {code}). Check Logs.")),
+        }
+    }
+
+    /// The bridge's count of Rojo plugins running in a Studio that just opened a place.
+    pub fn report_studio_rojo_plugins(&self, count: u32) {
+        let changed = self.lock().studio_rojo_plugins.replace(count) != Some(count);
+        if changed {
+            self.changed();
+        }
+    }
+
+    // ------------------------------------------------------------- watcher
+
+    /// Poll the TCP table: every 0.2 s while a server starts, otherwise every second. A listener
+    /// this app did not start is identified over HTTP once per owning process.
+    fn watch(self: Arc<Self>) {
+        // port -> (listener pid, checked at, is Rojo)
+        let mut probes: HashMap<u16, (u32, Instant, bool)> = HashMap::new();
+        while !self.closing.load(Ordering::SeqCst) {
+            let connections = !self.lock().procs.is_empty();
+            let Ok((listening, established)) = localnet::tcp_snapshot(connections) else {
+                self.sleep_watcher(Duration::from_secs(1));
+                continue;
+            };
+            let (projects, mut launching) = {
+                let state = self.lock();
+                (state.config.projects.clone(), !state.starting.is_empty() || !state.restarting.is_empty())
+            };
+            let mut changed = false;
+            for project in projects {
+                let (name, port) = (project.name.clone(), project.port);
+                let exited = {
+                    let mut state = self.lock();
+                    let exit = state.procs.get_mut(&name).and_then(|child| child.try_wait().ok().flatten());
+                    if exit.is_some() {
+                        state.procs.remove(&name);
+                    }
+                    exit.map(|status| (status.code(), state.expected_stop.remove(&name).unwrap_or(false)))
+                };
+                if let Some((code, expected)) = exited {
+                    let shown = code.map_or("unknown".to_string(), |c| c.to_string());
+                    self.log(&name, &format!("[process exited with code {shown}]"));
+                    changed = true;
+                    if !expected && !matches!(code, Some(0) | None) {
+                        self.crashed(&name, &shown);
+                    }
+                }
+                let owned = self.lock().procs.contains_key(&name);
+                let state = match listening.get(&port) {
+                    Some(_) if owned => {
+                        if established.get(&port).copied().unwrap_or(0) > 0 {
+                            ServerState::Connected
+                        } else {
+                            ServerState::Serving
+                        }
+                    }
+                    Some(&pid) => {
+                        let probe = probes.get(&port).copied();
+                        // A non-Rojo listener is re-checked now and then, in case Rojo was still binding.
+                        let is_rojo = match probe {
+                            Some((checked, at, is_rojo))
+                                if checked == pid && (is_rojo || at.elapsed() < Duration::from_secs(5)) =>
+                            {
+                                is_rojo
+                            }
+                            _ => {
+                                // Rojo serving another project here counts as another app.
+                                let is_rojo = serves_project(&project) == Some(true);
+                                probes.insert(port, (pid, Instant::now(), is_rojo));
+                                is_rojo
+                            }
+                        };
+                        if is_rojo { ServerState::External } else { ServerState::Blocked }
+                    }
+                    None => {
+                        probes.remove(&port);
+                        launching |= owned;
+                        ServerState::Off
+                    }
+                };
+                let previous = self.lock().states.insert(name.clone(), state);
+                if previous != Some(state) {
+                    changed = true;
+                    if state == ServerState::Blocked {
+                        self.alert(format!("{name}: port {port} is used by another application."));
+                    }
+                }
+            }
+            if changed {
+                self.changed();
+            }
+            self.sleep_watcher(if launching { Duration::from_millis(200) } else { Duration::from_secs(1) });
+        }
+    }
+
+    // ------------------------------------------------------------- projects
+
+    /// Add the Rojo project at `path`, or each new project in its immediate subfolders.
+    /// Returns the added names; errors when nothing could be added.
+    pub fn add_projects(&self, path: &Path) -> Result<Vec<String>, String> {
+        let added = if !project_files(path).is_empty() {
+            vec![self.register(path)?]
+        } else {
+            let entries = std::fs::read_dir(path).map_err(|e| format!("Cannot read that folder: {e}"))?;
+            let mut children: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|child| child.is_dir() && !project_files(child).is_empty())
+                .collect();
+            children.sort();
+            let known: Vec<String> = self.lock().config.projects.iter().map(|p| p.path.clone()).collect();
+            children.retain(|child| !known.iter().any(|path| same_path(path, &child.to_string_lossy())));
+            if children.is_empty() {
+                return Err("No Rojo projects found in that folder or its children".into());
+            }
+            let added: Vec<String> = children.iter().filter_map(|child| self.register(child).ok()).collect();
+            if added.is_empty() {
+                return Err("None of the Rojo projects in that folder could be added".into());
+            }
+            added
+        };
+        self.changed();
+        if let [name] = added.as_slice() {
+            let port = self.lock().port(name).unwrap_or_default();
+            self.notice(format!("Added {name} on port {port}. Click the port to change it."));
+        } else {
+            let folder =
+                path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            self.notice(format!("Added {} projects from {folder}", added.len()));
+        }
+        Ok(added)
+    }
+
+    /// Save the project at `path` on the first free port and return its name.
+    fn register(&self, path: &Path) -> Result<String, String> {
+        let mut files = project_files(path);
+        if files.is_empty() {
+            return Err("No *.project.json file found in that folder".into());
+        }
+        let project_file = match files.iter().position(|f| f == "default.project.json") {
+            Some(index) => files.remove(index),
+            None => files.remove(0),
+        };
+        let path_text = path.to_string_lossy().into_owned();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Choose a folder, not a drive")?;
+        let mut state = self.lock();
+        if state
+            .config
+            .projects
+            .iter()
+            .any(|p| p.name.to_lowercase() == name.to_lowercase() || same_path(&p.path, &path_text))
+        {
+            return Err(format!("A project named {name} is already registered"));
+        }
+        let used: HashSet<u16> = state.config.projects.iter().map(|p| p.port).collect();
+        let listening = localnet::listeners().unwrap_or_default();
+        let port = (FIRST_PORT..=u16::MAX)
+            .find(|port| !used.contains(port) && !listening.contains_key(port))
+            .ok_or("No available project ports. Remove a project or change an assigned port.")?;
+        let mut config = state.config.clone();
+        config.projects.push(config::Project {
+            name: name.clone(),
+            path: path_text,
+            project_file,
+            port,
+            autostart: false,
+            auto_connect: false,
+            place: None,
+        });
+        config::save(&config)?;
+        state.config = config;
+        Ok(name)
+    }
+
+    /// Look up a place ID or link with Roblox; empty text means "unlink". Call before `update`.
+    pub fn resolve_place(text: &str) -> Result<Option<Place>, ResolveError> {
+        match text.trim() {
+            "" => Ok(None),
+            text => studio::resolve_place(text).map(Some),
+        }
+    }
+
+    /// Apply changes to one project after checking all of them.
+    pub fn update(&self, name: &str, update: Update) -> Result<ProjectView, String> {
+        let mut state = self.lock();
+        let project = state.config.project(name).cloned().ok_or_else(|| missing(name))?;
+        let linked = update.place.unwrap_or(project.place);
+        if update.auto_connect == Some(true) && linked.is_none() {
+            return Err("Auto-connect needs a linked place.".into());
+        }
+        let new_name = update.name.as_deref().map(str::trim).unwrap_or(name).to_string();
+        if new_name != name {
+            if new_name.is_empty() {
+                return Err("Project name cannot be empty".into());
+            }
+            if state.config.projects.iter().any(|p| p.name != name && p.name.to_lowercase() == new_name.to_lowercase())
+            {
+                return Err(format!("A project named {new_name} is already registered"));
+            }
+            if state.busy(name) {
+                return Err("Stop the server before renaming it".into());
+            }
+        }
+        if let Some(port) = update.port.filter(|port| *port != project.port) {
+            if port == 0 {
+                return Err("Port must be 1-65535".into());
+            }
+            if let Some(other) = state.config.projects.iter().find(|p| p.name != name && p.port == port) {
+                return Err(format!("Port {port} already used by {}", other.name));
+            }
+            // Moving off a port another app holds is how a blocked project gets going again.
+            if state.busy(name) {
+                return Err("Stop the server before changing its port".into());
+            }
+        }
+        let mut config = state.config.clone();
+        let p = config.project_mut(name).ok_or_else(|| missing(name))?;
+        p.port = update.port.unwrap_or(p.port);
+        p.autostart = update.autostart.unwrap_or(p.autostart);
+        p.auto_connect = update.auto_connect.unwrap_or(p.auto_connect) && linked.is_some();
+        p.place = linked;
+        p.name = new_name.clone();
+        config::save(&config)?;
+        state.config = config;
+        if new_name != name {
+            // Logs and the last seen state follow the project to its new name.
+            if let Some(logs) = state.logs.remove(name) {
+                state.logs.insert(new_name.clone(), logs);
+            }
+            if let Some(seen) = state.states.remove(name) {
+                state.states.insert(new_name.clone(), seen);
+            }
+        }
+        let view = Self::view(&state, &new_name).ok_or_else(|| missing(&new_name))?;
+        drop(state);
+        self.changed();
+        Ok(view)
+    }
+
+    /// Stop the project's server if it runs, then drop the project. Its files are kept.
+    pub fn remove(&self, name: &str) -> Result<(), String> {
+        let (busy, port) = {
+            let state = self.lock();
+            (state.busy(name), state.port(name)?)
+        };
+        if busy || port_in_use(port) {
+            self.stop(name);
+        }
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        config.projects.retain(|p| p.name != name);
+        config::save(&config)?;
+        state.config = config;
+        state.logs.remove(name);
+        state.states.remove(name);
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    pub fn open_studio(&self, name: &str) -> Result<Place, String> {
+        let place = self.lock().config.project(name).ok_or_else(|| missing(name))?.place;
+        let place = place.ok_or_else(|| format!("{name} has no linked place. Set one in Rojo Manager."))?;
+        studio::open_place(&place).map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
+        Ok(place)
+    }
+
+    pub fn open_folder(&self, name: &str) -> Result<(), String> {
+        let path = self.lock().config.project(name).map(|p| p.path.clone()).ok_or_else(|| missing(name))?;
+        crate::shell::open(&path).map_err(|e| format!("Cannot open folder: {e}"))
+    }
+
+    // ------------------------------------------------------------- settings
+
+    /// Change one preference: a Settings key, or "launch_at_startup".
+    pub fn set_setting(self: &Arc<Self>, key: &str, value: bool) -> Result<(), String> {
+        let mut state = self.lock();
+        if key == "launch_at_startup" {
+            let hidden = state.config.settings.start_hidden;
+            drop(state);
+            startup::set_startup(value, hidden).map_err(|e| format!("Could not change Windows startup: {e}"))?;
+            self.changed();
+            return Ok(());
+        }
+        let mut config = state.config.clone();
+        if !config.settings.set(key, value) {
+            return Err(format!("Unknown setting {key}. Settings: launch_at_startup, {}", Settings::KEYS.join(", ")));
+        }
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        if key == "start_hidden" && startup::startup_enabled() {
+            startup::set_startup(true, value).map_err(|e| format!("Could not change Windows startup: {e}"))?;
+        }
+        match key {
+            "app_version_check" => self.check_app_update(false),
+            "version_check" => self.check_rojo(false),
+            _ => self.changed(),
+        }
+        Ok(())
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.lock().config.settings
+    }
+
+    // ------------------------------------------------------------- checks and tool jobs
+
+    /// Check Rojo's install and, when enabled or forced, its latest release.
+    pub fn check_rojo(self: &Arc<Self>, force: bool) {
+        let (revision, enabled) = {
+            let mut state = self.lock();
+            state.rojo_revision += 1;
+            state.rojo = None;
+            (state.rojo_revision, state.config.settings.version_check)
+        };
+        self.changed();
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            let status = tooling::inspect_rojo(force || enabled);
+            let mut state = engine.lock();
+            if state.rojo_revision == revision {
+                // An older check that finishes after a retry is ignored.
+                state.rojo = Some(status);
+                drop(state);
+                engine.changed();
+            }
+        });
+    }
+
+    pub fn check_app_update(self: &Arc<Self>, force: bool) {
+        let (revision, enabled) = {
+            let mut state = self.lock();
+            state.app_update_revision += 1;
+            state.app_update = None;
+            (state.app_update_revision, state.config.settings.app_version_check)
+        };
+        self.changed();
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            let status = updates::inspect_update(enabled || force, crate::VERSION);
+            let mut state = engine.lock();
+            if state.app_update_revision == revision {
+                state.app_update = Some(status);
+                drop(state);
+                engine.changed();
+            }
+        });
+    }
+
+    /// The newer release's version while one is available ("0.7.1"), for the tray.
+    pub fn available_update(&self) -> Option<String> {
+        let state = self.lock();
+        let update = state.app_update.as_ref().filter(|update| update.state == UpdateState::Outdated)?;
+        update.url.rsplit_once("/tag/v").map(|(_, version)| version.to_string())
+    }
+
+    /// Download and swap in the latest release. The caller restarts the app on success.
+    pub fn install_app_update(&self) -> Result<String, String> {
+        let installing = |message: String| UpdateStatus {
+            state: UpdateState::Installing,
+            message,
+            url: updates::RELEASES_URL.into(),
+        };
+        {
+            let mut state = self.lock();
+            if state.app_update.as_ref().is_some_and(|update| update.state == UpdateState::Installing) {
+                return Err("The update is already being installed.".into());
+            }
+            // A check finishing now must not overwrite this status.
+            state.app_update_revision += 1;
+            state.app_update = Some(installing("Downloading the update...".into()));
+        }
+        self.changed();
+        let result = updates::install_latest(&self.app_dir, crate::VERSION);
+        self.lock().app_update = Some(match &result {
+            Ok(version) => installing(format!("Restarting into Rojo Manager {version}...")),
+            Err(error) => {
+                UpdateStatus { state: UpdateState::Error, message: error.clone(), url: updates::RELEASES_URL.into() }
+            }
+        });
+        self.changed();
+        result
+    }
+
+    pub fn refresh_tool_versions(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            let versions =
+                tooling::TOOLS.iter().map(|tool| (tool.name, tooling::tool_version(tool.name, None).ok())).collect();
+            engine.lock().tool_versions = versions;
+            engine.changed();
+        });
+    }
+
+    /// Run a tool job in the ToolInstaller console; the result arrives as a notice.
+    pub fn run_tool_job(self: &Arc<Self>, job: Job) -> Result<(), String> {
+        let mut state = self.lock();
+        if state.tool_job.is_some() {
+            return Err("An installation is already running. Check its terminal window.".into());
+        }
+        let (operation, tool) = match &job {
+            Job::Global { tool } => ("global", tool),
+            Job::Project { tool, .. } => ("project", tool),
+            Job::Bridge { tool } => ("bridge", tool),
+            Job::Plugin { tool } => ("plugin", tool),
+        };
+        let view = ToolJobView { operation: operation.into(), tool: tool.clone() };
+        let installer = self.app_dir.join("ToolInstaller.exe");
+        if !installer.is_file() {
+            return Err("ToolInstaller.exe is missing. Extract the complete release ZIP and retry.".into());
+        }
+        let folder = tempfile::Builder::new().prefix("rojo-manager-job-").tempdir().map_err(|e| e.to_string())?;
+        let request = folder.path().join("request.json");
+        std::fs::write(&request, serde_json::to_vec(&job).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let mut command = Command::new(installer);
+        command.arg(&request).current_dir(&self.app_dir);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0000_0010); // CREATE_NEW_CONSOLE
+        let process = command.spawn().map_err(|e| format!("Could not start installation: {e}"))?;
+        let message = format!("Installing {}. Follow any prompts in the terminal.", view.tool);
+        state.tool_job = Some(ToolJob { view, folder, process });
+        drop(state);
+        self.changed();
+        self.notice(message);
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || engine.wait_for_tool_job());
+        Ok(())
+    }
+
+    fn wait_for_tool_job(self: Arc<Self>) {
+        let result = loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let mut state = self.lock();
+            let Some(job) = state.tool_job.as_mut() else { return };
+            let result_path = job.folder.path().join("result.json");
+            if result_path.is_file() {
+                let parsed =
+                    std::fs::read(&result_path).ok().and_then(|data| serde_json::from_slice::<Value>(&data).ok());
+                let outcome =
+                    parsed.as_ref().and_then(|v| Some((v.get("ok")?.as_bool()?, v.get("message")?.as_str()?)));
+                break match outcome {
+                    Some((true, message)) => message.to_string(),
+                    Some((false, message)) => format!("Installation failed: {message}"),
+                    None => "Installation failed: Invalid installer result".to_string(),
+                };
+            }
+            if job.process.try_wait().ok().flatten().is_some() {
+                break "Installation failed: Installation ended without completing. Check the terminal and retry."
+                    .into();
+            }
+        };
+        {
+            let mut state = self.lock();
+            state.tool_job = None; // deletes the request folder
+            state.rojo_checked.clear();
+        }
+        self.changed();
+        self.notice(result);
+        self.refresh_tool_versions();
+        self.check_rojo(true);
+    }
+}
+
+// ----------------------------------------------------------------- control API
+
+impl Engine {
+    /// One project as reported to agents: its view without badges, plus its last output lines.
+    fn agent_view(&self, name: &str) -> Option<Value> {
+        let view = self.project(name)?;
+        let logs = self.logs(name);
+        let log: Vec<&String> = logs.iter().skip(logs.len().saturating_sub(8)).map(|(_, line)| line).collect();
+        let mut value = serde_json::to_value(view).ok()?;
+        let object = value.as_object_mut()?;
+        object.remove("badges");
+        object.insert("log".into(), json!(log));
+        Some(value)
+    }
+
+    fn settings_value(&self) -> Value {
+        let mut value = serde_json::to_value(self.settings()).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("launch_at_startup".into(), json!(startup::startup_enabled()));
+        }
+        json!({ "settings": value })
+    }
+}
+
+/// The engine as the control servers' handler.
+pub struct Control(pub Arc<Engine>);
+
+impl ControlHandler for Control {
+    fn projects(&self) -> Vec<Value> {
+        let names: Vec<String> = self.0.lock().config.projects.iter().map(|p| p.name.clone()).collect();
+        names.iter().filter_map(|name| self.0.agent_view(name)).collect()
+    }
+
+    fn act(&self, project: Option<&str>, action: &str, body: &Map<String, Value>) -> Result<Value, ControlError> {
+        let engine = &self.0;
+        if action == "add" {
+            let path = body.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
+            let path = PathBuf::from(path.ok_or_else(|| ControlError::bad("Pass the project folder's path"))?);
+            if !path.is_absolute() || !path.is_dir() {
+                return Err(ControlError::new(format!("No folder at {}. Pass an absolute path.", path.display()), 404));
+            }
+            let names = engine.add_projects(&path).map_err(|e| ControlError::new(e, 409))?;
+            let added: Vec<Value> = names.iter().filter_map(|name| engine.agent_view(name)).collect();
+            return Ok(json!({ "added": added }));
+        }
+        let name = project.ok_or_else(|| ControlError::bad("Pass a project"))?;
+        let Some(view) = engine.project(name) else {
+            return Err(ControlError::new(missing(name), 404));
+        };
+        let reply = |name: &str| Ok(json!({ "project": engine.agent_view(name) }));
+        match action {
+            "update" | "link-place" => {
+                let (mut update, place) = parse_update(action, body)?;
+                if let Some(text) = place {
+                    update.place = Some(Engine::resolve_place(&text).map_err(|error| match error {
+                        ResolveError::Invalid(message) => ControlError::bad(message),
+                        ResolveError::Unreachable(message) => {
+                            ControlError::new(format!("Could not reach Roblox: {message}"), 502)
+                        }
+                    })?);
+                }
+                let updated = engine.update(name, update).map_err(|e| ControlError::new(e, 409))?;
+                engine.notice(format!("{}: updated by an agent", updated.name));
+                reply(&updated.name)
+            }
+            "remove" => {
+                engine.remove(name).map_err(|e| ControlError::new(e, 500))?;
+                engine.notice(format!("{name}: removed by an agent"));
+                Ok(json!({ "removed": name }))
+            }
+            "start" | "restart" if view.state == ServerState::Blocked => {
+                Err(ControlError::new(format!("Port {} is used by another application", view.port), 409))
+            }
+            "start" => {
+                if matches!(view.state, ServerState::Off | ServerState::Starting) {
+                    // a Starting one may be a launch that a stop cancelled
+                    engine
+                        .start(name)
+                        .map_err(|e| ControlError::new(format!("Rojo could not be started. {e}"), 409))?;
+                }
+                engine.notice(format!("{name}: start requested by an agent"));
+                reply(name)
+            }
+            "stop" => {
+                engine.stop(name);
+                engine.notice(format!("{name}: stop requested by an agent"));
+                reply(name)
+            }
+            "restart" => {
+                engine.restart(name).map_err(|e| ControlError::new(e, 409))?;
+                engine.notice(format!("{name}: restart requested by an agent"));
+                reply(name)
+            }
+            "open-studio" => {
+                let status = if view.place.is_none() { 409 } else { 500 };
+                engine.open_studio(name).map_err(|e| ControlError::new(e, status))?;
+                engine.notice(format!("{name}: open studio requested by an agent"));
+                reply(name)
+            }
+            _ => Err(ControlError::new(format!("Unknown action {action}"), 404)),
+        }
+    }
+
+    fn logs(&self, project: &str) -> Result<Value, ControlError> {
+        let view = self.0.project(project).ok_or_else(|| ControlError::new(missing(project), 404))?;
+        let lines: Vec<String> = self.0.logs(&view.name).into_iter().map(|(_, line)| line).collect();
+        Ok(json!({ "project": view.name, "state": view.state, "lines": lines }))
+    }
+
+    fn report_rojo_plugins(&self, count: u32) {
+        self.0.report_studio_rojo_plugins(count);
+    }
+
+    fn settings(&self, changes: Option<&Map<String, Value>>) -> Result<Value, ControlError> {
+        if let Some(changes) = changes {
+            for (key, value) in changes {
+                if key != "launch_at_startup" && !Settings::KEYS.contains(&key.as_str()) {
+                    let keys = Settings::KEYS.join(", ");
+                    return Err(ControlError::bad(format!(
+                        "Unknown setting {key}. Settings: launch_at_startup, {keys}"
+                    )));
+                }
+                if !value.is_boolean() {
+                    return Err(ControlError::bad(format!("{key} must be true or false")));
+                }
+            }
+            for (key, value) in changes {
+                self.0.set_setting(key, value.as_bool() == Some(true)).map_err(|e| ControlError::new(e, 500))?;
+            }
+            if !changes.is_empty() {
+                self.0.notice("Settings changed by an agent");
+            }
+        }
+        Ok(self.0.settings_value())
+    }
+
+    fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
+        self.0.auto_connect_port(place_id)
+    }
+}
+
+/// Read an agent's update body (name, port, autostart, autoConnect, place) or link-place body
+/// (place). The place text comes back separately, still to be looked up.
+fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Option<String>), ControlError> {
+    const FIELDS: &str = "name, port, autostart, autoConnect, place";
+    if action == "link-place" {
+        let place = body.get("place").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
+        let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link"))?;
+        return Ok((Update::default(), Some(place.to_string())));
+    }
+    if body.is_empty() {
+        return Err(ControlError::bad(format!("Pass at least one of: {FIELDS}")));
+    }
+    let (mut update, mut place) = (Update::default(), None);
+    for (key, value) in body {
+        let wrong = |kind: &str| ControlError::bad(format!("{key} must be a {kind}"));
+        match key.as_str() {
+            "name" => update.name = Some(value.as_str().ok_or_else(|| wrong("str"))?.to_string()),
+            "place" => place = Some(value.as_str().ok_or_else(|| wrong("str"))?.to_string()),
+            "port" => {
+                let port = value.as_u64().ok_or_else(|| wrong("int"))?;
+                let port = u16::try_from(port).ok().filter(|p| *p > 0);
+                update.port = Some(port.ok_or_else(|| ControlError::new("Port must be 1-65535", 409))?);
+            }
+            "autostart" => update.autostart = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
+            "autoConnect" => update.auto_connect = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
+            _ => return Err(ControlError::bad(format!("Unknown field {key}. Fields: {FIELDS}"))),
+        }
+    }
+    Ok((update, place))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ansi_colors_are_stripped_from_logs() {
+        assert_eq!(strip_ansi("\u{1b}[0m\u{1b}[1m\u{1b}[32mlocalhost\u{1b}[0m:34872"), "localhost:34872");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn agent_updates_are_checked_field_by_field() {
+        let body = |value: Value| value.as_object().cloned().unwrap();
+        let (update, place) =
+            parse_update("update", &body(json!({"port": 35000, "autoConnect": true, "place": ""}))).unwrap();
+        assert_eq!((update.port, update.auto_connect, place.as_deref()), (Some(35000), Some(true), Some("")));
+        assert_eq!(parse_update("update", &body(json!({"port": "1"}))).unwrap_err().message, "port must be a int");
+        assert!(parse_update("update", &body(json!({"colour": 1}))).unwrap_err().message.starts_with("Unknown field"));
+        assert_eq!(parse_update("update", &body(json!({}))).unwrap_err().status, 400);
+        assert_eq!(parse_update("link-place", &body(json!({"place": " 123 "}))).unwrap().1.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn project_paths_compare_like_windows() {
+        assert!(same_path("C:\\Games\\A\\", "c:\\games\\a"));
+        assert!(!same_path("C:\\Games\\A", "C:\\Games\\AB"));
+    }
+}
