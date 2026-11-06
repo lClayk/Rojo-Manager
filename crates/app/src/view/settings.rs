@@ -175,7 +175,7 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
                                 .label(if update.state == UpdateState::Installing { "Updating" } else { "Update now" })
                                 .variant(Variant::Primary)
                                 .disabled(update.state == UpdateState::Installing)
-                                .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                                .on_click(cx.listener(|this, _, _, cx| this.confirm_update(cx))),
                         ),
                         _ => d.child(
                             Button::new("check-update")

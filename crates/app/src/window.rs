@@ -77,6 +77,9 @@ pub fn run() {
                     ToWindow::Event(event) => {
                         view.update(cx, |view, cx| view.on_event(event, cx)).ok();
                     }
+                    ToWindow::ConfirmUpdate => {
+                        view.update(cx, |view, cx| view.confirm_update(cx)).ok();
+                    }
                     ToWindow::Activate => {
                         let _ = handle.update(cx, |_, window, _| window.activate_window());
                     }

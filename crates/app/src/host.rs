@@ -150,11 +150,13 @@ impl Host {
                     }
                 }
                 Msg::OpenStudio(name) => self.in_background(move |engine| engine.open_studio(&name).map(|_| ())),
-                Msg::InstallUpdate => self.in_background(|engine| {
-                    engine.install_app_update()?;
-                    post(Msg::Restart);
-                    Ok(())
-                }),
+                Msg::InstallUpdate => {
+                    // The window asks first, since installing restarts the app and its servers.
+                    self.show();
+                    if let Some(tx) = &*self.sink.lock().unwrap() {
+                        let _ = tx.send(ipc::line(&ToWindow::ConfirmUpdate));
+                    }
+                }
                 Msg::Restart => match self.restart() {
                     Ok(()) => return false,
                     Err(error) => self.alert(&format!("Could not restart Rojo Manager: {error}")),

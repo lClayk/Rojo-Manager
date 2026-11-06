@@ -86,6 +86,8 @@ pub enum ToWindow {
     Event(Event),
     /// A second launch or the tray asked to show the window, which is already open.
     Activate,
+    /// The tray's update item: ask before installing, as the window's own button does.
+    ConfirmUpdate,
 }
 
 pub fn line(message: &impl Serialize) -> String {
