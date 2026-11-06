@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/core", "crates/app", "crates/mcp", "crates/installer"]
+# Vendored crates patched in through [patch.crates-io] below (see patches/README.md); not ours to lint.
+exclude = ["patches"]
 resolver = "3"
 
 [workspace.package]
@@ -17,3 +19,6 @@ serde_json = "1"
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+gpui-pre-windows = { path = "patches/gpui-pre-windows" }
