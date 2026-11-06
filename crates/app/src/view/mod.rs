@@ -418,11 +418,38 @@ impl MainView {
                             .label(if installing { "Updating" } else { "Update now" })
                             .variant(Variant::Primary)
                             .disabled(installing)
-                            .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_update(cx))),
                     ),
             ));
         }
         banners
+    }
+
+    /// Ask before installing: the app restarts, and with it the servers it runs.
+    pub(crate) fn confirm_update(&mut self, cx: &mut Context<Self>) {
+        use rojo_manager_core::manager::ServerState;
+        let running = self.snapshot.as_ref().map(|snapshot| {
+            let restarts =
+                |state| matches!(state, ServerState::Starting | ServerState::Serving | ServerState::Connected);
+            snapshot.projects.iter().filter(|project| restarts(project.state)).count()
+        });
+        let reconnect = "stop for a few seconds and start again, so reconnect Rojo in Studio afterwards.";
+        let servers = match running {
+            Some(0) => String::new(),
+            Some(1) => format!(" Its running server will {reconnect}"),
+            Some(count) => format!(" Its {count} running servers will {reconnect}"),
+            None => format!(" Servers it runs will {reconnect}"),
+        };
+        self.ask(
+            Confirm {
+                title: "Install update",
+                message: format!("Rojo Manager restarts to install the update.{servers}"),
+                label: "Update and restart",
+                danger: false,
+                on_confirm: Box::new(|view, cx| view.install_update(cx)),
+            },
+            cx,
+        );
     }
 
     /// Download the update; the tray app then restarts into it, reopening this window.
