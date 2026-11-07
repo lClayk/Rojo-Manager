@@ -25,7 +25,7 @@ local NAME = "RojoManagerBridge"
 local VERSION = 6
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
-local POLL_SECONDS = 2
+local POLL_SECONDS = 5
 -- Rojo's port when its port field is empty.
 local DEFAULT_PORT = 34872
 
