@@ -110,9 +110,9 @@ pub enum ListItem<'a> {
     },
 }
 
-/// The list in project order, with places of the same experience gathered under one header.
-pub fn list_items(projects: &[ProjectView]) -> Vec<ListItem<'_>> {
-    let universe = |p: &ProjectView| p.place.map(|place| place.universe_id);
+/// The list in project order; with `group`, places of the same experience gather under one header.
+pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
+    let universe = |p: &ProjectView| p.place.map(|place| place.universe_id).filter(|_| group);
     let (mut items, mut grouped) = (Vec::new(), HashSet::new());
     for project in projects {
         let Some(id) = universe(project) else {
@@ -283,17 +283,19 @@ mod tests {
             linked("Solo", 8, None),
             linked("Arena", 7, Some("Game")),
         ];
-        let items = list_items(&projects);
-        let shape: Vec<String> = items
-            .iter()
-            .map(|item| match item {
-                ListItem::Project(p) => p.name.clone(),
-                ListItem::Experience { name, projects, .. } => {
-                    format!("{name}: {}", projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))
-                }
-            })
-            .collect();
-        assert_eq!(shape, ["A", "Game: Lobby, Arena", "Solo"]);
+        let shape = |group| -> Vec<String> {
+            list_items(&projects, group)
+                .iter()
+                .map(|item| match item {
+                    ListItem::Project(p) => p.name.clone(),
+                    ListItem::Experience { name, projects, .. } => {
+                        format!("{name}: {}", projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo"]);
+        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena"]);
     }
 
     #[test]

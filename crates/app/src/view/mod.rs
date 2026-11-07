@@ -537,7 +537,7 @@ impl MainView {
                 .into_any_element();
         }
         let mut rows = Vec::new();
-        for item in logic::list_items(&snapshot.projects) {
+        for item in logic::list_items(&snapshot.projects, snapshot.settings.group_experiences) {
             match item {
                 logic::ListItem::Project(project) => {
                     rows.push(project_row::render(self, project, snapshot, false, window, cx))

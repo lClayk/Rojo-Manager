@@ -49,6 +49,8 @@ pub struct Settings {
     pub restart_crashed: bool,
     /// Accept Rojo's initial sync prompt when the bridge auto-connects.
     pub auto_connect_accept: bool,
+    /// List places of one experience under a shared, collapsible header.
+    pub group_experiences: bool,
 }
 
 impl Default for Settings {
@@ -65,12 +67,13 @@ impl Default for Settings {
             notifications: true,
             restart_crashed: true,
             auto_connect_accept: true,
+            group_experiences: true,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 11] = [
+    pub const KEYS: [&'static str; 12] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -82,6 +85,7 @@ impl Settings {
         "notifications",
         "restart_crashed",
         "auto_connect_accept",
+        "group_experiences",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -97,6 +101,7 @@ impl Settings {
             "notifications" => &mut self.notifications,
             "restart_crashed" => &mut self.restart_crashed,
             "auto_connect_accept" => &mut self.auto_connect_accept,
+            "group_experiences" => &mut self.group_experiences,
             _ => return None,
         })
     }

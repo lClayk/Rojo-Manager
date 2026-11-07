@@ -147,6 +147,13 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
     general.extend([
         toggle(snapshot, "tray", "Keep running in the tray", Some("Closing the window leaves servers running"), cx),
         toggle(snapshot, "tray_status", "Show server status on the tray icon", None, cx),
+        toggle(
+            snapshot,
+            "group_experiences",
+            "Group places by experience",
+            Some("Under a header you can collapse"),
+            cx,
+        ),
         toggle(snapshot, "notifications", "Notify when a server fails", Some("While the window is closed"), cx),
         toggle(snapshot, "app_version_check", "Check for app updates on launch", None, cx),
     ]);
