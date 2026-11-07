@@ -63,6 +63,9 @@ pub struct ProjectView {
     pub autostart: bool,
     pub auto_connect: bool,
     pub place: Option<Place>,
+    /// The linked place's experience name, once looked up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experience: Option<String>,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -107,6 +110,8 @@ pub struct Snapshot {
     pub studio_rojo_plugins: Option<u32>,
     /// RojoManagerMCP.exe, for the agent setup commands.
     pub mcp_path: String,
+    /// Experiences (universe IDs) the window shows collapsed.
+    pub collapsed: Vec<u64>,
 }
 
 fn version() -> &'static str {
@@ -177,6 +182,8 @@ struct State {
     studio_rojo_plugins: Option<u32>,
     /// Each running Studio bridge's last poll, by the random id it picked when it loaded.
     bridges: HashMap<u64, BridgeReport>,
+    /// Experience names by universe ID, looked up once per run.
+    experiences: HashMap<u64, String>,
 }
 
 /// What a Studio bridge last said and was told.
@@ -319,6 +326,7 @@ impl Engine {
         self.check_rojo(false);
         self.check_app_update(false);
         self.refresh_tool_versions();
+        self.look_up_experiences();
         let names: Vec<String> =
             self.lock().config.projects.iter().filter(|p| p.autostart).map(|p| p.name.clone()).collect();
         for name in names {
@@ -395,6 +403,7 @@ impl Engine {
             autostart: p.autostart,
             auto_connect: p.auto_connect,
             place: p.place,
+            experience: p.place.and_then(|place| state.experiences.get(&place.universe_id).cloned()),
             state: state.view_state(&p.name),
             badges: tooling::project_badges(Path::new(&p.path)).into_iter().map(String::from).collect(),
         })
@@ -429,6 +438,7 @@ impl Engine {
             creator_store_rojo: tooling::creator_store_rojo_installed(),
             studio_rojo_plugins: state.studio_rojo_plugins,
             mcp_path: self.app_dir.join("RojoManagerMCP.exe").display().to_string(),
+            collapsed: state.config.collapsed.clone(),
         }
     }
 
@@ -951,7 +961,7 @@ impl Engine {
     }
 
     /// Apply changes to one project after checking all of them.
-    pub fn update(&self, name: &str, update: Update) -> Result<ProjectView, String> {
+    pub fn update(self: &Arc<Self>, name: &str, update: Update) -> Result<ProjectView, String> {
         let mut state = self.lock();
         let project = state.config.project(name).cloned().ok_or_else(|| missing(name))?;
         let linked = update.place.unwrap_or(project.place);
@@ -1004,7 +1014,43 @@ impl Engine {
         let view = Self::view(&state, &new_name).ok_or_else(|| missing(&new_name))?;
         drop(state);
         self.changed();
+        if view.place.is_some() && view.experience.is_none() {
+            self.look_up_experiences();
+        }
         Ok(view)
+    }
+
+    /// Fetch the names of linked experiences not looked up yet, for grouping places by experience.
+    fn look_up_experiences(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            let missing: HashSet<u64> = {
+                let state = engine.lock();
+                let linked = state.config.projects.iter().filter_map(|p| p.place).map(|place| place.universe_id);
+                linked.filter(|id| !state.experiences.contains_key(id)).collect()
+            };
+            for universe_id in missing {
+                if let Ok(name) = studio::experience_name(universe_id) {
+                    engine.lock().experiences.insert(universe_id, name);
+                    engine.changed();
+                }
+            }
+        });
+    }
+
+    /// Show or hide an experience's places in the window.
+    pub fn set_collapsed(&self, universe_id: u64, collapsed: bool) -> Result<(), String> {
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        config.collapsed.retain(|id| *id != universe_id);
+        if collapsed {
+            config.collapsed.push(universe_id);
+        }
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        self.changed();
+        Ok(())
     }
 
     /// Stop the project's server if it runs, then drop the project. Its files are kept.

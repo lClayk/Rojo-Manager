@@ -1,6 +1,8 @@
 //! Pure view logic: how engine state maps onto labels, buttons, and validation. Kept out of the
 //! views so it can be tested without a window.
 
+use std::collections::HashSet;
+
 use rojo_manager_core::config::Settings;
 use rojo_manager_core::manager::{ProjectView, ServerState};
 use rojo_manager_core::tooling::{BRIDGE_VERSION, StudioPlugin, full_version};
@@ -78,14 +80,58 @@ pub fn can_stop_all(projects: &[ProjectView]) -> bool {
 
 /// Footer line: "3 projects · 2 running · 1 connected".
 pub fn summary(projects: &[ProjectView]) -> String {
-    let running = projects.iter().filter(|p| p.state.running()).count();
-    let connected = projects.iter().filter(|p| p.state == ServerState::Connected).count();
-    let plural = if projects.len() == 1 { "" } else { "s" };
-    let mut parts = vec![format!("{} project{plural}", projects.len()), format!("{running} running")];
+    tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), "project")
+}
+
+/// An experience header's line: "2 places · 1 running".
+pub fn experience_summary(projects: &[&ProjectView]) -> String {
+    tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), "place")
+}
+
+fn tally(states: &[ServerState], noun: &str) -> String {
+    let running = states.iter().filter(|state| state.running()).count();
+    let connected = states.iter().filter(|state| **state == ServerState::Connected).count();
+    let plural = if states.len() == 1 { "" } else { "s" };
+    let mut parts = vec![format!("{} {noun}{plural}", states.len()), format!("{running} running")];
     if connected > 0 {
         parts.push(format!("{connected} connected"));
     }
     parts.join("  ·  ")
+}
+
+/// One entry of the project list.
+pub enum ListItem<'a> {
+    Project(&'a ProjectView),
+    /// Two or more projects linked to places of one experience, listed where its first one is.
+    Experience {
+        universe_id: u64,
+        name: String,
+        projects: Vec<&'a ProjectView>,
+    },
+}
+
+/// The list in project order; with `group`, places of the same experience gather under one header.
+pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
+    let universe = |p: &ProjectView| p.place.map(|place| place.universe_id).filter(|_| group);
+    let (mut items, mut grouped) = (Vec::new(), HashSet::new());
+    for project in projects {
+        let Some(id) = universe(project) else {
+            items.push(ListItem::Project(project));
+            continue;
+        };
+        if grouped.contains(&id) {
+            continue;
+        }
+        let members: Vec<&ProjectView> = projects.iter().filter(|p| universe(p) == Some(id)).collect();
+        if members.len() < 2 {
+            items.push(ListItem::Project(project));
+            continue;
+        }
+        grouped.insert(id);
+        let name = members.iter().find_map(|p| p.experience.clone()).unwrap_or_else(|| format!("Experience {id}"));
+        items.push(ListItem::Experience { universe_id: id, name, projects: members });
+    }
+    items
 }
 
 /// The project's tool badges the person chose to show.
@@ -217,9 +263,39 @@ mod tests {
             autostart: false,
             auto_connect: false,
             place: None,
+            experience: None,
             state,
             badges: vec![],
         }
+    }
+
+    #[test]
+    fn places_of_one_experience_share_a_header_where_the_first_one_was() {
+        let linked = |name: &str, universe_id, experience: Option<&str>| ProjectView {
+            name: name.into(),
+            place: Some(rojo_manager_core::config::Place { place_id: 1, universe_id }),
+            experience: experience.map(Into::into),
+            ..project(ServerState::Off)
+        };
+        let projects = [
+            project(ServerState::Off),
+            linked("Lobby", 7, None),
+            linked("Solo", 8, None),
+            linked("Arena", 7, Some("Game")),
+        ];
+        let shape = |group| -> Vec<String> {
+            list_items(&projects, group)
+                .iter()
+                .map(|item| match item {
+                    ListItem::Project(p) => p.name.clone(),
+                    ListItem::Experience { name, projects, .. } => {
+                        format!("{name}: {}", projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo"]);
+        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena"]);
     }
 
     #[test]

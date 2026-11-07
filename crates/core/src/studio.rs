@@ -86,6 +86,16 @@ fn resolve_with(text: &str, fetch: impl Fn(&str) -> Result<Value, HttpsError>) -
     }
 }
 
+/// The experience's name, as its creator set it.
+pub fn experience_name(universe_id: u64) -> Result<String, HttpsError> {
+    let url = format!("https://develop.roblox.com/v1/universes/{universe_id}");
+    let data = https::get_json(&url, "application/json", Duration::from_secs(10))?;
+    data.get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| HttpsError::Transport("The experience has no name".into()))
+}
+
 pub fn launch_uri(place: &Place) -> String {
     format!(
         "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{}+universeId:{}",

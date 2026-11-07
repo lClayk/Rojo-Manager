@@ -49,6 +49,8 @@ pub struct Settings {
     pub restart_crashed: bool,
     /// Accept Rojo's initial sync prompt when the bridge auto-connects.
     pub auto_connect_accept: bool,
+    /// List places of one experience under a shared, collapsible header.
+    pub group_experiences: bool,
 }
 
 impl Default for Settings {
@@ -65,12 +67,13 @@ impl Default for Settings {
             notifications: true,
             restart_crashed: true,
             auto_connect_accept: true,
+            group_experiences: true,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 11] = [
+    pub const KEYS: [&'static str; 12] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -82,6 +85,7 @@ impl Settings {
         "notifications",
         "restart_crashed",
         "auto_connect_accept",
+        "group_experiences",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -97,6 +101,7 @@ impl Settings {
             "notifications" => &mut self.notifications,
             "restart_crashed" => &mut self.restart_crashed,
             "auto_connect_accept" => &mut self.auto_connect_accept,
+            "group_experiences" => &mut self.group_experiences,
             _ => return None,
         })
     }
@@ -116,6 +121,9 @@ impl Settings {
 pub struct Config {
     pub projects: Vec<Project>,
     pub settings: Settings,
+    /// Experiences (universe IDs) whose places the window shows collapsed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<u64>,
 }
 
 impl Config {
@@ -216,7 +224,12 @@ pub fn validate(value: &Value) -> Result<Config, String> {
             place,
         });
     }
-    Ok(Config { projects, settings })
+    // Only a window preference, so a bad entry is dropped instead of refusing the file.
+    let collapsed = match object.get("collapsed") {
+        Some(Value::Array(ids)) => ids.iter().filter_map(Value::as_u64).filter(|id| *id > 0).collect(),
+        _ => Vec::new(),
+    };
+    Ok(Config { projects, settings, collapsed })
 }
 
 /// Read config.json; a missing file is an empty config. A malformed file is reported, never overwritten.
@@ -265,6 +278,9 @@ mod tests {
         let saved = serde_json::to_value(&config).unwrap();
         assert_eq!(saved["projects"][0], stored["projects"][0]);
         assert!(saved["settings"].get("unknown").is_none());
+        assert!(saved.get("collapsed").is_none());
+        let collapsed = validate(&json!({"collapsed": [2, "x", 0]})).unwrap().collapsed;
+        assert_eq!(collapsed, [2]);
     }
 
     #[test]

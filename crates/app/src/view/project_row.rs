@@ -5,7 +5,7 @@ use gpui_kit::component::input::Input;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rojo_manager_core::config::Place;
-use rojo_manager_core::manager::{Engine, ProjectView, Snapshot, Update};
+use rojo_manager_core::manager::{Engine, ProjectView, ServerState, Snapshot, Update};
 use rojo_manager_core::studio::ResolveError;
 use rojo_manager_core::tooling::Job;
 
@@ -13,7 +13,7 @@ use super::{Confirm, Field, Logs, MainView};
 use crate::ipc::Client;
 use crate::logic::{self, MainAction, StatusColor};
 use crate::theme::*;
-use crate::widgets::{Button, link_hover, switch_link, tip_link};
+use crate::widgets::{Button, icon, link_hover, switch_link, tip_link};
 
 fn dot(color: StatusColor) -> u32 {
     match color {
@@ -37,10 +37,80 @@ fn on_click(
     cx.listener(move |this, _: &ClickEvent, window, cx| f(this, &name, window, cx))
 }
 
+/// An experience's header: click to show or hide its places; start, stop, or open them all.
+pub fn render_experience(
+    universe_id: u64,
+    name: &str,
+    projects: &[&ProjectView],
+    open: bool,
+    cx: &mut Context<MainView>,
+) -> AnyElement {
+    let names: Vec<String> = projects.iter().map(|p| p.name.clone()).collect();
+    let action = |id: &str, label: &'static str, tip: &'static str, action: GroupAction| {
+        let names = names.clone();
+        tip_link(format!("experience-{id}-{universe_id}"), label, tip)
+            .on_click(cx.listener(move |this, _, _, cx| this.group_action(&names, action, cx)))
+    };
+    let toggle = div()
+        .id(format!("experience-toggle-{universe_id}"))
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .gap(px(8.))
+        .tooltip(crate::widgets::tooltip(if open { "Hide its places" } else { "Show its places" }))
+        .on_click(cx.listener(move |this, _, _, cx| this.set_collapsed(universe_id, open, cx)))
+        .child(icon(if open { "chevron-down" } else { "chevron-right" }, 14., MUTED))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(TEXT_LG)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT))
+                .child(name.to_string()),
+        )
+        .child(
+            div().flex_shrink_0().text_size(TEXT_SM).text_color(rgb(MUTED)).child(logic::experience_summary(projects)),
+        );
+    div()
+        .id(format!("experience-{universe_id}"))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(16.))
+        .py(px(10.))
+        .hover(|s| s.bg(rgb(CARD_HOVER)))
+        .child(toggle)
+        .child(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .mr(px(-6.))
+                .when(projects.iter().any(|p| p.state == ServerState::Off), |d| {
+                    d.child(action("start", "Start all", "Start every place's server", GroupAction::Start))
+                })
+                .when(projects.iter().any(|p| logic::is_active(p.state)), |d| {
+                    d.child(action("stop", "Stop all", "Stop every place's server", GroupAction::Stop))
+                })
+                .child(action("open", "Open places", "Open every place in Roblox Studio", GroupAction::Open)),
+        )
+        .into_any_element()
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum GroupAction {
+    Start,
+    Stop,
+    Open,
+}
+
+/// One project in the list; `nested` indents it under its experience's header.
 pub fn render(
     view: &MainView,
     p: &ProjectView,
     snapshot: &Snapshot,
+    nested: bool,
     _: &mut Window,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
@@ -213,7 +283,8 @@ pub fn render(
     div()
         .id(format!("row-{}", p.name))
         .group(group)
-        .px(px(16.))
+        .pl(px(if nested { 38. } else { 16. }))
+        .pr(px(16.))
         .py(px(12.))
         .hover(|s| s.bg(rgb(CARD_HOVER)))
         .child(top)
@@ -328,6 +399,31 @@ fn set_place(engine: &Client, name: &str, text: &str) -> Result<ProjectView, Str
 impl MainView {
     fn project(&self, name: &str) -> Option<&ProjectView> {
         self.snapshot.as_ref()?.projects.iter().find(|p| p.name == name)
+    }
+
+    fn set_collapsed(&mut self, universe_id: u64, collapsed: bool, cx: &mut Context<Self>) {
+        self.run(cx, move |engine| engine.set_collapsed(universe_id, collapsed), |_, (), _| {});
+    }
+
+    /// Start the stopped servers, stop the running ones, or open every place, of one experience.
+    fn group_action(&mut self, names: &[String], action: GroupAction, cx: &mut Context<Self>) {
+        for name in names {
+            let Some(project) = self.project(name) else { continue };
+            let applies = match action {
+                GroupAction::Start => project.state == ServerState::Off,
+                GroupAction::Stop => logic::is_active(project.state),
+                GroupAction::Open => true,
+            };
+            if !applies {
+                continue;
+            }
+            let name = name.clone();
+            match action {
+                GroupAction::Start => self.run(cx, move |engine| engine.start_server(&name), |_, (), _| {}),
+                GroupAction::Stop => self.run(cx, move |engine| engine.stop_server(&name), |_, (), _| {}),
+                GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: Place, _| {}),
+            }
+        }
     }
 
     fn toggle_flag(&mut self, name: &str, flag: Flag, cx: &mut Context<Self>) {

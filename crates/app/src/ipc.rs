@@ -25,6 +25,12 @@ pub enum Call {
     Toggle {
         name: String,
     },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
     StartAll,
     StopAll,
     PortOwner {
@@ -53,6 +59,10 @@ pub enum Call {
     SetSetting {
         key: String,
         value: bool,
+    },
+    SetCollapsed {
+        universe_id: u64,
+        collapsed: bool,
     },
     CheckRojo,
     CheckAppUpdate,
@@ -103,6 +113,11 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::Snapshot => json(Ok(engine.snapshot())),
         Call::Logs { name } => json(Ok(engine.logs(&name))),
         Call::Toggle { name } => json(engine.toggle(&name)),
+        Call::Start { name } => json(engine.start(&name)),
+        Call::Stop { name } => {
+            engine.stop(&name);
+            Ok(Value::Null)
+        }
         Call::PortOwner { name } => json(engine.port_owner(&name)),
         Call::KillPortOwner { name, pid } => json(engine.kill_port_owner(&name, pid)),
         Call::AddProjects { path } => json(engine.add_projects(&path)),
@@ -111,6 +126,7 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::OpenStudio { name } => json(engine.open_studio(&name)),
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
+        Call::SetCollapsed { universe_id, collapsed } => json(engine.set_collapsed(universe_id, collapsed)),
         Call::RunToolJob { job } => json(engine.run_tool_job(job)),
         Call::InstallAppUpdate => json(engine.install_app_update()),
         // Calls whose answer nobody waits for.
@@ -201,6 +217,12 @@ impl Client {
     pub fn toggle(&self, name: &str) -> Result<(), String> {
         self.call(Call::Toggle { name: name.into() })
     }
+    pub fn start_server(&self, name: &str) -> Result<(), String> {
+        self.call(Call::Start { name: name.into() })
+    }
+    pub fn stop_server(&self, name: &str) -> Result<(), String> {
+        self.call(Call::Stop { name: name.into() })
+    }
     pub fn start_all(&self) {
         self.send(Call::StartAll);
     }
@@ -230,6 +252,9 @@ impl Client {
     }
     pub fn set_setting(&self, key: &str, value: bool) -> Result<(), String> {
         self.call(Call::SetSetting { key: key.into(), value })
+    }
+    pub fn set_collapsed(&self, universe_id: u64, collapsed: bool) -> Result<(), String> {
+        self.call(Call::SetCollapsed { universe_id, collapsed })
     }
     pub fn check_rojo(&self) {
         self.send(Call::CheckRojo);
