@@ -10,6 +10,8 @@ A Windows tray app that runs the [Rojo](https://rojo.space) servers for all your
 - Crashed servers restart, failures show as notifications, and app updates install with one click.
 - Agents can do all of it through the bundled MCP server, next to robloxstudio-mcp.
 
+Questions, feedback, and release updates are on the [DevForum thread](https://devforum.roblox.com/t/4980026).
+
 ## Download and run
 
 1. Download **RojoManager-0.8.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest).
