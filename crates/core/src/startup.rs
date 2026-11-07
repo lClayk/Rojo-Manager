@@ -1,4 +1,6 @@
-//! Launch at Windows sign-in through HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
+//! Launch at Windows sign-in through HKCU\Software\Microsoft\Windows\CurrentVersion\Run, and the
+//! Start menu shortcut that makes the app show up in Windows search.
+//!
 //! Rojo Manager 0.5 used a RojoManager.lnk (or older .bat) in the Startup folder instead; those
 //! count as enabled and are removed whenever startup is changed. A Run value for another copy of
 //! the app (one that was moved, say) does not count, so turning startup on again fixes it.
@@ -9,10 +11,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
+};
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
-use windows::core::PCWSTR;
+use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+use windows::core::{Interface, PCWSTR};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE: &str = "RojoManager";
@@ -35,6 +41,34 @@ fn legacy_files() -> Vec<PathBuf> {
     };
     let folder = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
     vec![folder.join("RojoManager.lnk"), folder.join("RojoManager.bat")]
+}
+
+/// Point the Start menu's "Rojo Manager" shortcut at this executable, so Windows search finds the
+/// app wherever it was extracted. Runs at every launch, which also follows the app when it moves.
+pub fn add_to_start_menu() -> io::Result<()> {
+    let appdata = std::env::var_os("APPDATA").ok_or_else(|| io::Error::other("APPDATA is not set"))?;
+    let shortcut = PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Rojo Manager.lnk");
+    save_shortcut(&std::env::current_exe()?, &shortcut)
+}
+
+fn save_shortcut(exe: &Path, shortcut: &Path) -> io::Result<()> {
+    // SAFETY: COM is initialized for this call only, and every string is NUL-terminated.
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let saved = (|| {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(PCWSTR(wide(exe).as_ptr()))?;
+            if let Some(folder) = exe.parent() {
+                link.SetWorkingDirectory(PCWSTR(wide(folder).as_ptr()))?;
+            }
+            link.SetDescription(PCWSTR(wide("Run your Rojo servers from one tray app").as_ptr()))?;
+            link.cast::<IPersistFile>()?.Save(PCWSTR(wide(shortcut).as_ptr()), true)
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        saved.map_err(io::Error::other)
+    }
 }
 
 /// "<exe>" or "<exe>" --hidden, quoted for paths with spaces.
@@ -119,6 +153,17 @@ mod tests {
         let exe = Path::new(r"C:\Program Files\Rojo Manager\RojoManager.exe");
         assert_eq!(command(exe, false), r#""C:\Program Files\Rojo Manager\RojoManager.exe""#);
         assert_eq!(command(exe, true), r#""C:\Program Files\Rojo Manager\RojoManager.exe" --hidden"#);
+    }
+
+    #[test]
+    fn the_start_menu_shortcut_is_written() {
+        let folder = tempfile::tempdir().unwrap();
+        let shortcut = folder.path().join("Rojo Manager.lnk");
+        save_shortcut(Path::new(r"C:\Rojo Manager\RojoManager.exe"), &shortcut).unwrap();
+        let data = std::fs::read(&shortcut).unwrap();
+        // A shell link starts with its 0x4C header size, and stores the target path.
+        assert_eq!(data[..4], [0x4C, 0, 0, 0]);
+        assert!(String::from_utf8_lossy(&data).contains("RojoManager.exe"));
     }
 
     #[test]
