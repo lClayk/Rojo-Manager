@@ -449,7 +449,11 @@ pub fn render_agent_help(view: &MainView, help: &AgentHelp, cx: &mut Context<Mai
             .children(rows)
             .child(div().text_color(rgb(MUTED)).child("VS Code uses \"servers\" in place of \"mcpServers\"."))
     });
+    // Scrolls so the buttons stay reachable in a short window.
     let body = div()
+        .id("agent-help-body")
+        .min_h_0()
+        .overflow_y_scroll()
         .flex()
         .flex_col()
         .gap(px(12.))
