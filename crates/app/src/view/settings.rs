@@ -8,9 +8,51 @@ use rojo_manager_core::tooling::{Job, RojoState, StudioPlugin};
 use rojo_manager_core::updates::UpdateState;
 
 use super::MainView;
+use crate::agents::{self, Agent, Failure};
 use crate::logic;
 use crate::theme::*;
 use crate::widgets::{Button, Dialog, Variant, icon, panel, row, section, switch, tab_stop, tinted_row};
+
+/// Setup steps for an agent the app cannot add itself, shown over Settings.
+pub struct AgentHelp {
+    title: String,
+    message: String,
+    /// The config or command to copy.
+    code: String,
+    copy: &'static str,
+    /// List where common MCP clients keep their config file.
+    clients: bool,
+}
+
+impl AgentHelp {
+    fn other(path: &str) -> Self {
+        AgentHelp {
+            title: "Other MCP clients".into(),
+            message: "Add this to your MCP client's config file. If the file already has \"mcpServers\", \
+                      put only the rojo-manager entry inside it."
+                .into(),
+            code: agents::config_snippet(path),
+            copy: "Copy config",
+            clients: true,
+        }
+    }
+
+    fn manual(agent: Agent, path: &str, reason: &str) -> Self {
+        AgentHelp {
+            title: format!("Add to {}", agent.name()),
+            message: format!("{}. Run this in a terminal instead:", reason.trim_end_matches('.')),
+            code: agent.command_line(path),
+            copy: "Copy command",
+            clients: false,
+        }
+    }
+}
+
+const CLIENTS: [(&str, &str); 3] = [
+    ("Claude Desktop", r"%APPDATA%\Claude\claude_desktop_config.json"),
+    ("Cursor", r"%USERPROFILE%\.cursor\mcp.json"),
+    ("Windsurf", r"%USERPROFILE%\.codeium\windsurf\mcp_config.json"),
+];
 
 /// Read a setting from the snapshot; launch_at_startup lives in the registry, not config.json.
 fn value(snapshot: &Snapshot, key: &str) -> bool {
@@ -23,6 +65,40 @@ fn value(snapshot: &Snapshot, key: &str) -> bool {
 impl MainView {
     fn set_setting(&mut self, key: &'static str, value: bool, cx: &mut Context<Self>) {
         self.run(cx, move |engine| engine.set_setting(key, value), |_, (), _| {});
+    }
+
+    /// Run the agent's `mcp add` off the UI thread; if that cannot work, show the command to run instead.
+    fn add_to_agent(&mut self, key: &'static str, agent: Agent, cx: &mut Context<Self>) {
+        let Some(path) = self.snapshot.as_ref().map(|s| s.mcp_path.clone()) else { return };
+        self.adding = Some(key);
+        cx.notify();
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { agents::add(agent, &path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.adding = None;
+                match result {
+                    Ok(()) => {
+                        this.flash(key, "Added", cx);
+                        this.notify(format!("Added to {}. Start a new session to use it.", agent.name()), cx);
+                    }
+                    Err(Failure::Missing) => {
+                        let reason = format!("{}'s command line tool was not found", agent.name());
+                        this.agent_help = Some(AgentHelp::manual(agent, &path, &reason));
+                        cx.notify();
+                    }
+                    Err(Failure::Failed(message)) => {
+                        this.agent_help = Some(AgentHelp::manual(agent, &path, &message));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -105,20 +181,32 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
         ),
         _ => {}
     }
-    let setup = |id: &'static str, label: &'static str, cli: &'static str| {
-        Button::new(id).label(if view.copied(id) { "Copied" } else { label }).width(104.).on_click(cx.listener(
-            move |this, _, _, cx| {
-                let path = this.snapshot.as_ref().map(|s| s.mcp_path.clone()).unwrap_or_default();
-                this.copy(id, format!("{cli} mcp add rojo-manager -- \"{path}\""), cx);
-            },
-        ))
+    let setup = |key: &'static str, label: &'static str, agent: Agent| {
+        let label = if view.adding == Some(key) { "Adding…" } else { view.flashed(key).unwrap_or(label) };
+        Button::new(key)
+            .label(label)
+            .width(104.)
+            .disabled(view.adding.is_some())
+            .on_click(cx.listener(move |this, _, _, cx| this.add_to_agent(key, agent, cx)))
     };
-    let (claude, codex) = (setup("claude", "Claude Code", "claude"), setup("codex", "Codex", "codex"));
+    let other = Button::new("mcp-config").label("Other").width(104.).tip("Any other MCP client").on_click(cx.listener(
+        |this, _, _, cx| {
+            let path = this.snapshot.as_ref().map(|s| s.mcp_path.clone()).unwrap_or_default();
+            this.agent_help = Some(AgentHelp::other(&path));
+            cx.notify();
+        },
+    ));
     agents.push(
         row(
             "Add to an agent",
-            Some("Copies a command to run in a terminal.".into()),
-            div().flex().flex_shrink_0().gap(px(8.)).child(claude).child(codex),
+            None,
+            div()
+                .flex()
+                .flex_shrink_0()
+                .gap(px(8.))
+                .child(setup("claude", "Claude Code", Agent::Claude))
+                .child(setup("codex", "Codex", Agent::Codex))
+                .child(other),
         )
         .into_any_element(),
     );
@@ -326,4 +414,78 @@ pub fn render_tools(_: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView
             cx.notify();
         }),
     )
+}
+
+/// The steps for adding rojo-manager by hand: what to paste or run, with a copy button.
+pub fn render_agent_help(view: &MainView, help: &AgentHelp, cx: &mut Context<MainView>) -> Div {
+    let close = MainView::action(cx, |this, _, cx| {
+        this.agent_help = None;
+        cx.notify();
+    });
+    let close_click = close.clone();
+    let code = div()
+        .p(px(10.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(CARD))
+        .font_family(MONO)
+        .text_size(TEXT_SM)
+        .line_height(px(19.))
+        .text_color(rgb(TEXT))
+        .child(help.code.clone());
+    let clients = help.clients.then(|| {
+        let rows = CLIENTS.iter().map(|(name, file)| {
+            div()
+                .flex()
+                .flex_col()
+                .child(div().text_color(rgb(TEXT)).child(*name))
+                .child(div().font_family(MONO).text_size(TEXT_SM).text_color(rgb(MUTED)).child(*file))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .children(rows)
+            .child(div().text_color(rgb(MUTED)).child("VS Code uses \"servers\" in place of \"mcpServers\"."))
+    });
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .px(px(16.))
+        .pt(px(14.))
+        .pb(px(16.))
+        .text_size(TEXT_BASE)
+        .line_height(px(20.))
+        .child(div().text_color(rgb(TEXT)).child(help.message.clone()))
+        .child(code)
+        .children(clients)
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(8.))
+                .pt(px(4.))
+                .child(Button::new("agent-help-done").label("Done").on_click(move |_, w, cx| close_click(w, cx)))
+                .child(
+                    Button::new("agent-help-copy")
+                        .label(view.flashed("agent-help-copy").unwrap_or(help.copy))
+                        .variant(Variant::Primary)
+                        .width(112.)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(code) = this.agent_help.as_ref().map(|help| help.code.clone()) {
+                                this.copy("agent-help-copy", code, cx);
+                            }
+                        })),
+                ),
+        );
+    Dialog {
+        title: help.title.clone().into_any_element(),
+        actions: vec![],
+        body: body.into_any_element(),
+        max_width: 460.,
+        tall: false,
+    }
+    .render("agent-help", close)
 }
