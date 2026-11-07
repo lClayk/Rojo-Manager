@@ -18,7 +18,7 @@ Questions, feedback, and release updates are on the [DevForum thread](https://de
 2. Right-click the ZIP and choose **Extract All**.
 3. Open the extracted `RojoManager` folder and double-click **RojoManager.exe**.
 
-No installation or administrator access is needed. Keep `ToolInstaller.exe` and `RojoManagerMCP.exe` beside the app. The download is not code signed yet, so Windows SmartScreen may show "Windows protected your PC" on the first run. Click **More info**, then **Run anyway**.
+No installation or administrator access is needed. The app adds itself to the Start menu, so Windows search finds it. Keep `ToolInstaller.exe` and `RojoManagerMCP.exe` beside the app. The download is not code signed yet, so Windows SmartScreen may show "Windows protected your PC" on the first run. Click **More info**, then **Run anyway**.
 
 Requires Windows 10 or 11, x64. Other platforms are not currently supported.
 
@@ -95,7 +95,7 @@ Projects and settings are stored in `%LOCALAPPDATA%\RojoManager\config.json`, ou
 
 The app has no account, analytics, or credential store. It checks GitHub for Rojo Manager and Rojo releases, probes local Rojo servers, and asks Roblox's public APIs for a place's experience when you set one. Tool installers make their own network requests and manage their own configuration. Do not include your settings file or project logs when sharing a bug report without checking them for private paths and output.
 
-To reset the app, quit it and move or delete its settings file. To uninstall, disable Windows startup in Settings, quit, and delete the extracted application folder. Remove the settings folder too if you want to erase saved projects. Tools installed through Rokit remain installed.
+To reset the app, quit it and move or delete its settings file. To uninstall, disable Windows startup in Settings, quit, and delete the extracted application folder and the **Rojo Manager** shortcut in `%APPDATA%\Microsoft\Windows\Start Menu\Programs`. Remove the settings folder too if you want to erase saved projects. Tools installed through Rokit remain installed.
 
 ## Develop and build
 
