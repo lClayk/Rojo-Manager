@@ -110,8 +110,6 @@ cargo install cargo-about
 
 The ZIP and SHA-256 checksum are written to `dist`. `cargo run -p rojo-manager` runs the app. Tests use temporary settings and never touch the real Windows startup entry. Set `ROJO_MANAGER_DATA_DIR` to a separate folder when testing an isolated app profile. CI runs the same steps and checks the packaged executables with `tests/check_bundle.py`.
 
-Saved settings, local screenshots, credentials, and build output are excluded from Git.
-
 ## License
 
 [MIT](LICENSE). Bundled dependencies retain their own licenses, included in the download's `licenses` folder. Rojo Manager is an independent project and is not affiliated with Roblox, the Rojo maintainers, or robloxstudio-mcp.

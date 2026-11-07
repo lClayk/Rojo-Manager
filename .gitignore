@@ -17,6 +17,7 @@ build/
 dist/
 .release/
 .agents/
+AGENTS.md
 .codex/
 .DS_Store
 Thumbs.db
