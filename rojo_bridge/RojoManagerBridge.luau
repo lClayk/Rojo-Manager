@@ -31,11 +31,21 @@ local DEFAULT_PORT = 34872
 
 local published: { [any]: BindableFunction } = {}
 
+-- Rojo's live session, if any.
+local function connected(app): boolean
+	return app.serveSession ~= nil and app.serveSession:getStatus() == "Connected"
+end
+
 local function status(app)
 	local state = app.state or {}
+	-- appStatus is the page Rojo shows; its Settings page can sit over a session.
+	local appStatus = state.appStatus
+	if appStatus == "Settings" then
+		appStatus = if connected(app) then "Connected" else "NotConnected"
+	end
 	return {
 		bridge = VERSION,
-		status = state.appStatus,
+		status = appStatus,
 		host = app.host:getValue(),
 		port = app.port:getValue(),
 		projectName = state.projectName,
@@ -92,7 +102,7 @@ local actions = {
 
 -- The server Rojo has a live session with, or 0.
 local function connectedPort(app): number
-	if (app.state or {}).appStatus ~= "Connected" then
+	if not connected(app) then
 		return 0
 	end
 	return tonumber(app.port:getValue()) or DEFAULT_PORT
@@ -106,7 +116,7 @@ local function acceptPrompt(app)
 		if status == "Confirming" then
 			app.confirmationBindable:Fire("Accept")
 			return
-		elseif status == "Connected" or status == "Error" then
+		elseif connected(app) or status == "Error" then
 			return -- no prompt this time, or the connection failed
 		end
 		task.wait(0.2)
@@ -132,10 +142,8 @@ local function poll(app, bindable: BindableFunction)
 				offer, accept = body.port, body.accept == true
 			end
 		end
-		-- Rojo shows Error after a lost connection, such as the server restarting.
-		local status = (app.state or {}).appStatus
-		local idle = app.serveSession == nil and (status == "NotConnected" or status == "Error")
-		if offer ~= nil and offer ~= offered and idle then
+		-- No session, whatever page Rojo shows (Error after a lost connection, or Settings).
+		if offer ~= nil and offer ~= offered and app.serveSession == nil then
 			actions.connect(app, "localhost", tostring(offer))
 			if accept then
 				task.spawn(acceptPrompt, app)
