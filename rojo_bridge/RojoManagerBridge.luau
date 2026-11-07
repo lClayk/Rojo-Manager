@@ -11,26 +11,41 @@
 --   bridge:Invoke("disconnect")          -> status
 --   bridge:Invoke("accept" | "abort")    -> status; answers Rojo's initial sync confirmation
 --
--- When a place opens, it also asks Rojo Manager (on a fixed local port) whether a running project
--- with auto-connect is linked to this place, and connects to that server if so. It also tells
--- Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
+-- Every few seconds it tells Rojo Manager (on a fixed local port) which server Rojo is connected to,
+-- so Rojo Manager shows Connected only for real sessions. The answer names the server of a running
+-- project with auto-connect linked to this place, and the bridge connects when that offer appears,
+-- accepting Rojo's initial sync prompt unless Rojo Manager's settings say to ask.
+-- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
 
 local CoreGui = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local NAME = "RojoManagerBridge"
-local VERSION = 5
-local AUTO_CONNECT_URL = "http://localhost:34871/auto-connect/"
+local VERSION = 6
+local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
+local POLL_SECONDS = 5
+-- Rojo's port when its port field is empty.
+local DEFAULT_PORT = 34872
 
 local published: { [any]: BindableFunction } = {}
 
+-- Rojo's live session, if any.
+local function connected(app): boolean
+	return app.serveSession ~= nil and app.serveSession:getStatus() == "Connected"
+end
+
 local function status(app)
 	local state = app.state or {}
+	-- appStatus is the page Rojo shows; its Settings page can sit over a session.
+	local appStatus = state.appStatus
+	if appStatus == "Settings" then
+		appStatus = if connected(app) then "Connected" else "NotConnected"
+	end
 	return {
 		bridge = VERSION,
-		status = state.appStatus,
+		status = appStatus,
 		host = app.host:getValue(),
 		port = app.port:getValue(),
 		projectName = state.projectName,
@@ -85,26 +100,58 @@ local actions = {
 	end,
 }
 
-local function autoConnect(app)
-	if game.PlaceId == 0 then
-		return
+-- The server Rojo has a live session with, or 0.
+local function connectedPort(app): number
+	if not connected(app) then
+		return 0
 	end
-	local ok, response = pcall(HttpService.RequestAsync, HttpService, {
-		Url = AUTO_CONNECT_URL .. game.PlaceId,
-		Method = "GET",
-	})
-	if not ok or not response.Success then
-		return -- Rojo Manager is closed, or no running project auto-connects to this place
+	return tonumber(app.port:getValue()) or DEFAULT_PORT
+end
+
+-- Answer the sync prompt of the session auto-connect just started, once Rojo asks.
+local function acceptPrompt(app)
+	local deadline = os.clock() + 30
+	while os.clock() < deadline do
+		local status = (app.state or {}).appStatus
+		if status == "Confirming" then
+			app.confirmationBindable:Fire("Accept")
+			return
+		elseif connected(app) or status == "Error" then
+			return -- no prompt this time, or the connection failed
+		end
+		task.wait(0.2)
 	end
-	local decoded, body = pcall(HttpService.JSONDecode, HttpService, response.Body)
-	if not decoded or type(body) ~= "table" or type(body.port) ~= "number" then
-		return
+end
+
+-- Report the session and act on the auto-connect offer until the plugin unloads. An offer connects
+-- only when it appears (the place opened, the server started, or auto-connect was turned on), so
+-- disconnecting by hand sticks.
+local function poll(app, bindable: BindableFunction)
+	local id = Random.new():NextInteger(1, 2 ^ 31 - 1)
+	local offered: number? = nil
+	while published[app] == bindable do
+		local ok, response = pcall(HttpService.RequestAsync, HttpService, {
+			Url = `{POLL_URL}{id}/{game.PlaceId}/{connectedPort(app)}`,
+			Method = "GET",
+		})
+		-- 404 means Rojo Manager knows no running project that auto-connects here.
+		local offer: number?, accept = nil, false
+		if ok and response.Success then
+			local decoded, body = pcall(HttpService.JSONDecode, HttpService, response.Body)
+			if decoded and type(body) == "table" and type(body.port) == "number" then
+				offer, accept = body.port, body.accept == true
+			end
+		end
+		-- No session, whatever page Rojo shows (Error after a lost connection, or Settings).
+		if offer ~= nil and offer ~= offered and app.serveSession == nil then
+			actions.connect(app, "localhost", tostring(offer))
+			if accept then
+				task.spawn(acceptPrompt, app)
+			end
+		end
+		offered = offer
+		task.wait(POLL_SECONDS)
 	end
-	-- Rojo's own auto-reconnect, or the user, may have connected while this request ran.
-	if app.serveSession ~= nil or (app.state or {}).appStatus ~= "NotConnected" then
-		return
-	end
-	actions.connect(app, "localhost", tostring(body.port))
 end
 
 -- Each running Rojo plugin opens one "Rojo <version>" widget.
@@ -150,8 +197,8 @@ function Bridge.attach(app)
 	end
 	bindable.Parent = CoreGui
 	published[app] = bindable
-	-- The request yields, so the app has mounted by the time it can connect.
-	task.spawn(autoConnect, app)
+	-- The first request yields, so the app has mounted by the time it can connect.
+	task.spawn(poll, app, bindable)
 	task.spawn(reportRojoPlugins)
 end
 

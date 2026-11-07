@@ -147,6 +147,26 @@ pub struct PluginRow {
     pub primary: bool,
 }
 
+/// Why the installed bridge needs rebuilding: an older Rojo Manager built it, Rojo changed since,
+/// or this app ships a newer bridge. `rojo` is the installed Rojo's `--version` output, once read.
+pub fn bridge_outdated(plugin: &StudioPlugin, rojo: Option<&str>) -> Option<String> {
+    let StudioPlugin::Bridge { built } = plugin else { return None };
+    let Some(built) = built else {
+        return Some("The Studio bridge was installed by an older Rojo Manager. Update it once.".into());
+    };
+    match rojo {
+        Some(installed) if full_version(installed) != full_version(&built.rojo) => Some(format!(
+            "The Studio bridge was built for Rojo {}, but Rojo {} is installed. Update to match.",
+            built.rojo,
+            version_number(installed)
+        )),
+        _ if built.bridge < BRIDGE_VERSION => {
+            Some("A newer Studio bridge is available. Update, then restart Studio.".into())
+        }
+        _ => None,
+    }
+}
+
 /// `rojo` is the installed Rojo's `--version` output, once read.
 pub fn plugin_row(plugin: &StudioPlugin, rojo: Option<&str>, installing: bool) -> PluginRow {
     let row = |hint: String, warn, button, primary| PluginRow { hint, warn, button, primary };
@@ -163,25 +183,13 @@ pub fn plugin_row(plugin: &StudioPlugin, rojo: Option<&str>, installing: bool) -
             "Add bridge",
             true,
         ),
-        StudioPlugin::Bridge { built: None } => {
-            row("Installed by an older Rojo Manager. Update it once.".into(), true, "Update", true)
-        }
-        StudioPlugin::Bridge { built: Some(built) } => match rojo {
-            Some(installed) if full_version(installed) != full_version(&built.rojo) => row(
+        StudioPlugin::Bridge { built } => match (bridge_outdated(plugin, rojo), built) {
+            (Some(hint), _) => row(hint, true, "Update", true),
+            (None, built) => row(
                 format!(
-                    "Built for Rojo {}, but Rojo {} is installed. Update to match.",
-                    built.rojo,
-                    version_number(installed)
+                    "Installed for Rojo {}. Updating Rojo here updates it too.",
+                    built.as_ref().map_or("", |built| built.rojo.as_str())
                 ),
-                true,
-                "Update",
-                true,
-            ),
-            _ if built.bridge < BRIDGE_VERSION => {
-                row("A newer bridge is available. Update, then restart Studio.".into(), true, "Update", true)
-            }
-            _ => row(
-                format!("Installed for Rojo {}. Updating Rojo here updates it too.", built.rojo),
                 false,
                 "Reinstall",
                 false,
@@ -270,7 +278,11 @@ mod tests {
         let row = plugin_row(&bridge("7.6.1", BRIDGE_VERSION), Some("Rojo 7.7.0"), false);
         assert_eq!(
             (row.hint.as_str(), row.button, row.warn),
-            ("Built for Rojo 7.6.1, but Rojo 7.7.0 is installed. Update to match.", "Update", true)
+            (
+                "The Studio bridge was built for Rojo 7.6.1, but Rojo 7.7.0 is installed. Update to match.",
+                "Update",
+                true
+            )
         );
         assert_eq!(plugin_row(&bridge("7.7.0", BRIDGE_VERSION - 1), Some("Rojo 7.7.0"), false).button, "Update");
         assert_eq!(plugin_row(&bridge("7.7.0", BRIDGE_VERSION), Some("Rojo 7.7.0"), false).button, "Reinstall");

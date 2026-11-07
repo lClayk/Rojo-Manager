@@ -54,8 +54,8 @@ impl std::fmt::Display for ControlError {
 /// - POST /projects/<name>/<action>  act(Some(name), action, body), action in ACTIONS
 /// - GET  /projects/<name>/logs      logs(name)
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
-/// - GET  /auto-connect/<placeId>    {"port": auto_connect_port(placeId)} or 404 (AutoConnectServer, no token)
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
+/// - GET  /bridge/<id>/<placeId>/<port>  {"port", "accept"} from report_bridge(..) or 404 (AutoConnectServer, no token)
 ///
 /// Bodies are JSON objects ({} when empty). Errors reply {"error": message} with their status.
 pub trait ControlHandler: Send + Sync + 'static {
@@ -64,9 +64,11 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn settings(&self, changes: Option<&Map<String, Value>>) -> Result<Value, ControlError>;
     /// {"project", "state", "lines"}: the project's recent Rojo output, oldest first.
     fn logs(&self, project: &str) -> Result<Value, ControlError>;
-    fn auto_connect_port(&self, place_id: u64) -> Option<u16>;
     /// How many Rojo plugins the bridge found running in Studio.
     fn report_rojo_plugins(&self, count: u32);
+    /// A bridge's poll with the server its Rojo is connected to (0 for none); answers the place's
+    /// auto-connect port and whether to accept Rojo's sync prompt.
+    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)>;
 }
 
 pub fn control_path() -> PathBuf {
@@ -107,7 +109,7 @@ impl ControlServer {
     }
 }
 
-/// Answers GET /auto-connect/<placeId> and /rojo-plugins/<count> on 127.0.0.1:`port`. Binding
+/// Answers the bridge's GET requests (auto-connect, rojo-plugins, bridge) on 127.0.0.1:`port`. Binding
 /// fails when another program, or another Rojo Manager, holds the port (no address reuse).
 pub struct AutoConnectServer {
     served: Served,
@@ -119,16 +121,22 @@ impl AutoConnectServer {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         let served = Served::start(listener, move |request| {
             let allowed = *request.method() == tiny_http::Method::Get && header(request, "Origin").is_none();
-            let (route, number) = request.url().trim_matches('/').split_once('/').unwrap_or_default();
-            let number = number.bytes().all(|b| b.is_ascii_digit()).then(|| number.parse::<u64>().ok()).flatten();
-            match (route, number.filter(|_| allowed)) {
-                ("auto-connect", Some(place)) => {
-                    let found = handler.auto_connect_port(place);
-                    (if found.is_some() { 200 } else { 404 }, json!({ "port": found }))
-                }
-                ("rojo-plugins", Some(count)) => {
+            let url = request.url().trim_matches('/');
+            let (route, rest) = url.split_once('/').unwrap_or((url, ""));
+            let numbers: Option<Vec<u64>> = rest
+                .split('/')
+                .map(|part| part.bytes().all(|b| b.is_ascii_digit()).then(|| part.parse::<u64>().ok()).flatten())
+                .collect();
+            match (route, numbers.as_deref().filter(|_| allowed)) {
+                ("rojo-plugins", Some(&[count])) => {
                     handler.report_rojo_plugins(u32::try_from(count).unwrap_or(u32::MAX));
                     (200, json!({}))
+                }
+                ("bridge", Some(&[id, place, port])) => {
+                    match handler.report_bridge(id, place, u16::try_from(port).unwrap_or(0)) {
+                        Some((port, accept)) => (200, json!({ "port": port, "accept": accept })),
+                        None => (404, json!({ "port": null })),
+                    }
                 }
                 _ => (404, json!({ "port": null })),
             }
@@ -393,12 +401,13 @@ mod tests {
             Ok(json!({"project": project, "lines": ["a"]}))
         }
 
-        fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
-            (place_id == 42).then_some(34880)
-        }
-
         fn report_rojo_plugins(&self, count: u32) {
             self.calls.lock().unwrap().push(json!(["rojo-plugins", count]));
+        }
+
+        fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
+            self.calls.lock().unwrap().push(json!(["bridge", id, place_id, port]));
+            (place_id == 42).then_some((34880, true))
         }
     }
 
@@ -479,18 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn auto_connect_answers_only_a_port_for_a_place_and_owns_its_port() {
+    fn bridge_server_answers_only_a_port_for_a_place_and_owns_its_port() {
         let server = AutoConnectServer::start(Arc::new(Fake::default()), 0).unwrap();
         let port = server.served.server.server_addr().to_ip().unwrap().port();
         let get = |path: &str, headers: &[(&str, &str)]| {
             let response = crate::localnet::request(port, "GET", path, None, headers, TIMEOUT, None).unwrap();
             (response.status, serde_json::from_slice::<Value>(&response.body).unwrap())
         };
-        assert_eq!(get("/auto-connect/42", &[]), (200, json!({"port": 34880})));
-        assert_eq!(get("/auto-connect/7", &[]).0, 404);
-        assert_eq!(get("/auto-connect/42", &[("Origin", "https://example.invalid")]).0, 404);
         assert_eq!(get("/rojo-plugins/2", &[]).0, 200);
         assert_eq!(get("/rojo-plugins/x", &[]).0, 404);
+        assert_eq!(get("/bridge/9/42/0", &[]), (200, json!({"port": 34880, "accept": true})));
+        assert_eq!(get("/bridge/9/7/34881", &[]).0, 404);
+        assert_eq!(get("/bridge/9/42", &[]).0, 404);
+        assert_eq!(get("/bridge/9/42/0", &[("Origin", "https://example.invalid")]).0, 404);
+        assert_eq!(get("/auto-connect/42", &[]).0, 404);
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         server.close();

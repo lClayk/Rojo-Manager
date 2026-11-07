@@ -27,6 +27,8 @@ pub const FIRST_PORT: u16 = 34872;
 /// A crashed server is restarted at most this many times within CRASH_WINDOW.
 const CRASH_RESTARTS: usize = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
+/// A bridge polls every few seconds; one silent this long has unloaded with its Studio.
+const BRIDGE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -173,9 +175,30 @@ struct State {
     /// Recent unexpected exits per project, for the crash restart limit.
     crashes: HashMap<String, Vec<Instant>>,
     studio_rojo_plugins: Option<u32>,
+    /// Each running Studio bridge's last poll, by the random id it picked when it loaded.
+    bridges: HashMap<u64, BridgeReport>,
+}
+
+/// What a Studio bridge last said and was told.
+struct BridgeReport {
+    /// The server its Rojo is connected to, or 0.
+    port: u16,
+    /// The auto-connect server offered to it.
+    offered: Option<u16>,
+    seen: Instant,
 }
 
 impl State {
+    /// The running server whose project auto-connects to this place: (project name, port).
+    fn auto_connect_target(&self, place_id: u64) -> Option<(String, u16)> {
+        let project = self.config.projects.iter().find(|p| {
+            p.auto_connect
+                && p.place.is_some_and(|place| place.place_id == place_id)
+                && self.states.get(&p.name).is_some_and(|s| s.running())
+        })?;
+        Some((project.name.clone(), project.port))
+    }
+
     fn view_state(&self, name: &str) -> ServerState {
         let state = self.states.get(name).copied().unwrap_or(ServerState::Off);
         // The watcher can lag a launch by a tick, so in-flight work wins.
@@ -697,18 +720,25 @@ impl Engine {
         Ok(())
     }
 
-    /// The Studio bridge's question: the port of a running server whose project auto-connects to this place.
-    pub fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
-        let state = self.lock();
-        let project = state.config.projects.iter().find(|p| {
-            p.auto_connect
-                && p.place.is_some_and(|place| place.place_id == place_id)
-                && state.states.get(&p.name).is_some_and(|s| s.running())
-        })?;
-        let (name, port) = (project.name.clone(), project.port);
-        drop(state);
-        self.notice(format!("{name}: connecting Rojo in Studio"));
-        Some(port)
+    /// A bridge's poll: the server its Rojo is connected to (0 for none), so only real sessions
+    /// show as Connected. Answers with the place's auto-connect server and whether to accept Rojo's
+    /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
+    /// starting the server connects an open place.
+    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
+        let (target, previous, accept) = {
+            let mut state = self.lock();
+            let target = state.auto_connect_target(place_id);
+            let report = BridgeReport { port, offered: target.as_ref().map(|(_, port)| *port), seen: Instant::now() };
+            (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept)
+        };
+        if previous.as_ref().map(|report| report.port) != Some(port) {
+            self.wake_watcher();
+        }
+        let (name, offer) = target?;
+        if port == 0 && previous.and_then(|report| report.offered) != Some(offer) {
+            self.notice(format!("{name}: connecting Rojo in Studio"));
+        }
+        Some((offer, accept))
     }
 
     /// An unexpected exit. When restarting is on, the server starts again, up to CRASH_RESTARTS
@@ -755,9 +785,13 @@ impl Engine {
                 self.sleep_watcher(Duration::from_secs(1));
                 continue;
             };
-            let (projects, mut launching) = {
-                let state = self.lock();
-                (state.config.projects.clone(), !state.starting.is_empty() || !state.restarting.is_empty())
+            let (projects, mut launching, bridged) = {
+                let mut state = self.lock();
+                state.bridges.retain(|_, report| report.seen.elapsed() < BRIDGE_TTL);
+                // The ports live bridges report as connected; None when no bridge runs.
+                let bridged: Option<HashSet<u16>> = (!state.bridges.is_empty())
+                    .then(|| state.bridges.values().map(|report| report.port).filter(|&port| port != 0).collect());
+                (state.config.projects.clone(), !state.starting.is_empty() || !state.restarting.is_empty(), bridged)
             };
             let mut changed = false;
             for project in projects {
@@ -781,7 +815,10 @@ impl Engine {
                 let owned = self.lock().procs.contains_key(&name);
                 let state = match listening.get(&port) {
                     Some(_) if owned => {
-                        if established.get(&port).copied().unwrap_or(0) > 0 {
+                        // Studio keeps idle connections open, such as the one behind Rojo's "is serving"
+                        // prompt, so a live bridge decides; without one, any connection counts.
+                        let open = established.get(&port).copied().unwrap_or(0) > 0;
+                        if open && bridged.as_ref().is_none_or(|ports| ports.contains(&port)) {
                             ServerState::Connected
                         } else {
                             ServerState::Serving
@@ -1331,8 +1368,8 @@ impl ControlHandler for Control {
         Ok(self.0.settings_value())
     }
 
-    fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
-        self.0.auto_connect_port(place_id)
+    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
+        self.0.report_bridge(id, place_id, port)
     }
 }
 
