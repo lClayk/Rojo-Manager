@@ -412,6 +412,20 @@ impl MainView {
                 )),
             ));
         }
+        let rojo = snapshot.tool_versions.get("Rojo").cloned().flatten();
+        if let Some(message) = logic::bridge_outdated(&snapshot.studio_plugin, rojo.as_deref()) {
+            let installing = settings::installing_bridge(snapshot);
+            banners.push(Self::banner(
+                "circle-arrow-up",
+                BLUE,
+                message,
+                Button::new("update-bridge")
+                    .label(if installing { "Updating" } else { "Update bridge" })
+                    .variant(Variant::Primary)
+                    .disabled(snapshot.tool_job.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| this.tool_job(Job::Bridge { tool: "Rojo".into() }, cx))),
+            ));
+        }
         let update = &snapshot.app_update;
         let installing = update.state == UpdateState::Installing;
         if update.state == UpdateState::Outdated || installing {

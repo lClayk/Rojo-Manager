@@ -720,13 +720,6 @@ impl Engine {
         Ok(())
     }
 
-    /// The Studio bridge's question: the port of a running server whose project auto-connects to this place.
-    pub fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
-        let (name, port) = self.lock().auto_connect_target(place_id)?;
-        self.notice(format!("{name}: connecting Rojo in Studio"));
-        Some(port)
-    }
-
     /// A bridge's poll: the server its Rojo is connected to (0 for none), so only real sessions
     /// show as Connected. Answers with the place's auto-connect server and whether to accept Rojo's
     /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
@@ -1373,10 +1366,6 @@ impl ControlHandler for Control {
             }
         }
         Ok(self.0.settings_value())
-    }
-
-    fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
-        self.0.auto_connect_port(place_id)
     }
 
     fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {

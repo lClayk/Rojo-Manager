@@ -117,15 +117,20 @@ fn toggle(
         .into_any_element()
 }
 
+/// Whether the running tool job builds the Studio plugin; updating Rojo rebuilds the bridge too.
+pub fn installing_bridge(snapshot: &Snapshot) -> bool {
+    let bridge = matches!(snapshot.studio_plugin, StudioPlugin::Bridge { .. });
+    snapshot.tool_job.as_ref().is_some_and(|job| {
+        matches!(job.operation.as_str(), "bridge" | "plugin")
+            || (bridge && job.operation == "global" && job.tool == "Rojo")
+    })
+}
+
 pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) -> Div {
     let busy = snapshot.tool_job.is_some();
     let update = &snapshot.app_update;
     let bridge = matches!(snapshot.studio_plugin, StudioPlugin::Bridge { .. });
-    // Updating Rojo rebuilds the bridge too.
-    let installing = snapshot.tool_job.as_ref().is_some_and(|job| {
-        matches!(job.operation.as_str(), "bridge" | "plugin")
-            || (bridge && job.operation == "global" && job.tool == "Rojo")
-    });
+    let installing = installing_bridge(snapshot);
     let rojo = snapshot.tool_versions.get("Rojo").cloned().flatten();
     let plugin = logic::plugin_row(&snapshot.studio_plugin, rojo.as_deref(), installing);
     let shortcuts = [

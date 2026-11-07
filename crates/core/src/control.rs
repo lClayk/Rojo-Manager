@@ -54,7 +54,6 @@ impl std::fmt::Display for ControlError {
 /// - POST /projects/<name>/<action>  act(Some(name), action, body), action in ACTIONS
 /// - GET  /projects/<name>/logs      logs(name)
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
-/// - GET  /auto-connect/<placeId>    {"port": auto_connect_port(placeId)} or 404 (AutoConnectServer, no token)
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
 /// - GET  /bridge/<id>/<placeId>/<port>  {"port", "accept"} from report_bridge(..) or 404 (AutoConnectServer, no token)
 ///
@@ -65,7 +64,6 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn settings(&self, changes: Option<&Map<String, Value>>) -> Result<Value, ControlError>;
     /// {"project", "state", "lines"}: the project's recent Rojo output, oldest first.
     fn logs(&self, project: &str) -> Result<Value, ControlError>;
-    fn auto_connect_port(&self, place_id: u64) -> Option<u16>;
     /// How many Rojo plugins the bridge found running in Studio.
     fn report_rojo_plugins(&self, count: u32);
     /// A bridge's poll with the server its Rojo is connected to (0 for none); answers the place's
@@ -129,9 +127,7 @@ impl AutoConnectServer {
                 .split('/')
                 .map(|part| part.bytes().all(|b| b.is_ascii_digit()).then(|| part.parse::<u64>().ok()).flatten())
                 .collect();
-            let port_answer = |found: Option<u16>| (if found.is_some() { 200 } else { 404 }, json!({ "port": found }));
             match (route, numbers.as_deref().filter(|_| allowed)) {
-                ("auto-connect", Some(&[place])) => port_answer(handler.auto_connect_port(place)),
                 ("rojo-plugins", Some(&[count])) => {
                     handler.report_rojo_plugins(u32::try_from(count).unwrap_or(u32::MAX));
                     (200, json!({}))
@@ -405,17 +401,13 @@ mod tests {
             Ok(json!({"project": project, "lines": ["a"]}))
         }
 
-        fn auto_connect_port(&self, place_id: u64) -> Option<u16> {
-            (place_id == 42).then_some(34880)
-        }
-
         fn report_rojo_plugins(&self, count: u32) {
             self.calls.lock().unwrap().push(json!(["rojo-plugins", count]));
         }
 
         fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
             self.calls.lock().unwrap().push(json!(["bridge", id, place_id, port]));
-            self.auto_connect_port(place_id).map(|port| (port, true))
+            (place_id == 42).then_some((34880, true))
         }
     }
 
@@ -496,21 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn auto_connect_answers_only_a_port_for_a_place_and_owns_its_port() {
+    fn bridge_server_answers_only_a_port_for_a_place_and_owns_its_port() {
         let server = AutoConnectServer::start(Arc::new(Fake::default()), 0).unwrap();
         let port = server.served.server.server_addr().to_ip().unwrap().port();
         let get = |path: &str, headers: &[(&str, &str)]| {
             let response = crate::localnet::request(port, "GET", path, None, headers, TIMEOUT, None).unwrap();
             (response.status, serde_json::from_slice::<Value>(&response.body).unwrap())
         };
-        assert_eq!(get("/auto-connect/42", &[]), (200, json!({"port": 34880})));
-        assert_eq!(get("/auto-connect/7", &[]).0, 404);
-        assert_eq!(get("/auto-connect/42", &[("Origin", "https://example.invalid")]).0, 404);
         assert_eq!(get("/rojo-plugins/2", &[]).0, 200);
         assert_eq!(get("/rojo-plugins/x", &[]).0, 404);
         assert_eq!(get("/bridge/9/42/0", &[]), (200, json!({"port": 34880, "accept": true})));
         assert_eq!(get("/bridge/9/7/34881", &[]).0, 404);
         assert_eq!(get("/bridge/9/42", &[]).0, 404);
+        assert_eq!(get("/bridge/9/42/0", &[("Origin", "https://example.invalid")]).0, 404);
+        assert_eq!(get("/auto-connect/42", &[]).0, 404);
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         server.close();
