@@ -546,7 +546,7 @@ pub struct BridgeBuild {
 }
 
 /// The `VERSION` in RojoManagerBridge.luau; raise both together.
-pub const BRIDGE_VERSION: u32 = 5;
+pub const BRIDGE_VERSION: u32 = 6;
 
 fn bridge_record() -> PathBuf {
     crate::config::data_dir().join("bridge.json")
