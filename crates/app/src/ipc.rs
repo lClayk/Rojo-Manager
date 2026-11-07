@@ -25,6 +25,12 @@ pub enum Call {
     Toggle {
         name: String,
     },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
     StartAll,
     StopAll,
     PortOwner {
@@ -107,6 +113,11 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::Snapshot => json(Ok(engine.snapshot())),
         Call::Logs { name } => json(Ok(engine.logs(&name))),
         Call::Toggle { name } => json(engine.toggle(&name)),
+        Call::Start { name } => json(engine.start(&name)),
+        Call::Stop { name } => {
+            engine.stop(&name);
+            Ok(Value::Null)
+        }
         Call::PortOwner { name } => json(engine.port_owner(&name)),
         Call::KillPortOwner { name, pid } => json(engine.kill_port_owner(&name, pid)),
         Call::AddProjects { path } => json(engine.add_projects(&path)),
@@ -205,6 +216,12 @@ impl Client {
     }
     pub fn toggle(&self, name: &str) -> Result<(), String> {
         self.call(Call::Toggle { name: name.into() })
+    }
+    pub fn start_server(&self, name: &str) -> Result<(), String> {
+        self.call(Call::Start { name: name.into() })
+    }
+    pub fn stop_server(&self, name: &str) -> Result<(), String> {
+        self.call(Call::Stop { name: name.into() })
     }
     pub fn start_all(&self) {
         self.send(Call::StartAll);

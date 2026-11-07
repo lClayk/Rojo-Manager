@@ -419,9 +419,8 @@ impl MainView {
             }
             let name = name.clone();
             match action {
-                GroupAction::Start | GroupAction::Stop => {
-                    self.run(cx, move |engine| engine.toggle(&name), |_, (), _| {});
-                }
+                GroupAction::Start => self.run(cx, move |engine| engine.start_server(&name), |_, (), _| {}),
+                GroupAction::Stop => self.run(cx, move |engine| engine.stop_server(&name), |_, (), _| {}),
                 GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: Place, _| {}),
             }
         }
