@@ -3,6 +3,7 @@
 //! light however often the window is opened and closed.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agents;
 mod host;
 mod instance;
 mod ipc;

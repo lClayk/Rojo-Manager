@@ -24,9 +24,10 @@ use crate::theme::*;
 use crate::widgets::{Button, Callback, Dialog, TITLE_BAR, Variant, tabbable};
 
 pub use logs::Logs;
+use settings::AgentHelp;
 
 const NOTICE: Duration = Duration::from_secs(6);
-const COPIED: Duration = Duration::from_secs(2);
+const FLASH: Duration = Duration::from_secs(2);
 
 /// Which project field an inline editor is changing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,8 +70,12 @@ pub struct MainView {
     logs: Option<Logs>,
     confirm: Option<Confirm>,
     editing: Option<Editing>,
-    /// The copy button that says "Copied" for a moment.
-    copied: Option<(&'static str, Task<()>)>,
+    /// The button that briefly shows an outcome ("Copied", "Added") instead of its label.
+    flash: Option<(&'static str, &'static str, Task<()>)>,
+    /// The agent button whose `mcp add` is running.
+    adding: Option<&'static str>,
+    /// Manual setup steps for an agent, over Settings.
+    agent_help: Option<AgentHelp>,
     list_scroll: ScrollHandle,
     settings_scroll: ScrollHandle,
 }
@@ -93,7 +98,9 @@ impl MainView {
             logs: None,
             confirm: None,
             editing: None,
-            copied: None,
+            flash: None,
+            adding: None,
+            agent_help: None,
             list_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
         };
@@ -182,20 +189,25 @@ impl MainView {
 
     fn copy(&mut self, key: &'static str, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.flash(key, "Copied", cx);
+    }
+
+    /// Show `label` on the button `key` for two seconds.
+    fn flash(&mut self, key: &'static str, label: &'static str, cx: &mut Context<Self>) {
         let reset = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COPIED).await;
+            cx.background_executor().timer(FLASH).await;
             this.update(cx, |this, cx| {
-                this.copied = None;
+                this.flash = None;
                 cx.notify();
             })
             .ok();
         });
-        self.copied = Some((key, reset));
+        self.flash = Some((key, label, reset));
         cx.notify();
     }
 
-    fn copied(&self, key: &str) -> bool {
-        self.copied.as_ref().is_some_and(|(copied, _)| *copied == key)
+    fn flashed(&self, key: &str) -> Option<&'static str> {
+        self.flash.as_ref().filter(|(flashed, ..)| *flashed == key).map(|(_, label, _)| *label)
     }
 
     fn add_project(&mut self, cx: &mut Context<Self>) {
@@ -264,7 +276,11 @@ impl MainView {
         if self.editing.is_some() {
             return self.cancel_edit(window, cx);
         }
-        if self.confirm.take().is_none() && !std::mem::take(&mut self.tools_open) && self.logs.take().is_none() {
+        if self.confirm.take().is_none()
+            && self.agent_help.take().is_none()
+            && !std::mem::take(&mut self.tools_open)
+            && self.logs.take().is_none()
+        {
             self.settings_open = false;
         }
         cx.notify();
@@ -621,7 +637,7 @@ impl Render for MainView {
             return root.child(TitleBar::new().h(px(TITLE_BAR)));
         };
         // Only the topmost layer's controls are Tab stops: the list, or the dialog on top of it.
-        let top: u8 = if self.confirm.is_some() {
+        let top: u8 = if self.confirm.is_some() || self.agent_help.is_some() {
             4
         } else if self.logs.is_some() {
             3
@@ -652,6 +668,10 @@ impl Render for MainView {
             .when_some(
                 self.logs.as_ref().map(|logs| tabbable(top == 3, || logs::render(self, logs, cx))),
                 |root, logs| root.child(logs),
+            )
+            .when_some(
+                self.agent_help.as_ref().map(|help| settings::render_agent_help(self, help, cx)),
+                |root, help| root.child(help),
             )
             .children(self.render_confirm(cx))
     }
