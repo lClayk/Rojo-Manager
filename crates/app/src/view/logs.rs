@@ -110,7 +110,7 @@ pub fn render(view: &MainView, logs: &Logs, cx: &mut Context<MainView>) -> Div {
             .child("Follow output")
             .into_any_element(),
         Button::new("copy-logs")
-            .label(if view.copied("logs") { "Copied" } else { "Copy logs" })
+            .label(view.flashed("logs").unwrap_or("Copy logs"))
             .disabled(count == 0)
             .on_click(cx.listener(|this, _, _, cx| {
                 let text = this.logs.as_ref().map(Logs::text).unwrap_or_default();

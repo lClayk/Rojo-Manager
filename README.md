@@ -61,7 +61,7 @@ AI agents can run your Rojo servers, open places in Studio, and connect or disco
 
 1. Set up robloxstudio-mcp by following its README, if you have not already.
 2. In **Settings > Agents**, click **Install** next to **Studio plugin with agent bridge**, then restart Studio. If you also have the Creator Store Rojo, turn it off in Studio (**Plugins > Manage Plugins**) so only one Rojo runs.
-3. Under **Add to an agent**, click **Claude Code** or **Codex** and run the copied command in a terminal. It adds `rojo-manager` to that agent.
+3. Under **Add to an agent**, click **Claude Code** or **Codex**. The app runs that agent's own `mcp add` command, so `rojo-manager` is there in every new session. If the agent's command line tool is not installed, the app shows the command to run instead. For any other MCP client, click **Other** for the config to paste and where common clients keep their config file.
 
 | Tool | What it does |
 | --- | --- |
