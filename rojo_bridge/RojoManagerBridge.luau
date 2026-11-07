@@ -13,7 +13,8 @@
 --
 -- Every few seconds it tells Rojo Manager (on a fixed local port) which server Rojo is connected to,
 -- so Rojo Manager shows Connected only for real sessions. The answer names the server of a running
--- project with auto-connect linked to this place, and the bridge connects when that offer appears.
+-- project with auto-connect linked to this place, and the bridge connects when that offer appears,
+-- accepting Rojo's initial sync prompt unless Rojo Manager's settings say to ask.
 -- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
 
 local CoreGui = game:GetService("CoreGui")
@@ -97,6 +98,21 @@ local function connectedPort(app): number
 	return tonumber(app.port:getValue()) or DEFAULT_PORT
 end
 
+-- Answer the sync prompt of the session auto-connect just started, once Rojo asks.
+local function acceptPrompt(app)
+	local deadline = os.clock() + 30
+	while os.clock() < deadline do
+		local status = (app.state or {}).appStatus
+		if status == "Confirming" then
+			app.confirmationBindable:Fire("Accept")
+			return
+		elseif status == "Connected" or status == "Error" then
+			return -- no prompt this time, or the connection failed
+		end
+		task.wait(0.2)
+	end
+end
+
 -- Report the session and act on the auto-connect offer until the plugin unloads. An offer connects
 -- only when it appears (the place opened, the server started, or auto-connect was turned on), so
 -- disconnecting by hand sticks.
@@ -109,16 +125,21 @@ local function poll(app, bindable: BindableFunction)
 			Method = "GET",
 		})
 		-- 404 means Rojo Manager knows no running project that auto-connects here.
-		local offer: number? = nil
+		local offer: number?, accept = nil, false
 		if ok and response.Success then
 			local decoded, body = pcall(HttpService.JSONDecode, HttpService, response.Body)
 			if decoded and type(body) == "table" and type(body.port) == "number" then
-				offer = body.port
+				offer, accept = body.port, body.accept == true
 			end
 		end
-		local idle = app.serveSession == nil and (app.state or {}).appStatus == "NotConnected"
+		-- Rojo shows Error after a lost connection, such as the server restarting.
+		local status = (app.state or {}).appStatus
+		local idle = app.serveSession == nil and (status == "NotConnected" or status == "Error")
 		if offer ~= nil and offer ~= offered and idle then
 			actions.connect(app, "localhost", tostring(offer))
+			if accept then
+				task.spawn(acceptPrompt, app)
+			end
 		end
 		offered = offer
 		task.wait(POLL_SECONDS)

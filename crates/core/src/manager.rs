@@ -728,14 +728,15 @@ impl Engine {
     }
 
     /// A bridge's poll: the server its Rojo is connected to (0 for none), so only real sessions
-    /// show as Connected. Answers with the place's auto-connect server; the bridge connects when
-    /// that offer first appears, so turning auto-connect on or starting the server connects an open place.
-    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<u16> {
-        let (target, previous) = {
+    /// show as Connected. Answers with the place's auto-connect server and whether to accept Rojo's
+    /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
+    /// starting the server connects an open place.
+    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
+        let (target, previous, accept) = {
             let mut state = self.lock();
             let target = state.auto_connect_target(place_id);
             let report = BridgeReport { port, offered: target.as_ref().map(|(_, port)| *port), seen: Instant::now() };
-            (target, state.bridges.insert(id, report))
+            (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept)
         };
         if previous.as_ref().map(|report| report.port) != Some(port) {
             self.wake_watcher();
@@ -744,7 +745,7 @@ impl Engine {
         if port == 0 && previous.and_then(|report| report.offered) != Some(offer) {
             self.notice(format!("{name}: connecting Rojo in Studio"));
         }
-        Some(offer)
+        Some((offer, accept))
     }
 
     /// An unexpected exit. When restarting is on, the server starts again, up to CRASH_RESTARTS
@@ -1378,7 +1379,7 @@ impl ControlHandler for Control {
         self.0.auto_connect_port(place_id)
     }
 
-    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<u16> {
+    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
         self.0.report_bridge(id, place_id, port)
     }
 }

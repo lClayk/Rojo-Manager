@@ -47,6 +47,8 @@ pub struct Settings {
     pub notifications: bool,
     /// Start a server again when it crashes, a few times a minute at most.
     pub restart_crashed: bool,
+    /// Accept Rojo's initial sync prompt when the bridge auto-connects.
+    pub auto_connect_accept: bool,
 }
 
 impl Default for Settings {
@@ -62,12 +64,13 @@ impl Default for Settings {
             tray_status: true,
             notifications: true,
             restart_crashed: true,
+            auto_connect_accept: true,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 10] = [
+    pub const KEYS: [&'static str; 11] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -78,6 +81,7 @@ impl Settings {
         "tray_status",
         "notifications",
         "restart_crashed",
+        "auto_connect_accept",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -92,6 +96,7 @@ impl Settings {
             "tray_status" => &mut self.tray_status,
             "notifications" => &mut self.notifications,
             "restart_crashed" => &mut self.restart_crashed,
+            "auto_connect_accept" => &mut self.auto_connect_accept,
             _ => return None,
         })
     }

@@ -236,6 +236,13 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
                 .into_any_element(),
                 toggle(snapshot, "version_check", "Check for Rojo updates on launch", None, cx),
                 toggle(snapshot, "restart_crashed", "Restart servers that crash", Some("Up to 3 times a minute"), cx),
+                toggle(
+                    snapshot,
+                    "auto_connect_accept",
+                    "Skip Rojo's sync prompt on auto-connect",
+                    Some("Applies the project to Studio without asking"),
+                    cx,
+                ),
             ]
             .into_iter()
             .chain(shortcuts.map(|(key, label, hint)| toggle(snapshot, key, label, Some(hint), cx))),

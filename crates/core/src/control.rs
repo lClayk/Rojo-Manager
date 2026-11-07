@@ -56,7 +56,7 @@ impl std::fmt::Display for ControlError {
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
 /// - GET  /auto-connect/<placeId>    {"port": auto_connect_port(placeId)} or 404 (AutoConnectServer, no token)
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
-/// - GET  /bridge/<id>/<placeId>/<port>  {"port": report_bridge(..)} or 404 (AutoConnectServer, no token)
+/// - GET  /bridge/<id>/<placeId>/<port>  {"port", "accept"} from report_bridge(..) or 404 (AutoConnectServer, no token)
 ///
 /// Bodies are JSON objects ({} when empty). Errors reply {"error": message} with their status.
 pub trait ControlHandler: Send + Sync + 'static {
@@ -68,8 +68,9 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn auto_connect_port(&self, place_id: u64) -> Option<u16>;
     /// How many Rojo plugins the bridge found running in Studio.
     fn report_rojo_plugins(&self, count: u32);
-    /// A bridge's poll with the server its Rojo is connected to (0 for none); answers the place's auto-connect port.
-    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<u16>;
+    /// A bridge's poll with the server its Rojo is connected to (0 for none); answers the place's
+    /// auto-connect port and whether to accept Rojo's sync prompt.
+    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)>;
 }
 
 pub fn control_path() -> PathBuf {
@@ -136,7 +137,10 @@ impl AutoConnectServer {
                     (200, json!({}))
                 }
                 ("bridge", Some(&[id, place, port])) => {
-                    port_answer(handler.report_bridge(id, place, u16::try_from(port).unwrap_or(0)))
+                    match handler.report_bridge(id, place, u16::try_from(port).unwrap_or(0)) {
+                        Some((port, accept)) => (200, json!({ "port": port, "accept": accept })),
+                        None => (404, json!({ "port": null })),
+                    }
                 }
                 _ => (404, json!({ "port": null })),
             }
@@ -409,9 +413,9 @@ mod tests {
             self.calls.lock().unwrap().push(json!(["rojo-plugins", count]));
         }
 
-        fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<u16> {
+        fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
             self.calls.lock().unwrap().push(json!(["bridge", id, place_id, port]));
-            self.auto_connect_port(place_id)
+            self.auto_connect_port(place_id).map(|port| (port, true))
         }
     }
 
@@ -504,7 +508,7 @@ mod tests {
         assert_eq!(get("/auto-connect/42", &[("Origin", "https://example.invalid")]).0, 404);
         assert_eq!(get("/rojo-plugins/2", &[]).0, 200);
         assert_eq!(get("/rojo-plugins/x", &[]).0, 404);
-        assert_eq!(get("/bridge/9/42/0", &[]), (200, json!({"port": 34880})));
+        assert_eq!(get("/bridge/9/42/0", &[]), (200, json!({"port": 34880, "accept": true})));
         assert_eq!(get("/bridge/9/7/34881", &[]).0, 404);
         assert_eq!(get("/bridge/9/42", &[]).0, 404);
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
