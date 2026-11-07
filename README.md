@@ -14,7 +14,7 @@ Questions, feedback, and release updates are on the [DevForum thread](https://de
 
 ## Download and run
 
-1. Download **RojoManager-0.8.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest).
+1. Download **RojoManager-0.8.1-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest).
 2. Right-click the ZIP and choose **Extract All**.
 3. Open the extracted `RojoManager` folder and double-click **RojoManager.exe**.
 
