@@ -141,6 +141,9 @@ struct Project {
     port: u16,
     #[serde(default)]
     place: Option<Place>,
+    /// The linked place's experience name, once Rojo Manager looked it up.
+    #[serde(default)]
+    experience: Option<String>,
     #[serde(default)]
     autostart: bool,
     #[serde(default)]
@@ -168,6 +171,8 @@ struct Brief {
     port: u16,
     #[serde(rename = "placeId", skip_serializing_if = "Option::is_none")]
     place_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    experience: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     autostart: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -184,6 +189,7 @@ impl From<Project> for Brief {
             state: project.state,
             port: project.port,
             place_id: project.place.map(|place| place.place_id),
+            experience: project.experience,
             autostart: project.autostart,
             auto_connect: project.auto_connect,
             studio: None,

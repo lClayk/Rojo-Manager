@@ -536,8 +536,21 @@ impl MainView {
                 )
                 .into_any_element();
         }
-        let rows: Vec<AnyElement> =
-            snapshot.projects.iter().map(|project| project_row::render(self, project, snapshot, window, cx)).collect();
+        let mut rows = Vec::new();
+        for item in logic::list_items(&snapshot.projects) {
+            match item {
+                logic::ListItem::Project(project) => {
+                    rows.push(project_row::render(self, project, snapshot, false, window, cx))
+                }
+                logic::ListItem::Experience { universe_id, name, projects } => {
+                    let open = !snapshot.collapsed.contains(&universe_id);
+                    rows.push(project_row::render_experience(universe_id, &name, &projects, open, cx));
+                    if open {
+                        rows.extend(projects.iter().map(|p| project_row::render(self, p, snapshot, true, window, cx)));
+                    }
+                }
+            }
+        }
         div()
             .id("projects")
             .flex_1()

@@ -24,6 +24,8 @@ impl AssetSource for Assets {
             "icons/x.svg" => Some(include_bytes!("../assets/icons/x.svg")),
             "icons/circle-arrow-up.svg" => Some(include_bytes!("../assets/icons/circle-arrow-up.svg")),
             "icons/triangle-alert.svg" => Some(include_bytes!("../assets/icons/triangle-alert.svg")),
+            "icons/chevron-down.svg" => Some(include_bytes!("../assets/icons/chevron-down.svg")),
+            "icons/chevron-right.svg" => Some(include_bytes!("../assets/icons/chevron-right.svg")),
             _ => None,
         };
         match icon {
