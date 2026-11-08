@@ -64,6 +64,9 @@ pub enum Call {
         universe_id: u64,
         collapsed: bool,
     },
+    AnswerStudioTools {
+        keep: bool,
+    },
     CheckRojo,
     CheckAppUpdate,
     RefreshToolVersions,
@@ -127,6 +130,7 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
         Call::SetCollapsed { universe_id, collapsed } => json(engine.set_collapsed(universe_id, collapsed)),
+        Call::AnswerStudioTools { keep } => json(engine.answer_studio_tools(keep)),
         Call::RunToolJob { job } => json(engine.run_tool_job(job)),
         Call::InstallAppUpdate => json(engine.install_app_update()),
         // Calls whose answer nobody waits for.
@@ -255,6 +259,9 @@ impl Client {
     }
     pub fn set_collapsed(&self, universe_id: u64, collapsed: bool) -> Result<(), String> {
         self.call(Call::SetCollapsed { universe_id, collapsed })
+    }
+    pub fn answer_studio_tools(&self, keep: bool) -> Result<(), String> {
+        self.call(Call::AnswerStudioTools { keep })
     }
     pub fn check_rojo(&self) {
         self.send(Call::CheckRojo);

@@ -117,6 +117,9 @@ pub struct Snapshot {
     pub mcp_path: String,
     /// Experiences (universe IDs) the window shows collapsed.
     pub collapsed: Vec<u64>,
+    /// Another Studio MCP set up in an agent ("robloxstudio in Codex"), while the Studio tools are on
+    /// and the window has not asked whether to keep them.
+    pub studio_tools_prompt: Option<String>,
 }
 
 fn version() -> &'static str {
@@ -193,6 +196,8 @@ struct State {
     bridges: HashMap<u64, BridgeReport>,
     /// Experience names by universe ID, looked up once per run.
     experiences: HashMap<u64, String>,
+    /// Another Studio MCP set up in an agent, found at launch.
+    other_studio_mcp: Option<String>,
 }
 
 /// What a Studio bridge last said and was told.
@@ -343,6 +348,12 @@ impl Engine {
         self.check_app_update(false, auto_update);
         self.refresh_tool_versions();
         self.look_up_experiences();
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            let found = studio::other_studio_mcp();
+            engine.lock().other_studio_mcp = found;
+            engine.changed();
+        });
         let names: Vec<String> =
             self.lock().config.projects.iter().filter(|p| p.autostart).map(|p| p.name.clone()).collect();
         for name in names {
@@ -455,6 +466,10 @@ impl Engine {
             studio_rojo_plugins: state.studio_rojo_plugins,
             mcp_path: self.app_dir.join("RojoManagerMCP.exe").display().to_string(),
             collapsed: state.config.collapsed.clone(),
+            studio_tools_prompt: state
+                .other_studio_mcp
+                .clone()
+                .filter(|_| state.config.settings.studio_tools && !state.config.studio_tools_asked),
         }
     }
 
@@ -1079,6 +1094,20 @@ impl Engine {
                 }
             }
         });
+    }
+
+    /// The answer to the window's question, asked once when another Studio MCP is set up: whether
+    /// agents keep Rojo Manager's Studio tools as well.
+    pub fn answer_studio_tools(&self, keep: bool) -> Result<(), String> {
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        config.settings.studio_tools = keep;
+        config.studio_tools_asked = true;
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        self.changed();
+        Ok(())
     }
 
     /// Show or hide an experience's places in the window.

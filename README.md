@@ -76,7 +76,7 @@ AI agents can run your Rojo servers, open places in Studio, connect or disconnec
 | `get_connected_instances` | Lists the open Studio windows with the bridge, with each one's place, linked project, and Rojo status |
 | `execute_luau` | Runs Luau in a Studio window with plugin permissions and returns what it returned and printed |
 
-If another Studio MCP server already gives your agents `execute_luau`, turn off **Studio tools for agents** in **Settings > Agents** so they only see one.
+If another Studio MCP server already gives your agents `execute_luau`, turn off **Studio tools for agents** in **Settings > Agents** so they only see one. When Rojo Manager finds one set up in Claude Code or Codex, the window asks once.
 
 Rojo Manager keeps ownership of every server, so the window always shows what an agent did. If it is not running, the MCP server starts it in the tray. The agent and the window talk through a local API that needs a random token stored in `%LOCALAPPDATA%\RojoManager\control.json`. Browsers cannot reach it.
 

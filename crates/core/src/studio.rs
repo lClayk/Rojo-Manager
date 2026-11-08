@@ -96,6 +96,38 @@ pub fn experience_name(universe_id: u64) -> Result<String, HttpsError> {
         .ok_or_else(|| HttpsError::Transport("The experience has no name".into()))
 }
 
+/// Another Studio MCP server set up in Claude Code or Codex, such as robloxstudio-mcp or Roblox's
+/// built-in one, as "<name> in <agent>". It gives agents tools like Rojo Manager's Studio tools.
+pub fn other_studio_mcp() -> Option<String> {
+    let home = std::env::home_dir()?;
+    let claude: Option<Value> =
+        std::fs::read(home.join(".claude.json")).ok().and_then(|data| serde_json::from_slice(&data).ok());
+    if let Some(claude) = claude.as_ref() {
+        // User servers, then each folder's own.
+        let projects = claude.get("projects").and_then(Value::as_object).into_iter().flat_map(|p| p.values());
+        for servers in std::iter::once(claude).chain(projects).filter_map(|t| t.get("mcpServers")?.as_object()) {
+            if let Some(name) = servers.iter().find(|(name, server)| studio_server(name, server)).map(|(n, _)| n) {
+                return Some(format!("{name} in Claude Code"));
+            }
+        }
+    }
+    let codex = std::fs::read_to_string(home.join(".codex").join("config.toml")).ok();
+    let codex: Option<Value> = codex.and_then(|text| toml::from_str(&text).ok());
+    let servers = codex.as_ref().and_then(|codex| codex.get("mcp_servers")?.as_object())?;
+    let name = servers.iter().find(|(name, server)| studio_server(name, server)).map(|(name, _)| name)?;
+    Some(format!("{name} in Codex"))
+}
+
+/// Whether an MCP server entry runs robloxstudio-mcp or Roblox's built-in Studio MCP (Roblox/mcp.bat),
+/// judged by its name, command, and arguments.
+fn studio_server(name: &str, server: &Value) -> bool {
+    let args = server.get("args").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
+    let parts: Vec<&str> =
+        std::iter::once(name).chain(server.get("command").and_then(Value::as_str)).chain(args).collect();
+    let text = parts.join(" ").to_lowercase().replace('\\', "/").replace(['-', '_'], "");
+    !text.contains("rojomanager") && (text.contains("robloxstudio") || text.contains("roblox/mcp"))
+}
+
 pub fn launch_uri(place: &Place) -> String {
     format!(
         "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{}+universeId:{}",
@@ -165,5 +197,14 @@ mod tests {
             launch_uri(&Place { place_id: 2, universe_id: 1 }),
             "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:2+universeId:1"
         );
+    }
+
+    #[test]
+    fn studio_mcp_servers_are_recognized_by_name_or_command() {
+        assert!(studio_server("tools", &json!({"command": "C:/bin/robloxstudio-mcp.exe"})));
+        assert!(studio_server("studio", &json!({"command": r"C:\Users\a\AppData\Local/Roblox/mcp.bat"})));
+        assert!(studio_server("Roblox_Studio", &json!({})));
+        assert!(!studio_server("rojo-manager", &json!({"command": r"C:\Roblox\RojoManager\RojoManagerMCP.exe"})));
+        assert!(!studio_server("blender", &json!({"command": "uvx", "args": ["blender-mcp"]})));
     }
 }

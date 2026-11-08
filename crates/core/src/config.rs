@@ -134,6 +134,9 @@ pub struct Config {
     /// Experiences (universe IDs) whose places the window shows collapsed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<u64>,
+    /// The window asked whether to keep the Studio tools beside another Studio MCP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub studio_tools_asked: bool,
 }
 
 impl Config {
@@ -239,7 +242,8 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         Some(Value::Array(ids)) => ids.iter().filter_map(Value::as_u64).filter(|id| *id > 0).collect(),
         _ => Vec::new(),
     };
-    Ok(Config { projects, settings, collapsed })
+    let studio_tools_asked = object.get("studio_tools_asked").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Config { projects, settings, collapsed, studio_tools_asked })
 }
 
 /// Read config.json; a missing file is an empty config. A malformed file is reported, never overwritten.

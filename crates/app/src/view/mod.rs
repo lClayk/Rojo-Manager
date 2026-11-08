@@ -394,6 +394,54 @@ impl MainView {
             .child(action)
     }
 
+    /// A small card in the top right, until answered: another Studio MCP already gives agents
+    /// execute_luau, so offer to hide Rojo Manager's copy.
+    fn render_studio_tools_prompt(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+        let server = snapshot.studio_tools_prompt.as_ref()?;
+        let answer = |keep: bool| cx.listener(move |this: &mut Self, _, _, cx| this.answer_studio_tools(keep, cx));
+        Some(
+            div()
+                .absolute()
+                .top(px(TITLE_BAR + 8.))
+                .right(px(12.))
+                .w(px(280.))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .p(px(12.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(CARD))
+                .child(div().text_size(TEXT_SM).text_color(rgb(TEXT)).child(format!(
+                    "{server} already gives agents execute_luau. Hide Rojo Manager's Studio tools so agents \
+                     see each tool once?"
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("studio-tools-keep")
+                                .label("Keep")
+                                .variant(Variant::Ghost)
+                                .on_click(answer(true)),
+                        )
+                        .child(
+                            Button::new("studio-tools-hide")
+                                .label("Hide")
+                                .variant(Variant::Primary)
+                                .on_click(answer(false)),
+                        ),
+                ),
+        )
+    }
+
+    fn answer_studio_tools(&mut self, keep: bool, cx: &mut Context<Self>) {
+        self.run(cx, move |engine| engine.answer_studio_tools(keep), |_, (), _| {});
+    }
+
     fn render_banners(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<Div> {
         let mut banners = Vec::new();
         if let Some(action) = snapshot.rojo.action.clone() {
@@ -689,6 +737,7 @@ impl Render for MainView {
             .children(banners)
             .child(list)
             .child(self.render_footer(&snapshot))
+            .children((top == 0).then(|| self.render_studio_tools_prompt(&snapshot, cx)).flatten())
             .when(self.settings_open, |root| root.child(tabbable(top == 1, || settings::render(self, &snapshot, cx))))
             .when(self.tools_open, |root| {
                 root.child(tabbable(top == 2, || settings::render_tools(self, &snapshot, cx)))
