@@ -54,6 +54,7 @@ impl std::fmt::Display for ControlError {
 /// - POST /projects/<name>/<action>  act(Some(name), action, body), action in ACTIONS
 /// - GET  /projects/<name>/logs      logs(name)
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
+/// - GET  /updates, POST /updates/<target>  updates(None) or updates(Some(target)), target app or bridge
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
 /// - GET  /bridge/<id>/<placeId>/<port>  {"port", "accept"} from report_bridge(..) or 404 (AutoConnectServer, no token)
 ///
@@ -69,6 +70,8 @@ pub trait ControlHandler: Send + Sync + 'static {
     /// A bridge's poll with the server its Rojo is connected to (0 for none); answers the place's
     /// auto-connect port and whether to accept Rojo's sync prompt.
     fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)>;
+    /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
+    fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
 }
 
 pub fn control_path() -> PathBuf {
@@ -232,6 +235,8 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
         (true, ["projects", name, "logs"]) => handler.logs(name),
         (true, ["settings"]) => handler.settings(None),
         (false, ["settings"]) => handler.settings(Some(&body(request)?)),
+        (true, ["updates"]) => handler.updates(None),
+        (false, ["updates", target]) => handler.updates(Some(target)),
         _ => Err(ControlError::new("Unknown route", 404)),
     }
 }
@@ -408,6 +413,11 @@ mod tests {
         fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
             self.calls.lock().unwrap().push(json!(["bridge", id, place_id, port]));
             (place_id == 42).then_some((34880, true))
+        }
+
+        fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {
+            self.calls.lock().unwrap().push(json!(["updates", install]));
+            Ok(json!({}))
         }
     }
 

@@ -72,6 +72,7 @@ AI agents can run your Rojo servers, open places in Studio, and connect or disco
 | `rojo_session` | Connects or disconnects Rojo in an open place, reads its status, or accepts or aborts Rojo's initial sync confirmation |
 | `server_logs` | Reads a project's recent Rojo output, such as sync errors or why the server stopped |
 | `manage_project` | Adds a project folder, or every project in a parent folder; changes a project's name, port, autostart, auto-connect, or linked place; or removes it from the list |
+| `updates` | Checks whether the app and the Studio bridge are up to date, and installs either. Installing the app restarts it |
 | `app_settings` | Reads or changes the app's own preferences. Agents are told to change these only when asked |
 
 Rojo Manager keeps ownership of every server, so the window always shows what an agent did. If it is not running, the MCP server starts it in the tray. The agent and the window talk through a local API that needs a random token stored in `%LOCALAPPDATA%\RojoManager\control.json`. Browsers cannot reach it.
@@ -85,6 +86,8 @@ Rojo Manager checks its own version on launch. When a newer stable release exist
 Beta versions are published as GitHub pre-releases. The app never offers them; download one from [Releases](https://github.com/lClayk/Rojo-Manager/releases) to try it. A beta build offers the full release of its version once that is out.
 
 **Update now** downloads the release's ZIP, checks it against the SHA-256 digest GitHub lists for it when there is one, and replaces the files in the application folder. The manager then restarts, starting again the servers that were running. Your settings stay in local app data.
+
+Turn on **Install updates on launch** in Settings to skip the banner: on launch the manager installs a newer release and restarts into it, or, when the app is current, rebuilds a Studio bridge that is out of date. Agents can check for and install both updates with the `updates` tool.
 
 To update by hand instead, download and extract the new ZIP, quit the old manager from its tray menu, then replace the old application folder and reopen it. Keep `ToolInstaller.exe` and `RojoManagerMCP.exe` with the app. If you move the app to a different location, turn Windows startup off and on again to update its startup entry.
 

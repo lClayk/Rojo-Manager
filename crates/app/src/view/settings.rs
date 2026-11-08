@@ -156,6 +156,7 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
         ),
         toggle(snapshot, "notifications", "Notify when a server fails", Some("While the window is closed"), cx),
         toggle(snapshot, "app_version_check", "Check for app updates on launch", None, cx),
+        toggle(snapshot, "auto_update", "Install updates on launch", Some("The app and the Studio bridge"), cx),
     ]);
 
     let mut agents = vec![

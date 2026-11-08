@@ -143,7 +143,7 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
             Ok(Value::Null)
         }
         Call::CheckAppUpdate => {
-            engine.check_app_update(true);
+            engine.check_app_update(true, false);
             Ok(Value::Null)
         }
         Call::RefreshToolVersions => {

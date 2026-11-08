@@ -90,6 +90,15 @@ pub fn specs() -> Value {
                 "place": {"type": "string"}}},
         },
         {
+            "name": "updates",
+            "description": "Check whether Rojo Manager and its Studio bridge plugin are up to date, or install an \
+                update. install app downloads the newest release and restarts Rojo Manager; its running servers \
+                restart with it, so reconnect Rojo afterwards. install bridge rebuilds the bridge for the \
+                installed Rojo and waits for it; Studio needs a restart to load it. Install when the user asks.",
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+                "install": {"type": "string", "enum": ["app", "bridge"]}}},
+        },
+        {
             "name": "app_settings",
             "description": "Rojo Manager's own preferences, such as launching at Windows startup, the tray, update \
                 checks, and which install buttons projects show. Returns them; pass changes to set some. \
@@ -121,6 +130,7 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         }
         "server_logs" => text(&server_logs(backend, args)?),
         "manage_project" => text(&manage_project(backend, args)?),
+        "updates" => text(&updates(backend, args)?),
         "app_settings" => text(&app_settings(backend, args)?),
         _ => Err(format!("Unknown tool {name}")),
     }
@@ -651,6 +661,19 @@ fn app_settings(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
     field(reply, "settings")
 }
 
+/// Installing waits for the download, or for the bridge installer and any prompt in its terminal.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn updates(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
+    let install = optional_string(args, "install")?;
+    manager_projects(backend)?; // starts the manager if needed
+    match install.as_deref() {
+        None => call(backend, "GET", &["updates"], None, PROJECTS_TIMEOUT),
+        Some(target @ ("app" | "bridge")) => call(backend, "POST", &["updates", target], None, INSTALL_TIMEOUT),
+        Some(_) => Err("install must be app or bridge".into()),
+    }
+}
+
 // --------------------------------------------------------------- arguments
 
 /// A required nonempty string argument, trimmed.
@@ -788,6 +811,18 @@ mod tests {
         let error = app_settings(&fake, &args(json!({"changes": ["tray"]}))).unwrap_err();
         assert_eq!(error, "changes must be an object of setting names to true or false");
         assert_eq!(fake.calls(), ["GET projects", "GET settings", "GET projects", r#"POST settings {"tray":false}"#]);
+    }
+
+    #[test]
+    fn updates_check_or_install_one() {
+        let fake = Fake { reply: |_, _| json!({"message": "done"}), ..Fake::default() };
+        updates(&fake, &Args::new()).unwrap();
+        assert_eq!(updates(&fake, &args(json!({"install": "bridge"}))).unwrap(), json!({"message": "done"}));
+        assert_eq!(updates(&fake, &args(json!({"install": "rojo"}))).unwrap_err(), "install must be app or bridge");
+        assert_eq!(
+            fake.calls(),
+            ["GET projects", "GET updates", "GET projects", "POST updates/bridge", "GET projects"]
+        );
     }
 
     #[test]

@@ -242,13 +242,8 @@ impl Host {
                 }
                 let (engine, replies) = (Arc::clone(&engine), replies.clone());
                 std::thread::spawn(move || {
-                    let update = matches!(&call, Call::InstallAppUpdate);
                     let result = ipc::serve(&engine, call);
-                    let restart = update && result.is_ok();
                     let _ = replies.send(ipc::line(&ToWindow::Reply { id, result }));
-                    if restart {
-                        post(Msg::Restart);
-                    }
                 });
             }
             post(Msg::WindowClosed(window));
@@ -423,6 +418,7 @@ pub fn run(launch: Launch) {
         match &event {
             Event::Changed if !CHANGED.swap(true, Ordering::SeqCst) => post(Msg::Changed),
             Event::Alert(message) => post(Msg::Alert(message.clone())),
+            Event::Restart => post(Msg::Restart),
             _ => {}
         }
         if let Some(tx) = &*events.lock().unwrap() {
