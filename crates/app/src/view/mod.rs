@@ -402,6 +402,7 @@ impl MainView {
         Some(
             div()
                 .absolute()
+                .occlude()
                 .top(px(TITLE_BAR + 8.))
                 .right(px(12.))
                 .w(px(280.))
