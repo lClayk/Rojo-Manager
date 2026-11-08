@@ -6,7 +6,8 @@
 //! carry an Origin header) are refused, so only local programs run by this user can reach it.
 //!
 //! AutoConnectServer is the one exception: the Rojo bridge in Studio cannot read control.json, so it
-//! asks a fixed port, without a token, which server a newly opened place should connect to.
+//! polls a fixed port without a token. It reports its place and Rojo's state there, and receives the
+//! auto-connect server and the commands agents send it through this API.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -16,10 +17,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
 pub const MAX_BODY: usize = 16384;
+/// A bridge poll can carry a command's result, such as the output of agent Luau.
+pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
 /// Fixed so the bridge can find it; project ports start at 34872.
 pub const AUTO_CONNECT_PORT: u16 = 34871;
 
@@ -55,8 +59,9 @@ impl std::fmt::Display for ControlError {
 /// - GET  /projects/<name>/logs      logs(name)
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
 /// - GET  /updates, POST /updates/<target>  updates(None) or updates(Some(target)), target app or bridge
+/// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
-/// - GET  /bridge/<id>/<placeId>/<port>  {"port", "accept"} from report_bridge(..) or 404 (AutoConnectServer, no token)
+/// - POST /bridge/<id>               poll_bridge(id, body) (AutoConnectServer, no token)
 ///
 /// Bodies are JSON objects ({} when empty). Errors reply {"error": message} with their status.
 pub trait ControlHandler: Send + Sync + 'static {
@@ -67,11 +72,37 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn logs(&self, project: &str) -> Result<Value, ControlError>;
     /// How many Rojo plugins the bridge found running in Studio.
     fn report_rojo_plugins(&self, count: u32);
-    /// A bridge's poll with the server its Rojo is connected to (0 for none); answers the place's
-    /// auto-connect port and whether to accept Rojo's sync prompt.
-    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)>;
+    /// A bridge's poll. Answers {"port", "accept"}: the place's auto-connect server (null for none)
+    /// and whether to accept Rojo's sync prompt, plus "command" once one is queued for this bridge.
+    fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value;
+    /// {"bridge", "instances"}: whether the bridge is installed and the Studio windows it reports from;
+    /// or runs one command ({"action", ...}) in one of them and returns its result.
+    fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError>;
     /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
+}
+
+/// A bridge's poll: its place, the server its Rojo is connected to (0 for none), the Rojo plugin's
+/// status, and the result of the command the previous poll handed it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgePoll {
+    pub place_id: u64,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub rojo: Value,
+    #[serde(default)]
+    pub result: Option<CommandResult>,
+}
+
+/// A command's outcome: its return value, or the error message when not `ok`.
+#[derive(Debug, Deserialize)]
+pub struct CommandResult {
+    pub id: u64,
+    pub ok: bool,
+    #[serde(default)]
+    pub value: Value,
 }
 
 pub fn control_path() -> PathBuf {
@@ -92,7 +123,7 @@ impl ControlServer {
         let port = listener.local_addr()?.port();
         let token = new_token()?;
         let expected = token.clone();
-        let served = Served::start(listener, move |request| match route(&*handler, &expected, request) {
+        let served = Served::start(listener, WORKERS, move |request| match route(&*handler, &expected, request) {
             Ok(reply) => (200, reply),
             Err(error) => (error.status, json!({ "error": error.message })),
         })?;
@@ -112,8 +143,8 @@ impl ControlServer {
     }
 }
 
-/// Answers the bridge's GET requests (auto-connect, rojo-plugins, bridge) on 127.0.0.1:`port`. Binding
-/// fails when another program, or another Rojo Manager, holds the port (no address reuse).
+/// Answers the bridges' polls and plugin counts on 127.0.0.1:`port`. Binding fails when another
+/// program, or another Rojo Manager, holds the port (no address reuse).
 pub struct AutoConnectServer {
     served: Served,
 }
@@ -122,26 +153,30 @@ impl AutoConnectServer {
     pub fn start(handler: Arc<dyn ControlHandler>, port: u16) -> io::Result<AutoConnectServer> {
         // std sets no SO_REUSEADDR on Windows, so binding a taken port fails here.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
-        let served = Served::start(listener, move |request| {
-            let allowed = *request.method() == tiny_http::Method::Get && header(request, "Origin").is_none();
-            let url = request.url().trim_matches('/');
-            let (route, rest) = url.split_once('/').unwrap_or((url, ""));
-            let numbers: Option<Vec<u64>> = rest
-                .split('/')
-                .map(|part| part.bytes().all(|b| b.is_ascii_digit()).then(|| part.parse::<u64>().ok()).flatten())
-                .collect();
-            match (route, numbers.as_deref().filter(|_| allowed)) {
-                ("rojo-plugins", Some(&[count])) => {
+        // Each open Studio holds one worker with its poll, so this serves more at once.
+        let served = Served::start(listener, 16, move |request| {
+            if header(request, "Origin").is_some() {
+                return (404, json!({}));
+            }
+            let post = *request.method() == tiny_http::Method::Post;
+            let url = request.url().trim_matches('/').to_string();
+            let (route, rest) = url.split_once('/').unwrap_or((url.as_str(), ""));
+            let number = rest.bytes().all(|b| b.is_ascii_digit()).then(|| rest.parse::<u64>().ok()).flatten();
+            match (post, route, number) {
+                (false, "rojo-plugins", Some(count)) => {
                     handler.report_rojo_plugins(u32::try_from(count).unwrap_or(u32::MAX));
                     (200, json!({}))
                 }
-                ("bridge", Some(&[id, place, port])) => {
-                    match handler.report_bridge(id, place, u16::try_from(port).unwrap_or(0)) {
-                        Some((port, accept)) => (200, json!({ "port": port, "accept": accept })),
-                        None => (404, json!({ "port": null })),
+                (true, "bridge", Some(id)) => {
+                    let poll = body(request, MAX_BRIDGE_BODY).and_then(|body| {
+                        serde_json::from_value(Value::Object(body)).map_err(|e| ControlError::bad(e.to_string()))
+                    });
+                    match poll {
+                        Ok(poll) => (200, handler.poll_bridge(id, poll)),
+                        Err(error) => (error.status, json!({ "error": error.message })),
                     }
                 }
-                _ => (404, json!({ "port": null })),
+                _ => (404, json!({})),
             }
         })?;
         Ok(AutoConnectServer { served })
@@ -153,23 +188,26 @@ impl AutoConnectServer {
     }
 }
 
-/// Worker threads per server. Handlers may block (a Rojo start, a Roblox lookup), so a few run at once.
+/// Worker threads of the control API. Handlers may block (a Rojo start, a Studio command), so a few
+/// run at once.
 const WORKERS: usize = 4;
 
 /// A tiny_http server answering every request with JSON from `answer` on worker threads.
 struct Served {
     server: Arc<tiny_http::Server>,
+    workers: usize,
 }
 
 impl Served {
     fn start(
         listener: TcpListener,
+        workers: usize,
         answer: impl Fn(&mut tiny_http::Request) -> (u16, Value) + Send + Sync + 'static,
     ) -> io::Result<Served> {
-        let served =
-            Served { server: Arc::new(tiny_http::Server::from_listener(listener, None).map_err(io::Error::other)?) };
+        let server = Arc::new(tiny_http::Server::from_listener(listener, None).map_err(io::Error::other)?);
+        let served = Served { server, workers };
         let answer = Arc::new(answer);
-        for _ in 0..WORKERS {
+        for _ in 0..workers {
             let (server, answer) = (served.server.clone(), answer.clone());
             thread::Builder::new().name("control".into()).spawn(move || {
                 while let Ok(mut request) = server.recv() {
@@ -188,7 +226,7 @@ impl Drop for Served {
     /// Idle workers stop at once and busy ones after their request, without waiting here: a
     /// handler may need a lock the closing thread holds. The last worker out closes the listener.
     fn drop(&mut self) {
-        for _ in 0..WORKERS {
+        for _ in 0..self.workers {
             self.server.unblock();
         }
     }
@@ -228,26 +266,28 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
     };
     match (get, parts.as_slice()) {
         (true, ["projects"]) => Ok(json!({ "projects": handler.projects() })),
-        (false, ["projects"]) => handler.act(None, "add", &body(request)?),
+        (false, ["projects"]) => handler.act(None, "add", &body(request, MAX_BODY)?),
         (false, ["projects", name, action]) if ACTIONS.contains(action) => {
-            handler.act(Some(name), action, &body(request)?)
+            handler.act(Some(name), action, &body(request, MAX_BODY)?)
         }
         (true, ["projects", name, "logs"]) => handler.logs(name),
         (true, ["settings"]) => handler.settings(None),
-        (false, ["settings"]) => handler.settings(Some(&body(request)?)),
+        (false, ["settings"]) => handler.settings(Some(&body(request, MAX_BODY)?)),
+        (true, ["studio"]) => handler.studio(None),
+        (false, ["studio", instance]) => handler.studio(Some((instance, &body(request, MAX_BRIDGE_BODY)?))),
         (true, ["updates"]) => handler.updates(None),
         (false, ["updates", target]) => handler.updates(Some(target)),
         _ => Err(ControlError::new("Unknown route", 404)),
     }
 }
 
-/// The request's JSON object body, {} when empty.
-fn body(request: &mut tiny_http::Request) -> Result<Map<String, Value>, ControlError> {
+/// The request's JSON object body, {} when empty; at most `limit` bytes.
+fn body(request: &mut tiny_http::Request, limit: usize) -> Result<Map<String, Value>, ControlError> {
     let length = match header(request, "Content-Length") {
         None => 0,
         Some(length) => length.trim().parse::<usize>().map_err(|_| ControlError::bad("Invalid Content-Length"))?,
     };
-    if length > MAX_BODY {
+    if length > limit {
         return Err(ControlError::new("Request body is too large", 413));
     }
     if length == 0 {
@@ -410,9 +450,17 @@ mod tests {
             self.calls.lock().unwrap().push(json!(["rojo-plugins", count]));
         }
 
-        fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
-            self.calls.lock().unwrap().push(json!(["bridge", id, place_id, port]));
-            (place_id == 42).then_some((34880, true))
+        fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value {
+            self.calls.lock().unwrap().push(json!(["bridge", id, poll.place_id, poll.port]));
+            match poll.place_id {
+                42 => json!({"port": 34880, "accept": true}),
+                _ => json!({"port": null, "accept": false}),
+            }
+        }
+
+        fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError> {
+            self.calls.lock().unwrap().push(json!(["studio", command]));
+            Ok(json!({}))
         }
 
         fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {
@@ -498,20 +546,20 @@ mod tests {
     }
 
     #[test]
-    fn bridge_server_answers_only_a_port_for_a_place_and_owns_its_port() {
+    fn bridge_server_answers_polls_without_a_token_but_not_browsers_and_owns_its_port() {
         let server = AutoConnectServer::start(Arc::new(Fake::default()), 0).unwrap();
         let port = server.served.server.server_addr().to_ip().unwrap().port();
-        let get = |path: &str, headers: &[(&str, &str)]| {
-            let response = crate::localnet::request(port, "GET", path, None, headers, TIMEOUT, None).unwrap();
+        let send = |method: &str, path: &str, body: Option<&Value>, headers: &[(&str, &str)]| {
+            let response = crate::localnet::request(port, method, path, body, headers, TIMEOUT, None).unwrap();
             (response.status, serde_json::from_slice::<Value>(&response.body).unwrap())
         };
-        assert_eq!(get("/rojo-plugins/2", &[]).0, 200);
-        assert_eq!(get("/rojo-plugins/x", &[]).0, 404);
-        assert_eq!(get("/bridge/9/42/0", &[]), (200, json!({"port": 34880, "accept": true})));
-        assert_eq!(get("/bridge/9/7/34881", &[]).0, 404);
-        assert_eq!(get("/bridge/9/42", &[]).0, 404);
-        assert_eq!(get("/bridge/9/42/0", &[("Origin", "https://example.invalid")]).0, 404);
-        assert_eq!(get("/auto-connect/42", &[]).0, 404);
+        assert_eq!(send("GET", "/rojo-plugins/2", None, &[]).0, 200);
+        assert_eq!(send("GET", "/rojo-plugins/x", None, &[]).0, 404);
+        let poll = json!({"placeId": 42, "port": 0, "rojo": {"status": "NotConnected"}});
+        assert_eq!(send("POST", "/bridge/9", Some(&poll), &[]), (200, json!({"port": 34880, "accept": true})));
+        assert_eq!(send("POST", "/bridge/9", Some(&json!({"port": 0})), &[]).0, 400);
+        assert_eq!(send("POST", "/bridge/9", Some(&poll), &[("Origin", "https://example.invalid")]).0, 404);
+        assert_eq!(send("GET", "/bridge/9/42/0", None, &[]).0, 404);
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         server.close();

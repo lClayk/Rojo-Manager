@@ -96,6 +96,44 @@ pub fn experience_name(universe_id: u64) -> Result<String, HttpsError> {
         .ok_or_else(|| HttpsError::Transport("The experience has no name".into()))
 }
 
+/// Another Studio MCP server set up in Claude Code or Codex, as "<server> in <agent>", such as
+/// "robloxstudio-mcp in Codex". It gives agents tools like Rojo Manager's Studio tools.
+pub fn other_studio_mcp() -> Option<String> {
+    let home = std::env::home_dir()?;
+    let claude: Option<Value> =
+        std::fs::read(home.join(".claude.json")).ok().and_then(|data| serde_json::from_slice(&data).ok());
+    if let Some(claude) = claude.as_ref() {
+        // User servers, then each folder's own.
+        let projects = claude.get("projects").and_then(Value::as_object).into_iter().flat_map(|p| p.values());
+        for servers in std::iter::once(claude).chain(projects).filter_map(|t| t.get("mcpServers")?.as_object()) {
+            if let Some(server) = servers.iter().find_map(|(name, server)| studio_server(name, server)) {
+                return Some(format!("{server} in Claude Code"));
+            }
+        }
+    }
+    let codex = std::fs::read_to_string(home.join(".codex").join("config.toml")).ok();
+    let codex: Option<Value> = codex.and_then(|text| toml::from_str(&text).ok());
+    let servers = codex.as_ref().and_then(|codex| codex.get("mcp_servers")?.as_object())?;
+    let server = servers.iter().find_map(|(name, server)| studio_server(name, server))?;
+    Some(format!("{server} in Codex"))
+}
+
+/// Which Studio MCP an MCP server entry runs, if any: Roblox's built-in one (Roblox/mcp.bat) or
+/// robloxstudio-mcp, judged by its name, command, and arguments.
+fn studio_server(name: &str, server: &Value) -> Option<&'static str> {
+    let args = server.get("args").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
+    let parts: Vec<&str> =
+        std::iter::once(name).chain(server.get("command").and_then(Value::as_str)).chain(args).collect();
+    let text = parts.join(" ").to_lowercase().replace('\\', "/").replace(['-', '_'], "");
+    if text.contains("rojomanager") {
+        None
+    } else if text.contains("roblox/mcp") {
+        Some("Roblox Studio's built-in MCP")
+    } else {
+        text.contains("robloxstudio").then_some("robloxstudio-mcp")
+    }
+}
+
 pub fn launch_uri(place: &Place) -> String {
     format!(
         "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{}+universeId:{}",
@@ -165,5 +203,17 @@ mod tests {
             launch_uri(&Place { place_id: 2, universe_id: 1 }),
             "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:2+universeId:1"
         );
+    }
+
+    #[test]
+    fn studio_mcp_servers_are_recognized_by_name_or_command() {
+        let mcp = Some("robloxstudio-mcp");
+        assert_eq!(studio_server("tools", &json!({"command": "C:/bin/robloxstudio-mcp.exe"})), mcp);
+        assert_eq!(studio_server("Roblox_Studio", &json!({})), mcp);
+        let built_in = json!({"command": r"C:\Users\a\AppData\Local/Roblox/mcp.bat"});
+        assert_eq!(studio_server("roblox-studio", &built_in), Some("Roblox Studio's built-in MCP"));
+        let own = json!({"command": r"C:\Roblox\RojoManager\RojoManagerMCP.exe"});
+        assert_eq!(studio_server("rojo-manager", &own), None);
+        assert_eq!(studio_server("blender", &json!({"command": "uvx", "args": ["blender-mcp"]})), None);
     }
 }

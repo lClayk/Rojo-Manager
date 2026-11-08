@@ -8,7 +8,7 @@ A Windows tray app that runs the [Rojo](https://rojo.space) servers for all your
 - Link a project to its place, open it in Studio with one click, and let Rojo connect on its own.
 - Install Rojo, Rokit, Wally, and other tools, and a project's pinned tools and packages.
 - Crashed servers restart, failures show as notifications, and app updates install with one click.
-- Agents can do all of it through the bundled MCP server, next to robloxstudio-mcp.
+- Agents can do all of it through the bundled MCP server, and run Luau in Studio.
 
 Questions, feedback, and release updates are on the [DevForum thread](https://devforum.roblox.com/t/4980026).
 
@@ -58,11 +58,10 @@ The Rojo update warning checks the global version. A project can deliberately pi
 
 ## Agents
 
-AI agents can run your Rojo servers, open places in Studio, and connect or disconnect the Rojo plugin, all through the MCP server that ships with the app (`RojoManagerMCP.exe`). It works next to [robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp), which agents keep using for everything inside Studio.
+AI agents can run your Rojo servers, open places in Studio, connect or disconnect the Rojo plugin, and run Luau in Studio, all through the MCP server that ships with the app (`RojoManagerMCP.exe`).
 
-1. Set up robloxstudio-mcp by following its README, if you have not already.
-2. In **Settings > Agents**, click **Install** next to **Studio plugin with agent bridge**, then restart Studio. If you also have the Creator Store Rojo, turn it off in Studio (**Plugins > Manage Plugins**) so only one Rojo runs.
-3. Under **Add to an agent**, click **Claude Code** or **Codex**. The app runs that agent's own `mcp add` command, so `rojo-manager` is there in every new session. If the agent's command line tool is not installed, the app shows the command to run instead. For any other MCP client, click **Other** for the config to paste and where common clients keep their config file.
+1. In **Settings > Agents**, click **Install** next to **Studio plugin with agent bridge**, then restart Studio. If you also have the Creator Store Rojo, turn it off in Studio (**Plugins > Manage Plugins**) so only one Rojo runs.
+2. Under **Add to an agent**, click **Claude Code** or **Codex**. The app runs that agent's own `mcp add` command, so `rojo-manager` is there in every new session. If the agent's command line tool is not installed, the app shows the command to run instead. For any other MCP client, click **Other** for the config to paste and where common clients keep their config file.
 
 | Tool | What it does |
 | --- | --- |
@@ -74,10 +73,14 @@ AI agents can run your Rojo servers, open places in Studio, and connect or disco
 | `manage_project` | Adds a project folder, or every project in a parent folder; changes a project's name, port, autostart, auto-connect, or linked place; or removes it from the list |
 | `updates` | Checks whether the app and the Studio bridge are up to date, and installs either. Installing the app restarts it |
 | `app_settings` | Reads or changes the app's own preferences. Agents are told to change these only when asked |
+| `get_connected_instances` | Lists the open Studio windows with the bridge, with each one's place, linked project, and Rojo status |
+| `execute_luau` | Runs Luau in a Studio window with plugin permissions and returns what it returned and printed |
+
+If another Studio MCP server already gives your agents `execute_luau`, turn off **Studio tools for agents** in **Settings > Agents** so they only see one. When Rojo Manager finds one set up in Claude Code or Codex, the window asks once.
 
 Rojo Manager keeps ownership of every server, so the window always shows what an agent did. If it is not running, the MCP server starts it in the tray. The agent and the window talk through a local API that needs a random token stored in `%LOCALAPPDATA%\RojoManager\control.json`. Browsers cannot reach it.
 
-Rojo itself has no way for other plugins to control it, so the bridge plugin is the official Rojo plugin with a small addition. Every few seconds the bridge also tells Rojo Manager on `localhost:34871` which server Rojo is connected to, so the window shows Connected only for a real session, and asks whether a running project auto-connects to the open place. That port answers without a token, but only with a port number for a place ID. The bridge also reports there how many Rojo plugins Studio is running, so Settings can warn when the Creator Store Rojo is still on beside it. When an app update brings a newer bridge, the window shows a banner to update it. The installer downloads `Rojo.rbxm` for your installed Rojo version from Rojo's GitHub releases. It then uses Lune to add the [bridge module](rojo_bridge/RojoManagerBridge.luau) and two hook lines, and saves the result as `RojoManagerRojo.rbxm` in Studio's Plugins folder. In Edit mode the bridge exposes `CoreGui.RojoManagerBridge`, which plugin code can call but game scripts cannot. Updating Rojo from **Tools** rebuilds the bridge for the new version. If Rojo was updated some other way, Settings says the bridge no longer matches; click **Update** there.
+Rojo itself has no way for other plugins to control it, so the bridge plugin is the official Rojo plugin with a small addition. The bridge keeps a request open to Rojo Manager on `localhost:34871`. Every few seconds it reports which server Rojo is connected to, so the window shows Connected only for a real session, and learns whether a running project auto-connects to the open place. Commands from agents arrive on that open request, so they run at once. That port needs no token, but it only hands out commands that came in through the token-protected API, and it refuses browser requests. The bridge also reports there how many Rojo plugins Studio is running, so Settings can warn when the Creator Store Rojo is still on beside it. When an app update brings a newer bridge, the window shows a banner to update it. The installer downloads `Rojo.rbxm` for your installed Rojo version from Rojo's GitHub releases. It then uses Lune to add the [bridge module](rojo_bridge/RojoManagerBridge.luau) and two hook lines, and saves the result as `RojoManagerRojo.rbxm` in Studio's Plugins folder. Updating Rojo from **Tools** rebuilds the bridge for the new version. If Rojo was updated some other way, Settings says the bridge no longer matches; click **Update** there.
 
 ## App updates
 
@@ -116,6 +119,6 @@ The ZIP and SHA-256 checksum are written to `dist`. `cargo run -p rojo-manager` 
 
 ## License
 
-[MIT](LICENSE). Bundled dependencies retain their own licenses, included in the download's `licenses` folder. Rojo Manager is an independent project and is not affiliated with Roblox, the Rojo maintainers, or robloxstudio-mcp.
+[MIT](LICENSE). Bundled dependencies retain their own licenses, included in the download's `licenses` folder. Rojo Manager is an independent project and is not affiliated with Roblox or the Rojo maintainers.
 
-The files in [`rojo_bridge`](rojo_bridge) modify the Rojo plugin and are licensed under the [MPL-2.0](rojo_bridge/LICENSE), like [Rojo](https://github.com/rojo-rbx/rojo). Neither the app nor this repository contains Rojo or robloxstudio-mcp. Rojo, its plugin, and Lune are downloaded from their official GitHub releases on your machine. robloxstudio-mcp is installed by its own npm package.
+The files in [`rojo_bridge`](rojo_bridge) modify the Rojo plugin and are licensed under the [MPL-2.0](rojo_bridge/LICENSE), like [Rojo](https://github.com/rojo-rbx/rojo). Neither the app nor this repository contains Rojo. Rojo, its plugin, and Lune are downloaded from their official GitHub releases on your machine.

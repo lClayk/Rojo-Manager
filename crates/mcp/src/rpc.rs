@@ -25,9 +25,12 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
   or removes a project from the list (its files are kept).
 - server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
 - updates checks whether Rojo Manager and its Studio bridge are up to date, and installs either when the user asks.
+- get_connected_instances lists the Studio windows Rojo Manager's bridge reaches, and execute_luau runs Luau in one
+  (plugin permissions, Edit mode). The user can turn these two off when another Studio MCP provides them.
 Server states: off; starting; serving (running, no Studio connected); connected (a Studio is syncing);
 external (running but started outside Rojo Manager, still controllable); blocked (another app owns the port).
-Studio editing tools come from the separate robloxstudio MCP server; pass it the instanceId returned here.";
+Studio is reached through the Rojo Manager bridge, installed from Settings > Agents. instanceId values are Rojo
+Manager's; to use another Studio MCP's tools, match its Studio windows by placeId.";
 
 /// Read requests until `input` closes. Tool calls run on their own threads so pings stay responsive;
 /// finished ones are dropped, and those still running at the end are waited for.
@@ -86,7 +89,7 @@ fn handle(backend: &dyn Backend, message: &Map<String, Value>) -> Option<Value> 
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools::specs() }),
+        "tools/list" => json!({ "tools": tools::specs(backend.studio_tools()) }),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
             let no_args = Map::new();
@@ -170,6 +173,8 @@ mod tests {
             "manage_project",
             "updates",
             "app_settings",
+            "get_connected_instances",
+            "execute_luau",
         ];
         assert_eq!(names, HashSet::from(expected));
         assert_eq!(by_id["3"]["result"], json!({"content": [{"type": "text", "text": r#"{"projects":[]}"#}]}));

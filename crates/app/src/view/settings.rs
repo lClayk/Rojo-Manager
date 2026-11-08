@@ -194,6 +194,13 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
         ),
         _ => {}
     }
+    agents.push(toggle(
+        snapshot,
+        "studio_tools",
+        "Studio tools for agents",
+        Some("execute_luau and get_connected_instances. Turn off if another Studio MCP has them"),
+        cx,
+    ));
     let setup = |key: &'static str, label: &'static str, agent: Agent| {
         let label = if view.adding == Some(key) { "Adding…" } else { view.flashed(key).unwrap_or(label) };
         Button::new(key)

@@ -53,6 +53,8 @@ pub struct Settings {
     pub auto_connect_accept: bool,
     /// List places of one experience under a shared, collapsible header.
     pub group_experiences: bool,
+    /// Offer agents get_connected_instances and execute_luau; off when another Studio MCP has them.
+    pub studio_tools: bool,
 }
 
 impl Default for Settings {
@@ -71,12 +73,13 @@ impl Default for Settings {
             restart_crashed: true,
             auto_connect_accept: true,
             group_experiences: true,
+            studio_tools: true,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 13] = [
+    pub const KEYS: [&'static str; 14] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -90,6 +93,7 @@ impl Settings {
         "restart_crashed",
         "auto_connect_accept",
         "group_experiences",
+        "studio_tools",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -107,6 +111,7 @@ impl Settings {
             "restart_crashed" => &mut self.restart_crashed,
             "auto_connect_accept" => &mut self.auto_connect_accept,
             "group_experiences" => &mut self.group_experiences,
+            "studio_tools" => &mut self.studio_tools,
             _ => return None,
         })
     }
@@ -129,6 +134,9 @@ pub struct Config {
     /// Experiences (universe IDs) whose places the window shows collapsed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<u64>,
+    /// The window asked whether to keep the Studio tools beside another Studio MCP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub studio_tools_asked: bool,
 }
 
 impl Config {
@@ -234,7 +242,8 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         Some(Value::Array(ids)) => ids.iter().filter_map(Value::as_u64).filter(|id| *id > 0).collect(),
         _ => Vec::new(),
     };
-    Ok(Config { projects, settings, collapsed })
+    let studio_tools_asked = object.get("studio_tools_asked").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Config { projects, settings, collapsed, studio_tools_asked })
 }
 
 /// Read config.json; a missing file is an empty config. A malformed file is reported, never overwritten.
