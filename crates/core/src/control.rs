@@ -22,6 +22,8 @@ use serde_json::{Map, Value, json};
 
 pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
 pub const MAX_BODY: usize = 16384;
+/// A bridge poll can carry a command's result, such as the output of agent Luau.
+pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
 /// Fixed so the bridge can find it; project ports start at 34872.
 pub const AUTO_CONNECT_PORT: u16 = 34871;
 
@@ -166,7 +168,7 @@ impl AutoConnectServer {
                     (200, json!({}))
                 }
                 (true, "bridge", Some(id)) => {
-                    let poll = body(request).and_then(|body| {
+                    let poll = body(request, MAX_BRIDGE_BODY).and_then(|body| {
                         serde_json::from_value(Value::Object(body)).map_err(|e| ControlError::bad(e.to_string()))
                     });
                     match poll {
@@ -264,28 +266,28 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
     };
     match (get, parts.as_slice()) {
         (true, ["projects"]) => Ok(json!({ "projects": handler.projects() })),
-        (false, ["projects"]) => handler.act(None, "add", &body(request)?),
+        (false, ["projects"]) => handler.act(None, "add", &body(request, MAX_BODY)?),
         (false, ["projects", name, action]) if ACTIONS.contains(action) => {
-            handler.act(Some(name), action, &body(request)?)
+            handler.act(Some(name), action, &body(request, MAX_BODY)?)
         }
         (true, ["projects", name, "logs"]) => handler.logs(name),
         (true, ["settings"]) => handler.settings(None),
-        (false, ["settings"]) => handler.settings(Some(&body(request)?)),
+        (false, ["settings"]) => handler.settings(Some(&body(request, MAX_BODY)?)),
         (true, ["studio"]) => handler.studio(None),
-        (false, ["studio", instance]) => handler.studio(Some((instance, &body(request)?))),
+        (false, ["studio", instance]) => handler.studio(Some((instance, &body(request, MAX_BRIDGE_BODY)?))),
         (true, ["updates"]) => handler.updates(None),
         (false, ["updates", target]) => handler.updates(Some(target)),
         _ => Err(ControlError::new("Unknown route", 404)),
     }
 }
 
-/// The request's JSON object body, {} when empty.
-fn body(request: &mut tiny_http::Request) -> Result<Map<String, Value>, ControlError> {
+/// The request's JSON object body, {} when empty; at most `limit` bytes.
+fn body(request: &mut tiny_http::Request, limit: usize) -> Result<Map<String, Value>, ControlError> {
     let length = match header(request, "Content-Length") {
         None => 0,
         Some(length) => length.trim().parse::<usize>().map_err(|_| ControlError::bad("Invalid Content-Length"))?,
     };
-    if length > MAX_BODY {
+    if length > limit {
         return Err(ControlError::new("Request body is too large", 413));
     }
     if length == 0 {

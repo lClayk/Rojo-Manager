@@ -791,10 +791,15 @@ impl Engine {
         }
     }
 
+    /// A bridge polled recently, or is running a command it was handed.
+    fn bridge_live(&self, id: u64, report: &BridgeReport) -> bool {
+        report.seen.elapsed() < BRIDGE_TTL || self.link.busy(id)
+    }
+
     /// The Studio windows whose bridge polled recently: {instanceId, placeId, rojo}.
     pub fn studio_instances(&self) -> Vec<Value> {
         let state = self.lock();
-        let live = state.bridges.iter().filter(|(_, report)| report.seen.elapsed() < BRIDGE_TTL);
+        let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
         let mut instances: Vec<(u64, &BridgeReport)> = live.map(|(id, report)| (*id, report)).collect();
         instances.sort_by_key(|(id, _)| *id);
         let instance = |(id, report): (u64, &BridgeReport)| json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
@@ -806,7 +811,7 @@ impl Engine {
         let id = instance
             .parse::<u64>()
             .ok()
-            .filter(|id| self.lock().bridges.get(id).is_some_and(|report| report.seen.elapsed() < BRIDGE_TTL));
+            .filter(|id| self.lock().bridges.get(id).is_some_and(|report| self.bridge_live(*id, report)));
         let id = id.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
         let timeout = if action == "luau" { LUAU_TIMEOUT } else { Duration::from_secs(15) };
         self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
@@ -835,7 +840,7 @@ impl Engine {
             };
             let (projects, mut launching, bridged) = {
                 let mut state = self.lock();
-                state.bridges.retain(|_, report| report.seen.elapsed() < BRIDGE_TTL);
+                state.bridges.retain(|id, report| self.bridge_live(*id, report));
                 // The ports live bridges report as connected; None when no bridge runs.
                 let bridged: Option<HashSet<u16>> = (!state.bridges.is_empty())
                     .then(|| state.bridges.values().map(|report| report.port).filter(|&port| port != 0).collect());

@@ -22,6 +22,8 @@ local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 -- How long to wait before trying again when Rojo Manager does not answer.
 local RETRY_SECONDS = 5
+-- The largest poll Rojo Manager accepts, results included.
+local MAX_POLL_BYTES = 1024 * 1024
 -- Rojo's port when its port field is empty.
 local DEFAULT_PORT = 34872
 
@@ -175,8 +177,11 @@ local function poll(app, token: {})
 		local started = os.clock()
 		local report = { placeId = game.PlaceId, port = connectedPort(app), rojo = status(app), result = result }
 		local encoded, json = pcall(HttpService.JSONEncode, HttpService, report)
-		if not encoded and result then
-			report.result = { id = result.id, ok = false, value = `The result could not be sent: {json}` }
+		if result and (not encoded or #json > MAX_POLL_BYTES) then
+			local problem = if encoded
+				then `The result is too large to send ({#json} bytes). Return less.`
+				else `The result could not be sent: {json}`
+			report.result = { id = result.id, ok = false, value = problem }
 			json = HttpService:JSONEncode(report)
 		end
 		local ok, response = pcall(HttpService.RequestAsync, HttpService, {
@@ -238,8 +243,8 @@ function Bridge.attach(app)
 	end
 	local token = {}
 	attached[app] = token
-	-- The first request yields, so the app has mounted by the time it can connect.
-	task.spawn(poll, app, token)
+	-- Deferred until App:init has finished, so the host and port the poll reports are set.
+	task.defer(poll, app, token)
 	task.spawn(reportRojoPlugins)
 end
 
