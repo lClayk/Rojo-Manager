@@ -5851,7 +5851,7 @@ dependencies = [
 
 [[package]]
 name = "rojo-manager"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "async-channel",
  "embed-resource",
@@ -5867,7 +5867,7 @@ dependencies = [
 
 [[package]]
 name = "rojo-manager-core"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -5883,7 +5883,7 @@ dependencies = [
 
 [[package]]
 name = "rojo-manager-installer"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "rojo-manager-core",
  "serde",
@@ -5893,7 +5893,7 @@ dependencies = [
 
 [[package]]
 name = "rojo-manager-mcp"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "rojo-manager-core",
  "serde",
