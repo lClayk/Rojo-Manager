@@ -12,7 +12,7 @@ pub mod rojo_api;
 pub mod shell;
 pub mod startup;
 pub mod studio;
-pub mod studio_mcp;
+pub mod studio_link;
 pub mod tooling;
 pub mod updates;
 

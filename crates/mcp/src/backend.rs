@@ -5,12 +5,11 @@ use std::io;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::{self, Place};
 use rojo_manager_core::control::{self, RequestError};
 use rojo_manager_core::rojo_api;
 use rojo_manager_core::studio::{self, ResolveError};
-use rojo_manager_core::studio_mcp::{self, StudioMcpError};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 pub trait Backend: Sync {
     /// Call the running manager's control API.
@@ -25,10 +24,8 @@ pub trait Backend: Sync {
     fn launch_manager(&self) -> io::Result<()>;
     /// Whether a Rojo server answers on this port; the manager's watcher can lag a restart.
     fn rojo_answers(&self, port: u16) -> bool;
-    /// Call one robloxstudio-mcp tool.
-    fn studio_call(&self, tool: &str, arguments: &Value) -> Result<Map<String, Value>, StudioMcpError>;
-    /// Run plugin-level Luau in one Studio instance and return its decoded return value.
-    fn run_luau(&self, instance_id: &str, code: &str) -> Result<Value, StudioMcpError>;
+    /// Whether agents get get_connected_instances and execute_luau (the studio_tools setting).
+    fn studio_tools(&self) -> bool;
     /// Look up the place and universe IDs for a place ID or link.
     fn resolve_place(&self, text: &str) -> Result<Place, ResolveError>;
     /// Hand a place to Roblox Studio.
@@ -70,12 +67,9 @@ impl Backend for Core {
         rojo_api::server_info(port, Duration::from_secs(1)).is_some()
     }
 
-    fn studio_call(&self, tool: &str, arguments: &Value) -> Result<Map<String, Value>, StudioMcpError> {
-        studio_mcp::call(tool, arguments, Duration::from_secs(60))
-    }
-
-    fn run_luau(&self, instance_id: &str, code: &str) -> Result<Value, StudioMcpError> {
-        studio_mcp::run_luau(instance_id, code)
+    /// Read from the settings file, so listing tools does not start the manager.
+    fn studio_tools(&self) -> bool {
+        config::load().ok().is_none_or(|config| config.settings.studio_tools)
     }
 
     fn resolve_place(&self, text: &str) -> Result<Place, ResolveError> {

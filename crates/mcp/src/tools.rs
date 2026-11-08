@@ -1,11 +1,10 @@
 //! The tools agents call. Rojo processes stay owned by the Rojo Manager app, reached through its
-//! control API (it is started hidden when it is not running). Studio is reached through
-//! robloxstudio-mcp's HTTP bridge and the Rojo Manager bridge patched into the Rojo plugin.
+//! control API (it is started hidden when it is not running). Studio is reached through the same API:
+//! the Rojo Manager bridge patched into the Rojo plugin polls the app for commands.
 //!
 //! Results are typed structs serialized in field order, so agents read the same compact JSON as
 //! before. Failures are plain messages, reported to the agent as tool errors.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use rojo_manager_core::config::Place;
@@ -20,15 +19,19 @@ use crate::backend::Backend;
 pub type Args = Map<String, Value>;
 
 const RUNNING: [&str; 3] = ["serving", "connected", "external"];
-const BRIDGE_MISSING: &str = "The Rojo Manager bridge is not loaded in this Studio. Install it from Rojo Manager \
-    (Settings > Agents), disable the Creator Store Rojo plugin, then restart Studio.";
+const BRIDGE_MISSING: &str = "The Rojo Manager bridge is not installed. Install it from Rojo Manager \
+    (Settings > Agents), turn off the Creator Store Rojo plugin, then restart Studio.";
+/// Tools the studio_tools setting hides, for people whose other Studio MCP has them.
+const STUDIO_TOOLS: [&str; 2] = ["get_connected_instances", "execute_luau"];
+/// Longer than the manager waits for Luau to finish in Studio.
+const LUAU_CALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// control.request's default, used for GET /projects.
 const PROJECTS_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The tools/list entries, in the order agents see them.
-pub fn specs() -> Value {
-    json!([
+/// The tools/list entries, in the order agents see them; `studio_tools` adds the Studio ones.
+pub fn specs(studio_tools: bool) -> Value {
+    let mut specs = json!([
         {
             "name": "list_projects",
             "description": "List Rojo Manager projects with server state, port, linked Roblox place, \
@@ -45,7 +48,7 @@ pub fn specs() -> Value {
         },
         {
             "name": "open_place",
-            "description": "Open a Roblox place in Studio and wait until robloxstudio-mcp sees it. Pass a project \
+            "description": "Open a Roblox place in Studio and wait until its Rojo Manager bridge reports in. Pass a project \
                 to use its linked place, or a place ID or link. Passing both links that place to the \
                 project. connect_rojo also starts the project's server and connects the Rojo plugin.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
@@ -107,11 +110,32 @@ pub fn specs() -> Value {
                 "changes": {"type": "object", "additionalProperties": {"type": "boolean"},
                     "description": "Setting name to true or false"}}},
         },
-    ])
+        {
+            "name": "get_connected_instances",
+            "description": "Use to discover the Studio windows Rojo Manager's bridge reaches, with each one's \
+                instanceId, placeId, linked project, and Rojo plugin status.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+        },
+        {
+            "name": "execute_luau",
+            "description": "Use for custom Studio traversal, edits, or inspection. Runs with plugin permissions \
+                in Edit mode and returns the value it returns and what it prints.",
+            "inputSchema": {"type": "object", "required": ["code"], "additionalProperties": false, "properties": {
+                "code": {"type": "string", "description": "Luau code to execute."},
+                "instance_id": {"type": "string", "description": "Studio instance ID when ambiguous."}}},
+        },
+    ]);
+    if !studio_tools && let Some(list) = specs.as_array_mut() {
+        list.retain(|spec| !STUDIO_TOOLS.contains(&spec["name"].as_str().unwrap_or_default()));
+    }
+    specs
 }
 
 /// Run one tool: its result as compact JSON text, or an error message for the agent.
 pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, String> {
+    if STUDIO_TOOLS.contains(&name) && !backend.studio_tools() {
+        return Err(format!("Unknown tool {name}"));
+    }
     match name {
         "list_projects" => text(&list_projects(backend)?),
         "rojo_server" => {
@@ -132,6 +156,8 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         "manage_project" => text(&manage_project(backend, args)?),
         "updates" => text(&updates(backend, args)?),
         "app_settings" => text(&app_settings(backend, args)?),
+        "get_connected_instances" => text(&connected_instances(backend)?),
+        "execute_luau" => text(&execute_luau(backend, args)?),
         _ => Err(format!("Unknown tool {name}")),
     }
 }
@@ -322,9 +348,6 @@ struct Rojo {
     address: Option<String>,
     #[serde(skip_serializing_if = "blank")]
     error: Option<String>,
-    /// The bridge is not loaded in this Studio.
-    #[serde(default, skip_serializing)]
-    missing: bool,
 }
 
 impl Rojo {
@@ -345,39 +368,37 @@ struct StudioPlace {
     rojo: Rojo,
 }
 
-/// placeId -> instanceId for open Studio places, or None when robloxstudio-mcp is not running.
-fn studio_instances(backend: &dyn Backend) -> Option<HashMap<u64, String>> {
-    let reply = backend.studio_call("get_connected_instances", &json!({})).ok()?;
-    let instances = reply.get("instances").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    let entry = |item: &Value| Some((item.get("placeId")?.as_u64()?, item.get("id")?.as_str()?.to_string()));
-    Some(instances.iter().filter_map(entry).collect())
+/// A Studio window whose Rojo Manager bridge reports to the manager.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Instance {
+    instance_id: String,
+    place_id: u64,
+    #[serde(default)]
+    rojo: Rojo,
 }
 
-/// The Luau that invokes the Rojo Manager bridge. Arguments are validated literals.
-fn bridge_code(action: &str, port: Option<u16>) -> String {
-    let args = match port {
-        Some(port) if action == "connect" => format!(", \"localhost\", \"{port}\""),
-        _ => String::new(),
-    };
-    format!(
-        "local bridge = game:GetService(\"CoreGui\"):FindFirstChild(\"RojoManagerBridge\")\n\
-         if not bridge then return {{ missing = true }} end\n\
-         return bridge:Invoke(\"{action}\"{args})"
-    )
+/// The Studio windows the bridge reports from, or None when the bridge is not installed.
+fn studio_instances(backend: &dyn Backend) -> Result<Option<Vec<Instance>>, String> {
+    let reply = call(backend, "GET", &["studio"], None, CALL_TIMEOUT)?;
+    let installed = reply.get("bridge") == Some(&Value::Bool(true));
+    let instances: Vec<Instance> = field(reply, "instances")?;
+    Ok((installed || !instances.is_empty()).then_some(instances))
 }
 
-/// Invoke the Rojo Manager bridge in one Studio instance.
+/// The open Studio window with this place, if any.
+fn find_instance(instances: &[Instance], place_id: u64) -> Option<String> {
+    instances.iter().find(|instance| instance.place_id == place_id).map(|instance| instance.instance_id.clone())
+}
+
+/// Run a Rojo plugin action through the bridge in one Studio window.
 fn bridge(backend: &dyn Backend, instance_id: &str, action: &str, port: Option<u16>) -> Result<Rojo, String> {
-    let result = backend.run_luau(instance_id, &bridge_code(action, port)).map_err(|error| error.0)?;
-    let unexpected = || format!("Unexpected bridge response: {result}");
-    if !result.is_object() {
-        return Err(unexpected());
-    }
-    let rojo = Rojo::deserialize(&result).map_err(|_| unexpected())?;
-    if rojo.missing {
-        return Err(BRIDGE_MISSING.into());
-    }
-    Ok(rojo)
+    let body = match port {
+        Some(port) => json!({ "action": action, "port": port }),
+        None => json!({ "action": action }),
+    };
+    let result = call(backend, "POST", &["studio", instance_id], Some(&body), CALL_TIMEOUT)?;
+    Rojo::deserialize(&result).map_err(|_| format!("Unexpected bridge response: {result}"))
 }
 
 /// The Studio instance that has the project's linked place open.
@@ -385,11 +406,13 @@ fn place_instance(backend: &dyn Backend, project: &Project) -> Result<String, St
     let Some(place) = project.place else {
         return Err(format!("{} has no linked place. Link one with open_place (project and place).", project.name));
     };
-    let instances = studio_instances(backend).ok_or("robloxstudio-mcp is not running, so Studio cannot be reached.")?;
-    instances
-        .get(&place.place_id)
-        .cloned()
-        .ok_or_else(|| format!("Place {} is not open in Studio. Use open_place first.", place.place_id))
+    let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
+    find_instance(&instances, place.place_id).ok_or_else(|| {
+        format!(
+            "Place {} is not open in Studio, or its Rojo Manager bridge is not loaded. Use open_place first.",
+            place.place_id
+        )
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -482,7 +505,7 @@ struct Opened {
 }
 
 /// open_place: reuses a Studio that already has the place open, otherwise opens it and waits up to
-/// 3 minutes for robloxstudio-mcp to see it.
+/// 3 minutes for its bridge to report in.
 fn open_place(
     backend: &dyn Backend,
     project_name: Option<String>,
@@ -504,18 +527,21 @@ fn open_place(
     if connect_rojo && project.is_none() {
         return Err("connect_rojo needs a project, so Rojo Manager knows which server to use.".into());
     }
+    if project.is_none() {
+        manager_projects(backend)?; // starts the manager if needed
+    }
 
-    let instances = studio_instances(backend);
-    let mut instance_id = instances.as_ref().and_then(|instances| instances.get(&place.place_id).cloned());
+    let instances = studio_instances(backend)?;
+    let mut instance_id = instances.as_deref().and_then(|instances| find_instance(instances, place.place_id));
     let opened = instance_id.is_none();
     if opened {
         backend.open_place(&place).map_err(|error| format!("Could not open Roblox Studio: {error}"))?;
         if instances.is_none() {
-            let mut note = "robloxstudio-mcp is not running, so the opened place cannot be confirmed.";
+            let mut note = "The Rojo Manager bridge is not installed, so the opened place cannot be confirmed.";
             if let Some(project) = project.filter(|_| connect_rojo) {
                 run_server(backend, &project.name, "start")?;
-                note = "robloxstudio-mcp is not running, so the opened place cannot be confirmed and Rojo was \
-                        not connected. The Rojo server is running; connect it from the Rojo plugin in Studio.";
+                note = "The Rojo Manager bridge is not installed, so the opened place cannot be confirmed and \
+                        Rojo was not connected. The Rojo server is running; connect it from the Rojo plugin in Studio.";
             }
             return Ok(Opened {
                 place_id: place.place_id,
@@ -529,11 +555,13 @@ fn open_place(
         let deadline = Instant::now() + Duration::from_secs(180);
         while instance_id.is_none() && Instant::now() < deadline {
             backend.sleep(Duration::from_secs(2));
-            instance_id = studio_instances(backend).and_then(|mut instances| instances.remove(&place.place_id));
+            let instances = studio_instances(backend)?.unwrap_or_default();
+            instance_id = find_instance(&instances, place.place_id);
         }
         if instance_id.is_none() {
             return Err(format!(
-                "Studio was asked to open place {}, but it did not connect to robloxstudio-mcp within 3 minutes.",
+                "Studio was asked to open place {}, but its Rojo Manager bridge did not report in within 3 \
+                 minutes. Check that the Creator Store Rojo is off, so the bridge's Rojo loads.",
                 place.place_id
             ));
         }
@@ -556,22 +584,77 @@ struct ProjectList {
 }
 
 fn list_projects(backend: &dyn Backend) -> Result<ProjectList, String> {
-    let instances = studio_instances(backend);
-    let projects = manager_projects(backend)?
+    let projects = manager_projects(backend)?;
+    let mut instances = studio_instances(backend)?;
+    let projects = projects
         .into_iter()
         .map(|project| {
             let mut item = Brief::from(project);
-            let instance_id = item.place_id.and_then(|place_id| instances.as_ref()?.get(&place_id).cloned());
-            item.studio = instance_id.map(|instance_id| {
-                let rojo = bridge(backend, &instance_id, "status", None)
-                    .unwrap_or_else(|error| Rojo { error: Some(error), ..Rojo::default() });
-                StudioPlace { instance_id, rojo }
+            let open = item.place_id.and_then(|place_id| {
+                let instances = instances.as_mut()?;
+                let index = instances.iter().position(|instance| instance.place_id == place_id)?;
+                Some(instances.swap_remove(index))
             });
+            item.studio = open.map(|instance| StudioPlace { instance_id: instance.instance_id, rojo: instance.rojo });
             item
         })
         .collect();
-    let note = instances.is_none().then_some("robloxstudio-mcp is not running, so Studio state is unknown.");
+    let note = instances.is_none().then_some("The Rojo Manager bridge is not installed, so Studio state is unknown.");
     Ok(ProjectList { projects, note })
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectedInstance {
+    #[serde(rename = "instanceId")]
+    instance_id: String,
+    #[serde(rename = "placeId")]
+    place_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    rojo: Rojo,
+}
+
+/// get_connected_instances: every Studio window the bridge reports from, with its linked project.
+fn connected_instances(backend: &dyn Backend) -> Result<Value, String> {
+    let projects = manager_projects(backend)?;
+    let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
+    let linked = |place_id| projects.iter().find(|p| p.place.is_some_and(|place| place.place_id == place_id));
+    let instances: Vec<ConnectedInstance> = instances
+        .into_iter()
+        .map(|instance| ConnectedInstance {
+            project: linked(instance.place_id).map(|project| project.name.clone()),
+            instance_id: instance.instance_id,
+            place_id: instance.place_id,
+            rojo: instance.rojo,
+        })
+        .collect();
+    Ok(json!({ "instances": instances }))
+}
+
+/// execute_luau: run code in the one open Studio, or the one `instance_id` names.
+fn execute_luau(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
+    let code = match args.get("code") {
+        Some(Value::String(code)) if !code.trim().is_empty() => code.clone(),
+        _ => return Err("code must be a nonempty string".into()),
+    };
+    let instance_id = match optional_string(args, "instance_id")? {
+        Some(instance_id) => instance_id,
+        None => {
+            manager_projects(backend)?; // starts the manager if needed
+            let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
+            match instances.as_slice() {
+                [only] => only.instance_id.clone(),
+                [] => return Err("No Studio window with the Rojo Manager bridge is open.".into()),
+                several => {
+                    let ids: Vec<String> =
+                        several.iter().map(|i| format!("{} (place {})", i.instance_id, i.place_id)).collect();
+                    return Err(format!("Several Studio windows are open; pass instance_id: {}", ids.join(", ")));
+                }
+            }
+        }
+    };
+    let body = json!({ "action": "luau", "code": code });
+    call(backend, "POST", &["studio", &instance_id], Some(&body), LUAU_CALL_TIMEOUT)
 }
 
 // --------------------------------------------------------------- logs
@@ -712,7 +795,7 @@ fn project_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::{Fake, Script, project, studio_open};
+    use crate::fake::{Fake, Script, no_bridge, project, studio_open};
 
     fn args(value: Value) -> Args {
         match value {
@@ -845,7 +928,7 @@ mod tests {
         let fake = Fake {
             projects: Script::new([json!([project("off", true)]), json!([project("serving", true)])]),
             instances: studio_open(),
-            luau: Script::new([
+            studio: Script::new([
                 json!({"status": "Connecting"}),
                 json!({"status": "Connecting"}),
                 json!({"status": "Confirming"}),
@@ -855,7 +938,7 @@ mod tests {
         let session = run_session(&fake, "TestGame", "connect").unwrap();
         assert_eq!(
             json_text(&session),
-            r#"{"instanceId":"instance:a","rojo":{"status":"Confirming"},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort."}"#
+            r#"{"instanceId":"7","rojo":{"status":"Confirming"},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort."}"#
         );
         assert_eq!(
             fake.calls(),
@@ -863,9 +946,9 @@ mod tests {
                 "GET projects",
                 "POST projects/TestGame/start",
                 "GET projects",
-                r#"luau instance:a return bridge:Invoke("connect", "localhost", "34879")"#,
-                r#"luau instance:a return bridge:Invoke("status")"#,
-                r#"luau instance:a return bridge:Invoke("status")"#,
+                r#"POST studio/7 {"action":"connect","port":34879}"#,
+                r#"POST studio/7 {"action":"status"}"#,
+                r#"POST studio/7 {"action":"status"}"#,
             ]
         );
     }
@@ -883,8 +966,8 @@ mod tests {
             fake.calls(),
             [
                 "GET projects",
-                r#"luau instance:a return bridge:Invoke("status")"#,
-                r#"luau instance:a return bridge:Invoke("disconnect")"#,
+                r#"POST studio/7 {"action":"status"}"#,
+                r#"POST studio/7 {"action":"disconnect"}"#,
                 "POST projects/TestGame/stop",
                 "GET projects",
             ]
@@ -904,11 +987,11 @@ mod tests {
             fake.calls(),
             [
                 "GET projects",
-                r#"luau instance:a return bridge:Invoke("status")"#,
+                r#"POST studio/7 {"action":"status"}"#,
                 "POST projects/TestGame/restart",
                 "GET projects",
                 "GET projects",
-                r#"luau instance:a return bridge:Invoke("connect", "localhost", "34879")"#,
+                r#"POST studio/7 {"action":"connect","port":34879}"#,
             ]
         );
     }
@@ -920,23 +1003,22 @@ mod tests {
         let mut lobby = project("off", false);
         lobby["name"] = json!("Lobby");
         lobby["projectFile"] = json!("default.project.json");
+        let rojo = json!({"status": "Connected", "address": "localhost:34879", "host": "localhost", "bridge": 7});
         let fake = Fake {
             projects: Script::new([json!([test_game, lobby])]),
-            instances: studio_open(),
-            luau: Script::new([
-                json!({"status": "Connected", "address": "localhost:34879", "host": "localhost", "bridge": 1}),
-            ]),
+            instances: json!({"bridge": true, "instances": [{"instanceId": "7", "placeId": 2, "rojo": rojo}]}),
             ..Fake::default()
         };
         assert_eq!(
             json_text(&list_projects(&fake).unwrap()),
-            r#"{"projects":[{"name":"TestGame","state":"serving","port":34879,"placeId":2,"studio":{"instanceId":"instance:a","rojo":{"status":"Connected","address":"localhost:34879"}}},{"name":"Lobby","state":"off","port":34879}]}"#
+            r#"{"projects":[{"name":"TestGame","state":"serving","port":34879,"placeId":2,"studio":{"instanceId":"7","rojo":{"status":"Connected","address":"localhost:34879"}}},{"name":"Lobby","state":"off","port":34879}]}"#
         );
+        assert_eq!(fake.calls(), ["GET projects"]);
 
-        let fake = Fake { instances: None, ..Fake::default() };
+        let fake = Fake { instances: no_bridge(), ..Fake::default() };
         assert_eq!(
             json_text(&list_projects(&fake).unwrap()),
-            r#"{"projects":[],"note":"robloxstudio-mcp is not running, so Studio state is unknown."}"#
+            r#"{"projects":[],"note":"The Rojo Manager bridge is not installed, so Studio state is unknown."}"#
         );
     }
 
@@ -949,7 +1031,7 @@ mod tests {
             ..Fake::default()
         };
         let opened = open_place(&fake, Some("TestGame".into()), Some("https://www.roblox.com/games/2".into()), false);
-        assert_eq!(json_text(&opened.unwrap()), r#"{"placeId":2,"instanceId":"instance:a"}"#);
+        assert_eq!(json_text(&opened.unwrap()), r#"{"placeId":2,"instanceId":"7"}"#);
         assert_eq!(
             fake.calls(),
             ["GET projects", r#"POST projects/TestGame/link-place {"place":"https://www.roblox.com/games/2"}"#]
@@ -958,20 +1040,20 @@ mod tests {
 
     #[test]
     fn open_place_opens_studio_when_the_place_is_not_open() {
-        let fake = Fake { instances: None, ..Fake::default() };
+        let fake = Fake { instances: no_bridge(), ..Fake::default() };
         let opened = open_place(&fake, None, Some("2".into()), false).unwrap();
         assert_eq!(
             json_text(&opened),
-            r#"{"placeId":2,"opened":true,"note":"robloxstudio-mcp is not running, so the opened place cannot be confirmed."}"#
+            r#"{"placeId":2,"opened":true,"note":"The Rojo Manager bridge is not installed, so the opened place cannot be confirmed."}"#
         );
-        assert_eq!(fake.calls(), ["resolve 2", "open 2"]);
+        assert_eq!(fake.calls(), ["resolve 2", "GET projects", "open 2"]);
         let error = open_place(&fake, None, Some("2".into()), true).unwrap_err();
         assert_eq!(error, "connect_rojo needs a project, so Rojo Manager knows which server to use.");
 
-        // connect_rojo without robloxstudio-mcp still starts the server, and says Rojo is not connected.
+        // connect_rojo without the bridge still starts the server, and says Rojo is not connected.
         let fake = Fake {
             projects: Script::new([json!([project("off", true)]), json!([project("serving", true)])]),
-            instances: None,
+            instances: no_bridge(),
             ..Fake::default()
         };
         let opened = open_place(&fake, Some("TestGame".into()), None, true).unwrap();
@@ -980,39 +1062,64 @@ mod tests {
     }
 
     #[test]
-    fn sessions_need_a_linked_place_that_is_open() {
+    fn sessions_need_a_linked_place_open_with_the_bridge() {
         let fake = Fake { projects: Script::new([json!([project("off", false)])]), ..Fake::default() };
         let error = run_session(&fake, "TestGame", "status").unwrap_err();
         assert_eq!(error, "TestGame has no linked place. Link one with open_place (project and place).");
 
         let fake = Fake { projects: Script::new([json!([project("off", true)])]), ..Fake::default() };
         let error = run_session(&fake, "TestGame", "status").unwrap_err();
-        assert_eq!(error, "Place 2 is not open in Studio. Use open_place first.");
+        assert_eq!(
+            error,
+            "Place 2 is not open in Studio, or its Rojo Manager bridge is not loaded. Use open_place first."
+        );
+
+        let fake =
+            Fake { projects: Script::new([json!([project("off", true)])]), instances: no_bridge(), ..Fake::default() };
+        assert_eq!(run_session(&fake, "TestGame", "status").unwrap_err(), BRIDGE_MISSING);
     }
 
     #[test]
-    fn open_place_reuses_an_open_studio_and_reports_a_missing_bridge() {
+    fn open_place_reuses_an_open_studio() {
         let fake = Fake {
             projects: Script::new([json!([project("off", true)])]),
             instances: studio_open(),
-            luau: Script::new([json!({"missing": true})]),
             ..Fake::default()
         };
         let opened = open_place(&fake, Some("TestGame".into()), None, false).unwrap();
-        assert_eq!(json_text(&opened), r#"{"placeId":2,"instanceId":"instance:a"}"#);
+        assert_eq!(json_text(&opened), r#"{"placeId":2,"instanceId":"7"}"#);
         assert_eq!(fake.calls(), ["GET projects"]);
-        assert_eq!(bridge(&fake, "instance:a", "status", None).unwrap_err(), BRIDGE_MISSING);
     }
 
     #[test]
-    fn bridge_code_is_unchanged() {
+    fn studio_tools_list_instances_and_run_luau_unless_turned_off() {
+        let fake = Fake {
+            projects: Script::new([json!([project("serving", true)])]),
+            instances: studio_open(),
+            studio: Script::new([json!({"success": true, "returnValue": 2, "output": []})]),
+            ..Fake::default()
+        };
         assert_eq!(
-            bridge_code("connect", Some(34879)),
-            "local bridge = game:GetService(\"CoreGui\"):FindFirstChild(\"RojoManagerBridge\")\n\
-             if not bridge then return { missing = true } end\n\
-             return bridge:Invoke(\"connect\", \"localhost\", \"34879\")"
+            json_text(&connected_instances(&fake).unwrap()),
+            r#"{"instances":[{"instanceId":"7","placeId":2,"project":"TestGame","rojo":{"status":"Connected"}}]}"#
         );
-        assert!(bridge_code("status", Some(34879)).ends_with("\nreturn bridge:Invoke(\"status\")"));
+        let result = execute_luau(&fake, &args(json!({"code": "return 1 + 1"}))).unwrap();
+        assert_eq!(result["returnValue"], 2);
+        assert_eq!(
+            fake.calls(),
+            ["GET projects", "GET projects", r#"POST studio/7 {"action":"luau","code":"return 1 + 1"}"#]
+        );
+        assert_eq!(execute_luau(&fake, &args(json!({"code": " "}))).unwrap_err(), "code must be a nonempty string");
+
+        let hidden = Fake { studio_tools: false, ..Fake::default() };
+        let error = run(&hidden, "execute_luau", &args(json!({"code": "return 1"}))).unwrap_err();
+        assert_eq!(error, "Unknown tool execute_luau");
+        let listed = |studio_tools| {
+            let specs = specs(studio_tools);
+            let names: Vec<&str> = specs.as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+            STUDIO_TOOLS.iter().filter(|tool| names.contains(*tool)).count()
+        };
+        assert_eq!((listed(true), listed(false)), (2, 0));
     }
 
     #[test]

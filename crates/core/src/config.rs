@@ -53,6 +53,8 @@ pub struct Settings {
     pub auto_connect_accept: bool,
     /// List places of one experience under a shared, collapsible header.
     pub group_experiences: bool,
+    /// Offer agents get_connected_instances and execute_luau; off when another Studio MCP has them.
+    pub studio_tools: bool,
 }
 
 impl Default for Settings {
@@ -71,12 +73,13 @@ impl Default for Settings {
             restart_crashed: true,
             auto_connect_accept: true,
             group_experiences: true,
+            studio_tools: true,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 13] = [
+    pub const KEYS: [&'static str; 14] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -90,6 +93,7 @@ impl Settings {
         "restart_crashed",
         "auto_connect_accept",
         "group_experiences",
+        "studio_tools",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -107,6 +111,7 @@ impl Settings {
             "restart_crashed" => &mut self.restart_crashed,
             "auto_connect_accept" => &mut self.auto_connect_accept,
             "group_experiences" => &mut self.group_experiences,
+            "studio_tools" => &mut self.studio_tools,
             _ => return None,
         })
     }

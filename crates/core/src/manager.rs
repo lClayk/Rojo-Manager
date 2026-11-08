@@ -14,9 +14,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::config::{self, Config, Place, Settings};
-use crate::control::{ControlError, ControlHandler};
+use crate::control::{BridgePoll, ControlError, ControlHandler};
 use crate::localnet::{self, port_in_use};
 use crate::studio::{self, ResolveError};
+use crate::studio_link::Link;
 use crate::tooling::{self, Job, RojoState, RojoStatus};
 use crate::updates::{self, UpdateState, UpdateStatus};
 use crate::{rojo_api, startup};
@@ -29,6 +30,10 @@ const CRASH_RESTARTS: usize = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
 /// A bridge polls every few seconds; one silent this long has unloaded with its Studio.
 const BRIDGE_TTL: Duration = Duration::from_secs(15);
+/// How long a bridge's poll waits for a command before the bridge reports again.
+const BRIDGE_HOLD: Duration = Duration::from_secs(5);
+/// How long agent Luau may run in Studio.
+pub const LUAU_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -192,8 +197,11 @@ struct State {
 
 /// What a Studio bridge last said and was told.
 struct BridgeReport {
+    place_id: u64,
     /// The server its Rojo is connected to, or 0.
     port: u16,
+    /// The Rojo plugin's status, as the bridge describes it.
+    rojo: Value,
     /// The auto-connect server offered to it.
     offered: Option<u16>,
     seen: Instant,
@@ -249,6 +257,8 @@ pub struct Engine {
     app_dir: PathBuf,
     closing: AtomicBool,
     wake: (Mutex<bool>, Condvar),
+    /// Commands on their way to the bridges in Studio.
+    link: Link,
 }
 
 fn missing(name: &str) -> String {
@@ -320,6 +330,7 @@ impl Engine {
             app_dir,
             closing: AtomicBool::new(false),
             wake: (Mutex::new(false), Condvar::new()),
+            link: Link::default(),
         })
     }
 
@@ -739,11 +750,12 @@ impl Engine {
     /// show as Connected. Answers with the place's auto-connect server and whether to accept Rojo's
     /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
     /// starting the server connects an open place.
-    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
+    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16, rojo: Value) -> Option<(u16, bool)> {
         let (target, previous, accept) = {
             let mut state = self.lock();
             let target = state.auto_connect_target(place_id);
-            let report = BridgeReport { port, offered: target.as_ref().map(|(_, port)| *port), seen: Instant::now() };
+            let offered = target.as_ref().map(|(_, port)| *port);
+            let report = BridgeReport { place_id, port, rojo, offered, seen: Instant::now() };
             (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept)
         };
         if previous.as_ref().map(|report| report.port) != Some(port) {
@@ -777,6 +789,27 @@ impl Engine {
             Some(false) => self.alert(format!("{name} keeps crashing, so it was not restarted. Check Logs.")),
             None => self.alert(format!("{name} stopped unexpectedly (code {code}). Check Logs.")),
         }
+    }
+
+    /// The Studio windows whose bridge polled recently: {instanceId, placeId, rojo}.
+    pub fn studio_instances(&self) -> Vec<Value> {
+        let state = self.lock();
+        let live = state.bridges.iter().filter(|(_, report)| report.seen.elapsed() < BRIDGE_TTL);
+        let mut instances: Vec<(u64, &BridgeReport)> = live.map(|(id, report)| (*id, report)).collect();
+        instances.sort_by_key(|(id, _)| *id);
+        let instance = |(id, report): (u64, &BridgeReport)| json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
+        instances.into_iter().map(instance).collect()
+    }
+
+    /// Run a command in one Studio window through its bridge and wait for the result.
+    pub fn studio_command(&self, instance: &str, action: &str, args: Value) -> Result<Value, ControlError> {
+        let id = instance
+            .parse::<u64>()
+            .ok()
+            .filter(|id| self.lock().bridges.get(id).is_some_and(|report| report.seen.elapsed() < BRIDGE_TTL));
+        let id = id.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
+        let timeout = if action == "luau" { LUAU_TIMEOUT } else { Duration::from_secs(15) };
+        self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
     }
 
     /// The bridge's count of Rojo plugins running in a Studio that just opened a place.
@@ -1470,8 +1503,37 @@ impl ControlHandler for Control {
         Ok(self.0.settings_value())
     }
 
-    fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
-        self.0.report_bridge(id, place_id, port)
+    fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value {
+        let offer = self.0.report_bridge(id, poll.place_id, poll.port, poll.rojo);
+        let result = poll.result.map(|result| {
+            let outcome = match result.ok {
+                true => Ok(result.value),
+                false => Err(result.value.as_str().unwrap_or("The command failed in Studio").to_string()),
+            };
+            (result.id, outcome)
+        });
+        let command = self.0.link.poll(id, result, BRIDGE_HOLD);
+        json!({ "port": offer.map(|(port, _)| port), "accept": offer.is_some_and(|(_, accept)| accept), "command": command })
+    }
+
+    fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError> {
+        let Some((instance, body)) = command else {
+            let installed = matches!(tooling::studio_plugin(), tooling::StudioPlugin::Bridge { .. });
+            return Ok(json!({ "bridge": installed, "instances": self.0.studio_instances() }));
+        };
+        let action = body.get("action").and_then(Value::as_str).unwrap_or_default();
+        let valid = match action {
+            "status" | "disconnect" | "accept" | "abort" => true,
+            "connect" => body.get("port").and_then(Value::as_u64).is_some_and(|port| (1..=65535).contains(&port)),
+            "luau" => body.get("code").is_some_and(Value::is_string),
+            _ => false,
+        };
+        if !valid {
+            return Err(ControlError::bad(
+                "Pass action status, disconnect, accept, abort, connect (with port), or luau (with code)",
+            ));
+        }
+        self.0.studio_command(instance, action, Value::Object(body.clone()))
     }
 
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {

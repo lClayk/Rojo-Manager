@@ -3,33 +3,30 @@
 -- Rojo Manager bridge for the Rojo Studio plugin (https://github.com/rojo-rbx/rojo).
 --
 -- patch_rojo_plugin.luau adds this module to the official Rojo plugin on the user's machine.
--- In Edit mode it publishes CoreGui.RojoManagerBridge, a BindableFunction that plugin code
--- (such as robloxstudio-mcp's execute_luau) can invoke. Game scripts cannot reach CoreGui.
+-- In Edit mode it polls Rojo Manager on a fixed local port without pause. Each poll reports the
+-- place, the server Rojo is connected to, and Rojo's status, so Rojo Manager shows Connected only for
+-- real sessions. Rojo Manager holds the poll until it has a command for this Studio, or a few seconds.
 --
---   bridge:Invoke("status")              -> { status, host, port, projectName, address, error }
---   bridge:Invoke("connect", host, port) -> status; connects in the background
---   bridge:Invoke("disconnect")          -> status
---   bridge:Invoke("accept" | "abort")    -> status; answers Rojo's initial sync confirmation
---
--- Every few seconds it tells Rojo Manager (on a fixed local port) which server Rojo is connected to,
--- so Rojo Manager shows Connected only for real sessions. The answer names the server of a running
--- project with auto-connect linked to this place, and the bridge connects when that offer appears,
--- accepting Rojo's initial sync prompt unless Rojo Manager's settings say to ask.
+-- The answer names the server of a running project with auto-connect linked to this place; the
+-- bridge connects when that offer appears, accepting Rojo's initial sync prompt unless Rojo
+-- Manager's settings say to ask. A command is one of the actions below; its result goes back with
+-- the next poll. Commands only come from Rojo Manager, which takes them from agents through its
+-- token-protected API.
 -- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
 
-local CoreGui = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
-local NAME = "RojoManagerBridge"
-local VERSION = 6
+local VERSION = 7
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
-local POLL_SECONDS = 5
+-- How long to wait before trying again when Rojo Manager does not answer.
+local RETRY_SECONDS = 5
 -- Rojo's port when its port field is empty.
 local DEFAULT_PORT = 34872
 
-local published: { [any]: BindableFunction } = {}
+-- The attached app's current poll loop, so a detached or reattached app's loop stops.
+local attached: { [any]: {} } = {}
 
 -- Rojo's live session, if any.
 local function connected(app): boolean
@@ -74,16 +71,19 @@ local function endSession(app)
 	end
 end
 
+-- A value as JSON can carry it; anything else (an Instance, a function) as its text.
+local function encodable(value: any): any
+	local ok = pcall(HttpService.JSONEncode, HttpService, { value })
+	return if ok then value else tostring(value)
+end
+
 local actions = {
 	status = status,
-	connect = function(app, host: string?, port: string?)
-		-- Any plugin can call this bridge, so it only connects Rojo to servers on this computer.
-		if host ~= nil and host ~= "" and host ~= "localhost" and host ~= "127.0.0.1" then
-			error("Rojo Manager's bridge only connects to Rojo servers on this computer", 0)
-		end
+	-- Connect Rojo to the Rojo server on this computer at args.port.
+	connect = function(app, args)
 		endSession(app)
-		app.setHost(host or "")
-		app.setPort(port or "")
+		app.setHost("localhost")
+		app.setPort(tostring(args.port))
 		-- Starting can yield on the sync lock; return so the caller can poll status.
 		task.spawn(app.startSession, app)
 		return status(app)
@@ -98,7 +98,49 @@ local actions = {
 	abort = function(app)
 		return answer(app, "Abort")
 	end,
+	-- Run args.code with plugin permissions. Returns what it printed and returned.
+	luau = function(_app, args)
+		local chunk, compileError = loadstring(args.code, "=execute_luau")
+		if not chunk then
+			error(compileError, 0)
+		end
+		local output = {}
+		local function capture(prefix: string)
+			return function(...)
+				local parts = {}
+				for index = 1, select("#", ...) do
+					parts[index] = tostring((select(index, ...)))
+				end
+				table.insert(output, prefix .. table.concat(parts, " "))
+			end
+		end
+		setfenv(chunk, setmetatable({ print = capture(""), warn = capture("warning: ") }, { __index = getfenv() }))
+		local results = table.pack(pcall(chunk))
+		if not results[1] then
+			local printed = if #output > 0 then "\nOutput:\n" .. table.concat(output, "\n") else ""
+			error(tostring(results[2]) .. printed, 0)
+		end
+		local returned = {}
+		for index = 2, results.n do
+			returned[index - 1] = encodable(results[index])
+		end
+		return {
+			success = true,
+			returnValue = if results.n <= 2 then returned[1] else returned,
+			output = output,
+		}
+	end,
 }
+
+-- Run one command from Rojo Manager; the result travels with the next poll.
+local function run(app, command)
+	local handler = actions[command.action]
+	if not handler then
+		return { id = command.id, ok = false, value = `Unknown Rojo Manager bridge action: {command.action}` }
+	end
+	local ok, value = pcall(handler, app, command.args or {})
+	return { id = command.id, ok = ok, value = if ok then value else tostring(value) }
+end
 
 -- The server Rojo has a live session with, or 0.
 local function connectedPort(app): number
@@ -123,34 +165,47 @@ local function acceptPrompt(app)
 	end
 end
 
--- Report the session and act on the auto-connect offer until the plugin unloads. An offer connects
--- only when it appears (the place opened, the server started, or auto-connect was turned on), so
--- disconnecting by hand sticks.
-local function poll(app, bindable: BindableFunction)
+-- Poll until the plugin unloads. An auto-connect offer connects only when it appears (the place
+-- opened, the server started, or auto-connect was turned on), so disconnecting by hand sticks.
+local function poll(app, token: {})
 	local id = Random.new():NextInteger(1, 2 ^ 31 - 1)
 	local offered: number? = nil
-	while published[app] == bindable do
-		local ok, response = pcall(HttpService.RequestAsync, HttpService, {
-			Url = `{POLL_URL}{id}/{game.PlaceId}/{connectedPort(app)}`,
-			Method = "GET",
-		})
-		-- 404 means Rojo Manager knows no running project that auto-connects here.
-		local offer: number?, accept = nil, false
-		if ok and response.Success then
-			local decoded, body = pcall(HttpService.JSONDecode, HttpService, response.Body)
-			if decoded and type(body) == "table" and type(body.port) == "number" then
-				offer, accept = body.port, body.accept == true
-			end
+	local result = nil
+	while attached[app] == token do
+		local started = os.clock()
+		local report = { placeId = game.PlaceId, port = connectedPort(app), rojo = status(app), result = result }
+		local encoded, json = pcall(HttpService.JSONEncode, HttpService, report)
+		if not encoded and result then
+			report.result = { id = result.id, ok = false, value = `The result could not be sent: {json}` }
+			json = HttpService:JSONEncode(report)
 		end
+		local ok, response = pcall(HttpService.RequestAsync, HttpService, {
+			Url = `{POLL_URL}{id}`,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = json,
+		})
+		result = nil
+		local body = nil
+		if ok and response.Success then
+			local decoded, value = pcall(HttpService.JSONDecode, HttpService, response.Body)
+			body = if decoded and type(value) == "table" then value else nil
+		end
+		local offer: number? = if body and type(body.port) == "number" then body.port else nil
 		-- No session, whatever page Rojo shows (Error after a lost connection, or Settings).
 		if offer ~= nil and offer ~= offered and app.serveSession == nil then
-			actions.connect(app, "localhost", tostring(offer))
-			if accept then
+			actions.connect(app, { port = offer })
+			if body and body.accept == true then
 				task.spawn(acceptPrompt, app)
 			end
 		end
 		offered = offer
-		task.wait(POLL_SECONDS)
+		if body and type(body.command) == "table" then
+			result = run(app, body.command)
+		elseif os.clock() - started < 1 then
+			-- Rojo Manager is not running, or did not hold the poll.
+			task.wait(RETRY_SECONDS)
+		end
 	end
 end
 
@@ -181,34 +236,16 @@ function Bridge.attach(app)
 	if not RunService:IsEdit() then
 		return
 	end
-	local previous = CoreGui:FindFirstChild(NAME)
-	if previous then
-		previous:Destroy()
-	end
-	local bindable = Instance.new("BindableFunction")
-	bindable.Name = NAME
-	bindable.Archivable = false
-	bindable.OnInvoke = function(action: string, ...)
-		local handler = actions[action]
-		if not handler then
-			error(`Unknown Rojo Manager bridge action: {tostring(action)}`, 0)
-		end
-		return handler(app, ...)
-	end
-	bindable.Parent = CoreGui
-	published[app] = bindable
+	local token = {}
+	attached[app] = token
 	-- The first request yields, so the app has mounted by the time it can connect.
-	task.spawn(poll, app, bindable)
+	task.spawn(poll, app, token)
 	task.spawn(reportRojoPlugins)
 end
 
 -- Called from App:willUnmount when the plugin unloads.
 function Bridge.detach(app)
-	local bindable = published[app]
-	if bindable then
-		published[app] = nil
-		bindable:Destroy()
-	end
+	attached[app] = nil
 end
 
 return Bridge

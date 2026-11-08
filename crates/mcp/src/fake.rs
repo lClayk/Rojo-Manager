@@ -8,8 +8,7 @@ use std::time::Duration;
 use rojo_manager_core::config::Place;
 use rojo_manager_core::control::RequestError;
 use rojo_manager_core::studio::ResolveError;
-use rojo_manager_core::studio_mcp::StudioMcpError;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::backend::Backend;
 
@@ -32,10 +31,12 @@ pub struct Fake {
     pub projects: Script<Value>,
     /// Answers every other control request, given its method and path parts.
     pub reply: fn(&str, &[&str]) -> Value,
-    /// The get_connected_instances answer; None when robloxstudio-mcp is not running.
-    pub instances: Option<Value>,
-    /// What the bridge Luau returns.
-    pub luau: Script<Value>,
+    /// The GET /studio answer.
+    pub instances: Value,
+    /// What Studio commands return.
+    pub studio: Script<Value>,
+    /// The studio_tools setting.
+    pub studio_tools: bool,
     /// Whether Rojo answers on the project's port.
     pub answers: Script<bool>,
     /// Read with [`Fake::calls`].
@@ -47,8 +48,9 @@ impl Default for Fake {
         Fake {
             projects: Script::new([json!([])]),
             reply: |_, _| json!({"project": project("serving", true)}),
-            instances: Some(json!({"instances": []})),
-            luau: Script::new([json!({"status": "Connected"})]),
+            instances: json!({"bridge": true, "instances": []}),
+            studio: Script::new([json!({"status": "Connected"})]),
+            studio_tools: true,
             answers: Script::new([true]),
             calls: Mutex::default(),
         }
@@ -56,8 +58,8 @@ impl Default for Fake {
 }
 
 impl Fake {
-    /// Control requests ("METHOD path body"), launches, bridge calls (instance and the Luau's last
-    /// line), place lookups, and Studio launches, in order.
+    /// Control requests ("METHOD path body"), launches, place lookups, and Studio launches, in order;
+    /// GET /studio is left out.
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
@@ -73,9 +75,14 @@ pub fn project(state: &str, place: bool) -> Value {
     json!({"name": "TestGame", "port": 34879, "state": state, "log": ["error: port in use"], "place": place})
 }
 
-/// A get_connected_instances answer with place 2 open in Studio.
-pub fn studio_open() -> Option<Value> {
-    Some(json!({"instances": [{"id": "instance:a", "placeId": 2}]}))
+/// A GET /studio answer with place 2 open in Studio.
+pub fn studio_open() -> Value {
+    json!({"bridge": true, "instances": [{"instanceId": "7", "placeId": 2, "rojo": {"status": "Connected"}}]})
+}
+
+/// A GET /studio answer without the bridge installed.
+pub fn no_bridge() -> Value {
+    json!({"bridge": false, "instances": []})
 }
 
 impl Backend for Fake {
@@ -87,6 +94,9 @@ impl Backend for Fake {
         _timeout: Duration,
     ) -> Result<Value, RequestError> {
         let path = parts.join("/");
+        if method == "GET" && path == "studio" {
+            return Ok(self.instances.clone());
+        }
         self.record(match body {
             Some(body) => format!("{method} {path} {body}"),
             None => format!("{method} {path}"),
@@ -97,6 +107,9 @@ impl Backend for Fake {
                 return Err(RequestError::Unreachable("Rojo Manager is not running".into()));
             }
             return Ok(json!({ "projects": projects }));
+        }
+        if parts.first() == Some(&"studio") {
+            return Ok(self.studio.next());
         }
         Ok((self.reply)(method, parts))
     }
@@ -110,16 +123,8 @@ impl Backend for Fake {
         self.answers.next()
     }
 
-    fn studio_call(&self, _tool: &str, _arguments: &Value) -> Result<Map<String, Value>, StudioMcpError> {
-        match &self.instances {
-            Some(Value::Object(reply)) => Ok(reply.clone()),
-            _ => Err(StudioMcpError("robloxstudio-mcp is not reachable".into())),
-        }
-    }
-
-    fn run_luau(&self, instance_id: &str, code: &str) -> Result<Value, StudioMcpError> {
-        self.record(format!("luau {instance_id} {}", code.lines().last().unwrap_or_default()));
-        Ok(self.luau.next())
+    fn studio_tools(&self) -> bool {
+        self.studio_tools
     }
 
     fn resolve_place(&self, text: &str) -> Result<Place, ResolveError> {
