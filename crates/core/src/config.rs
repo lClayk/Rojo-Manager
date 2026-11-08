@@ -38,6 +38,8 @@ pub struct Settings {
     pub start_hidden: bool,
     pub version_check: bool,
     pub app_version_check: bool,
+    /// On launch, install a newer app release (restarting into it), or else rebuild an outdated bridge.
+    pub auto_update: bool,
     pub show_wally: bool,
     pub show_rokit: bool,
     pub show_aftman: bool,
@@ -60,6 +62,7 @@ impl Default for Settings {
             start_hidden: false,
             version_check: true,
             app_version_check: true,
+            auto_update: false,
             show_wally: true,
             show_rokit: true,
             show_aftman: true,
@@ -73,11 +76,12 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 12] = [
+    pub const KEYS: [&'static str; 13] = [
         "tray",
         "start_hidden",
         "version_check",
         "app_version_check",
+        "auto_update",
         "show_wally",
         "show_rokit",
         "show_aftman",
@@ -94,6 +98,7 @@ impl Settings {
             "start_hidden" => &mut self.start_hidden,
             "version_check" => &mut self.version_check,
             "app_version_check" => &mut self.app_version_check,
+            "auto_update" => &mut self.auto_update,
             "show_wally" => &mut self.show_wally,
             "show_rokit" => &mut self.show_rokit,
             "show_aftman" => &mut self.show_aftman,

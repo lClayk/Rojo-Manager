@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use rojo_manager_core::config::Settings;
 use rojo_manager_core::manager::{ProjectView, ServerState};
-use rojo_manager_core::tooling::{BRIDGE_VERSION, StudioPlugin, full_version};
+use rojo_manager_core::tooling::{StudioPlugin, bridge_outdated};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusColor {
@@ -193,26 +193,6 @@ pub struct PluginRow {
     pub primary: bool,
 }
 
-/// Why the installed bridge needs rebuilding: an older Rojo Manager built it, Rojo changed since,
-/// or this app ships a newer bridge. `rojo` is the installed Rojo's `--version` output, once read.
-pub fn bridge_outdated(plugin: &StudioPlugin, rojo: Option<&str>) -> Option<String> {
-    let StudioPlugin::Bridge { built } = plugin else { return None };
-    let Some(built) = built else {
-        return Some("The Studio bridge was installed by an older Rojo Manager. Update it once.".into());
-    };
-    match rojo {
-        Some(installed) if full_version(installed) != full_version(&built.rojo) => Some(format!(
-            "The Studio bridge was built for Rojo {}, but Rojo {} is installed. Update to match.",
-            built.rojo,
-            version_number(installed)
-        )),
-        _ if built.bridge < BRIDGE_VERSION => {
-            Some("A newer Studio bridge is available. Update, then restart Studio.".into())
-        }
-        _ => None,
-    }
-}
-
 /// `rojo` is the installed Rojo's `--version` output, once read.
 pub fn plugin_row(plugin: &StudioPlugin, rojo: Option<&str>, installing: bool) -> PluginRow {
     let row = |hint: String, warn, button, primary| PluginRow { hint, warn, button, primary };
@@ -253,6 +233,7 @@ pub fn version_number(output: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rojo_manager_core::tooling::BRIDGE_VERSION;
 
     fn project(state: ServerState) -> ProjectView {
         ProjectView {

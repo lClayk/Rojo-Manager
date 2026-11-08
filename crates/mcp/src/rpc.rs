@@ -24,6 +24,7 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - manage_project adds project folders, changes a project's name, port, autostart, auto_connect, or linked place,
   or removes a project from the list (its files are kept).
 - server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
+- updates checks whether Rojo Manager and its Studio bridge are up to date, and installs either when the user asks.
 Server states: off; starting; serving (running, no Studio connected); connected (a Studio is syncing);
 external (running but started outside Rojo Manager, still controllable); blocked (another app owns the port).
 Studio editing tools come from the separate robloxstudio MCP server; pass it the instanceId returned here.";
@@ -167,6 +168,7 @@ mod tests {
             "rojo_session",
             "server_logs",
             "manage_project",
+            "updates",
             "app_settings",
         ];
         assert_eq!(names, HashSet::from(expected));

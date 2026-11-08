@@ -132,6 +132,8 @@ pub enum Event {
     Alert(String),
     /// A line of a project's Rojo output.
     Log { project: String, seq: u64, line: String },
+    /// An app update was installed; the tray app restarts into it.
+    Restart,
 }
 
 /// Changes to one project, checked as a whole before any is applied. `place: Some(None)` unlinks.
@@ -177,6 +179,8 @@ struct State {
     app_update_revision: u64,
     tool_job: Option<ToolJob>,
     tool_versions: HashMap<&'static str, Option<String>>,
+    /// The last tool job's outcome, as its notice said.
+    job_result: Option<String>,
     /// Recent unexpected exits per project, for the crash restart limit.
     crashes: HashMap<String, Vec<Instant>>,
     studio_rojo_plugins: Option<u32>,
@@ -324,7 +328,8 @@ impl Engine {
         let engine = Arc::clone(self);
         std::thread::spawn(move || engine.watch());
         self.check_rojo(false);
-        self.check_app_update(false);
+        let auto_update = self.settings().auto_update;
+        self.check_app_update(false, auto_update);
         self.refresh_tool_versions();
         self.look_up_experiences();
         let names: Vec<String> =
@@ -1109,7 +1114,7 @@ impl Engine {
             startup::set_startup(true, value).map_err(|e| format!("Could not change Windows startup: {e}"))?;
         }
         match key {
-            "app_version_check" => self.check_app_update(false),
+            "app_version_check" => self.check_app_update(false, false),
             "version_check" => self.check_rojo(false),
             _ => self.changed(),
         }
@@ -1144,7 +1149,9 @@ impl Engine {
         });
     }
 
-    pub fn check_app_update(self: &Arc<Self>, force: bool) {
+    /// Check for a newer release when enabled or forced. With `install`, a newer release is installed
+    /// (restarting into it), and otherwise an outdated Studio bridge is rebuilt.
+    pub fn check_app_update(self: &Arc<Self>, force: bool, install: bool) {
         let (revision, enabled) = {
             let mut state = self.lock();
             state.app_update_revision += 1;
@@ -1154,14 +1161,33 @@ impl Engine {
         self.changed();
         let engine = Arc::clone(self);
         std::thread::spawn(move || {
-            let status = updates::inspect_update(enabled || force, crate::VERSION);
+            let status = updates::inspect_update(enabled || force || install, crate::VERSION);
+            let outdated = status.state == UpdateState::Outdated;
             let mut state = engine.lock();
-            if state.app_update_revision == revision {
-                state.app_update = Some(status);
-                drop(state);
-                engine.changed();
+            if state.app_update_revision != revision {
+                return;
+            }
+            state.app_update = Some(status);
+            drop(state);
+            engine.changed();
+            if install && outdated {
+                let _ = engine.install_app_update(); // a failure shows in the update status
+            } else if install
+                && engine.bridge_update().is_some()
+                && let Err(error) = engine.run_tool_job(Job::Bridge { tool: "Rojo".into() })
+            {
+                engine.notice(error);
             }
         });
+    }
+
+    /// Why the installed Studio bridge needs rebuilding, if it does.
+    pub fn bridge_update(&self) -> Option<String> {
+        let rojo = match self.lock().tool_versions.get("Rojo") {
+            Some(version) => version.clone(),
+            None => tooling::tool_version("Rojo", None).ok(), // not read yet at launch
+        };
+        tooling::bridge_outdated(&tooling::studio_plugin(), rojo.as_deref())
     }
 
     /// The newer release's version while one is available ("0.7.1"), for the tray.
@@ -1171,7 +1197,7 @@ impl Engine {
         update.url.rsplit_once("/tag/v").map(|(_, version)| version.to_string())
     }
 
-    /// Download and swap in the latest release. The caller restarts the app on success.
+    /// Download and swap in the latest release, then have the tray app restart into it.
     pub fn install_app_update(&self) -> Result<String, String> {
         let installing = |message: String| UpdateStatus {
             state: UpdateState::Installing,
@@ -1196,6 +1222,9 @@ impl Engine {
             }
         });
         self.changed();
+        if result.is_ok() {
+            (self.emit)(Event::Restart);
+        }
         result
     }
 
@@ -1270,6 +1299,7 @@ impl Engine {
             let mut state = self.lock();
             state.tool_job = None; // deletes the request folder
             state.rojo_checked.clear();
+            state.job_result = Some(result.clone());
         }
         self.changed();
         self.notice(result);
@@ -1291,6 +1321,32 @@ impl Engine {
         object.remove("badges");
         object.insert("log".into(), json!(log));
         Some(value)
+    }
+
+    /// Install an update for an agent: "app" restarts into the newest release; "bridge" waits for the
+    /// installer, whose terminal may ask the user to trust a tool.
+    fn install_update(self: &Arc<Self>, target: &str) -> Result<Value, ControlError> {
+        if target == "app" {
+            let version = self.install_app_update().map_err(|e| ControlError::new(e, 409))?;
+            self.notice(format!("Updating to Rojo Manager {version}, requested by an agent"));
+            return Ok(json!({ "message": format!(
+                "Rojo Manager {version} is installed and restarting. Its running servers restart with it, so \
+                reconnect Rojo in Studio afterwards."
+            )}));
+        }
+        if target != "bridge" {
+            return Err(ControlError::new(format!("Unknown update {target}. Pass app or bridge."), 404));
+        }
+        self.lock().job_result = None;
+        self.run_tool_job(Job::Bridge { tool: "Rojo".into() }).map_err(|e| ControlError::new(e, 409))?;
+        while self.lock().tool_job.is_some() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let result = self.lock().job_result.clone().unwrap_or_default();
+        if result.starts_with("Installation failed") {
+            return Err(ControlError::new(result, 500));
+        }
+        Ok(json!({ "message": format!("{result} Restart Studio to load it.") }))
     }
 
     fn settings_value(&self) -> Value {
@@ -1416,6 +1472,22 @@ impl ControlHandler for Control {
 
     fn report_bridge(&self, id: u64, place_id: u64, port: u16) -> Option<(u16, bool)> {
         self.0.report_bridge(id, place_id, port)
+    }
+
+    fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {
+        if let Some(target) = install {
+            return self.0.install_update(target);
+        }
+        let app = updates::inspect_update(true, crate::VERSION);
+        let bridge = match (tooling::studio_plugin(), self.0.bridge_update()) {
+            (_, Some(message)) => json!({ "state": "outdated", "message": message }),
+            (tooling::StudioPlugin::Bridge { .. }, None) => json!({ "state": "current" }),
+            (_, None) => json!({ "state": "missing", "message": "The Studio bridge is not installed." }),
+        };
+        Ok(json!({
+            "app": { "installed": crate::VERSION, "state": app.state, "message": app.message },
+            "bridge": bridge,
+        }))
     }
 }
 

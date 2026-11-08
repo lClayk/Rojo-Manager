@@ -15,7 +15,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rojo_manager_core::manager::{Event, Snapshot};
-use rojo_manager_core::tooling::Job;
+use rojo_manager_core::tooling::{self, Job};
 use rojo_manager_core::updates::UpdateState;
 
 use crate::ipc::Client;
@@ -119,6 +119,7 @@ impl MainView {
                     cx.notify();
                 }
             }
+            Event::Restart => {}
         }
     }
 
@@ -413,7 +414,7 @@ impl MainView {
             ));
         }
         let rojo = snapshot.tool_versions.get("Rojo").cloned().flatten();
-        if let Some(message) = logic::bridge_outdated(&snapshot.studio_plugin, rojo.as_deref()) {
+        if let Some(message) = tooling::bridge_outdated(&snapshot.studio_plugin, rojo.as_deref()) {
             let installing = settings::installing_bridge(snapshot);
             banners.push(Self::banner(
                 "circle-arrow-up",

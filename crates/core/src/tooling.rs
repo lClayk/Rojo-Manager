@@ -548,6 +548,25 @@ pub struct BridgeBuild {
 /// The `VERSION` in RojoManagerBridge.luau; raise both together.
 pub const BRIDGE_VERSION: u32 = 6;
 
+/// Why the installed bridge needs rebuilding: an older Rojo Manager built it, Rojo changed since,
+/// or this app ships a newer bridge. `rojo` is the installed Rojo's `--version` output, once read.
+pub fn bridge_outdated(plugin: &StudioPlugin, rojo: Option<&str>) -> Option<String> {
+    let StudioPlugin::Bridge { built } = plugin else { return None };
+    let Some(built) = built else {
+        return Some("The Studio bridge was installed by an older Rojo Manager. Update it once.".into());
+    };
+    match rojo.map(|installed| full_version(installed).unwrap_or(installed.trim())) {
+        Some(installed) if Some(installed) != full_version(&built.rojo) => Some(format!(
+            "The Studio bridge was built for Rojo {}, but Rojo {installed} is installed. Update to match.",
+            built.rojo
+        )),
+        _ if built.bridge < BRIDGE_VERSION => {
+            Some("A newer Studio bridge is available. Update, then restart Studio.".into())
+        }
+        _ => None,
+    }
+}
+
 fn bridge_record() -> PathBuf {
     crate::config::data_dir().join("bridge.json")
 }
