@@ -1413,7 +1413,8 @@ impl Engine {
         if result.starts_with("Installation failed") {
             return Err(ControlError::new(result, 500));
         }
-        Ok(json!({ "message": format!("{result} Restart Studio to load it.") }))
+        // The installer's result already says to restart Studio.
+        Ok(json!({ "message": result }))
     }
 
     fn settings_value(&self) -> Value {
