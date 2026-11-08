@@ -414,10 +414,19 @@ impl MainView {
                 .border_1()
                 .border_color(rgb(BORDER))
                 .bg(rgb(CARD))
-                .child(div().text_size(TEXT_SM).text_color(rgb(TEXT)).child(format!(
-                    "{server} already gives agents execute_luau. Hide Rojo Manager's Studio tools so agents \
-                     see each tool once?"
-                )))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Duplicate Studio tools"))
+                        .child(
+                            div()
+                                .text_size(TEXT_SM)
+                                .text_color(rgb(MUTED))
+                                .child(format!("{server} has them too. Hide Rojo Manager's copy?")),
+                        ),
+                )
                 .child(
                     div()
                         .flex()
