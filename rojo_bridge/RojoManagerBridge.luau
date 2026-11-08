@@ -73,10 +73,16 @@ local function endSession(app)
 	end
 end
 
--- A value as JSON can carry it; anything else (an Instance, a function) as its text.
+-- A value as JSON can carry it; an Instance as its full name, and anything else as its text.
+-- JSONEncode turns an Instance into null instead of failing, so plain values are picked by type.
 local function encodable(value: any): any
-	local ok = pcall(HttpService.JSONEncode, HttpService, { value })
-	return if ok then value else tostring(value)
+	local kind = type(value)
+	if kind == "nil" or kind == "boolean" or kind == "number" or kind == "string" then
+		return value
+	elseif kind == "table" and pcall(HttpService.JSONEncode, HttpService, value) then
+		return value
+	end
+	return if typeof(value) == "Instance" then value:GetFullName() else tostring(value)
 end
 
 local actions = {
