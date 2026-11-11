@@ -17,6 +17,12 @@ mod platform;
 
 pub use platform::{kill_process, listeners, process_name, tcp_snapshot};
 
+/// Whether something accepts a TCP connection on 127.0.0.1 at `port`, within 100 ms. Much cheaper
+/// than a snapshot on macOS, though it misses a listener bound to another local address.
+pub fn answers(port: u16) -> bool {
+    TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), Duration::from_millis(100)).is_ok()
+}
+
 pub fn port_in_use(port: u16) -> bool {
     listeners().is_ok_and(|listening| listening.contains_key(&port))
 }

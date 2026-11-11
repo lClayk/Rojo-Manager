@@ -21,6 +21,8 @@ mod widgets;
 mod window;
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    platform::extend_path();
     if std::env::args().any(|arg| arg == "--window") {
         window::run();
     } else {

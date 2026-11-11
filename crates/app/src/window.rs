@@ -68,8 +68,8 @@ pub fn run() {
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {
                 title: Some("Rojo Manager".into()),
-                // Centered in the app's taller title bar.
-                traffic_light_position: Some(point(px(16.), px(15.))),
+                // macOS keeps its traffic lights where AppKit puts them; moving them hid them.
+                traffic_light_position: None,
                 ..TitleBar::title_bar_options()
             }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(760.), px(820.)), cx))),
