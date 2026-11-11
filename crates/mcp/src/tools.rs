@@ -95,6 +95,21 @@ pub fn specs(studio_tools: bool) -> Value {
                 "place": {"type": "string"}}},
         },
         {
+            "name": "studio_output",
+            "description": "Read Studio's Output for an open place, oldest first: prints, warnings, and errors from Edit \
+                mode and from a playtest's server (a playtest's client cannot send its Output), each with its \
+                context and kind. Pass a project to \
+                use its linked place, or instance_id. Pass since, the next value of the previous read, to get \
+                only newer lines; level warning or error leaves out plain prints.",
+            "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+                "project": {"type": "string", "description": "Project name"},
+                "instance_id": {"type": "string", "description": "Studio instance ID when ambiguous."},
+                "since": {"type": "integer", "minimum": 0, "description": "next from the previous read"},
+                "lines": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100,
+                    "description": "How many of the newest matching lines to return"},
+                "level": {"type": "string", "enum": ["all", "warning", "error"], "default": "all"}}},
+        },
+        {
             "name": "updates",
             "description": "Check whether Rojo Manager and its Studio bridge plugin are up to date, or install an \
                 update. install app downloads the newest release and restarts Rojo Manager; its running servers \
@@ -160,6 +175,7 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         "app_settings" => text(&app_settings(backend, args)?),
         "get_connected_instances" => text(&connected_instances(backend)?),
         "execute_luau" => text(&execute_luau(backend, args)?),
+        "studio_output" => text(&studio_output(backend, args)?),
         _ => Err(format!("Unknown tool {name}")),
     }
 }
@@ -646,22 +662,43 @@ fn execute_luau(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
     };
     let instance_id = match optional_string(args, "instance_id")? {
         Some(instance_id) => instance_id,
-        None => {
-            manager_projects(backend)?; // starts the manager if needed
-            let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
-            match instances.as_slice() {
-                [only] => only.instance_id.clone(),
-                [] => return Err("No Studio window with the Rojo Manager bridge is open.".into()),
-                several => {
-                    let ids: Vec<String> =
-                        several.iter().map(|i| format!("{} (place {})", i.instance_id, i.place_id)).collect();
-                    return Err(format!("Several Studio windows are open; pass instance_id: {}", ids.join(", ")));
-                }
-            }
-        }
+        None => only_instance(backend)?,
     };
     let body = json!({ "action": "luau", "code": code });
     call(backend, "POST", &["studio", &instance_id], Some(&body), LUAU_CALL_TIMEOUT)
+}
+
+/// The one open Studio window with the bridge.
+fn only_instance(backend: &dyn Backend) -> Result<String, String> {
+    manager_projects(backend)?; // starts the manager if needed
+    let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
+    match instances.as_slice() {
+        [only] => Ok(only.instance_id.clone()),
+        [] => Err("No Studio window with the Rojo Manager bridge is open.".into()),
+        several => {
+            let ids: Vec<String> =
+                several.iter().map(|i| format!("{} (place {})", i.instance_id, i.place_id)).collect();
+            Err(format!("Several Studio windows are open; pass instance_id or project: {}", ids.join(", ")))
+        }
+    }
+}
+
+/// studio_output: Output lines from the Studio window `instance_id` names, the one with the
+/// project's place open, or the only one open. Rojo Manager checks since, lines, and level.
+fn studio_output(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
+    let instance_id = match (optional_string(args, "instance_id")?, optional_string(args, "project")?) {
+        (Some(instance_id), _) => instance_id,
+        (None, Some(project)) => place_instance(backend, &find_project(backend, &project)?)?,
+        (None, None) => only_instance(backend)?,
+    };
+    let mut body = json!({ "action": "output" });
+    // Sorted, so the body reads the same whether or not serde_json preserves insertion order.
+    for key in ["level", "lines", "since"] {
+        if let Some(value) = args.get(key) {
+            body[key] = value.clone();
+        }
+    }
+    call(backend, "POST", &["studio", &instance_id], Some(&body), CALL_TIMEOUT)
 }
 
 // --------------------------------------------------------------- logs
@@ -1128,6 +1165,23 @@ mod tests {
             STUDIO_TOOLS.iter().filter(|tool| names.contains(*tool)).count()
         };
         assert_eq!((listed(true), listed(false)), (2, 0));
+    }
+
+    #[test]
+    fn studio_output_reads_the_window_with_the_projects_place() {
+        let reply = json!({"lines": [{"context": "server", "kind": "error", "text": "boom"}], "next": 5});
+        let fake = Fake {
+            projects: Script::new([json!([project("serving", true)])]),
+            instances: studio_open(),
+            studio: Script::new([reply.clone()]),
+            ..Fake::default()
+        };
+        let result = studio_output(&fake, &args(json!({"project": "TestGame", "since": 3, "level": "error"}))).unwrap();
+        assert_eq!(result, reply);
+        assert_eq!(fake.calls(), ["GET projects", r#"POST studio/7 {"action":"output","level":"error","since":3}"#]);
+        let unlinked = Fake { projects: Script::new([json!([project("serving", false)])]), ..Fake::default() };
+        let error = studio_output(&unlinked, &args(json!({"project": "TestGame"}))).unwrap_err();
+        assert!(error.starts_with("TestGame has no linked place"));
     }
 
     #[test]

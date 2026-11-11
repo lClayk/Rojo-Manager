@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::config::{self, Config, Place, Settings};
-use crate::control::{BridgePoll, ControlError, ControlHandler};
+use crate::control::{BridgePoll, ControlError, ControlHandler, OutputContext, OutputKind, StudioOutput};
 use crate::localnet::{self, port_in_use};
 use crate::studio::{self, ResolveError};
 use crate::studio_link::Link;
@@ -34,6 +34,11 @@ const BRIDGE_TTL: Duration = Duration::from_secs(15);
 const BRIDGE_HOLD: Duration = Duration::from_secs(5);
 /// How long agent Luau may run in Studio.
 pub const LUAU_TIMEOUT: Duration = Duration::from_secs(60);
+/// Lines of Studio's Output kept per place, and characters kept per line.
+const OUTPUT_CAP: usize = 2000;
+const OUTPUT_TEXT: usize = 2000;
+/// The first bridge version that sends Studio's Output.
+const OUTPUT_BRIDGE: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -263,6 +268,20 @@ struct State {
     experiences: HashMap<u64, String>,
     /// Another Studio MCP set up in an agent, found at launch.
     other_studio_mcp: Option<String>,
+    /// Studio's recent Output by place, from its Edit DataModel and playtests.
+    output: HashMap<u64, VecDeque<OutputLine>>,
+    output_seq: u64,
+}
+
+/// One line of Studio's Output, numbered across all places so a reader can ask for newer lines.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputLine {
+    /// Readers get `next` instead.
+    #[serde(skip)]
+    pub seq: u64,
+    pub context: OutputContext,
+    pub kind: OutputKind,
+    pub text: String,
 }
 
 /// What a Studio bridge last said and was told.
@@ -992,6 +1011,53 @@ impl Engine {
         self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
     }
 
+    /// Keep new lines of a place's Output; the oldest go past OUTPUT_CAP.
+    pub fn report_output(&self, output: StudioOutput) {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let buffer = state.output.entry(output.place_id).or_default();
+        for line in output.lines {
+            let mut text = line.text;
+            if let Some((end, _)) = text.char_indices().nth(OUTPUT_TEXT) {
+                text.truncate(end);
+            }
+            state.output_seq += 1;
+            if buffer.len() == OUTPUT_CAP {
+                buffer.pop_front();
+            }
+            buffer.push_back(OutputLine { seq: state.output_seq, context: output.context, kind: line.kind, text });
+        }
+    }
+
+    /// The Output of the place open in one Studio window, oldest first: the newest `count` lines after
+    /// `since` that are at least as severe as `level`, and `next`, the `since` for the next read.
+    pub fn studio_output(
+        &self,
+        instance: &str,
+        since: u64,
+        level: OutputKind,
+        count: usize,
+    ) -> Result<Value, ControlError> {
+        let state = self.lock();
+        let id = instance.parse::<u64>().ok();
+        let report = id.and_then(|id| state.bridges.get(&id).filter(|report| self.bridge_live(id, report)));
+        let report =
+            report.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
+        let buffer = state.output.get(&report.place_id);
+        let bridge = report.rojo.get("bridge").and_then(Value::as_u64).unwrap_or(0);
+        if buffer.is_none() && bridge < OUTPUT_BRIDGE {
+            return Err(ControlError::new(
+                "This Studio's bridge is too old to send its Output. Update the bridge in Rojo Manager, then restart \
+                Studio.",
+                409,
+            ));
+        }
+        let lines: Vec<&OutputLine> =
+            buffer.into_iter().flatten().filter(|line| line.seq > since && line.kind >= level).collect();
+        let next = buffer.and_then(VecDeque::back).map_or(since, |line| line.seq.max(since));
+        Ok(json!({ "lines": &lines[lines.len().saturating_sub(count)..], "next": next }))
+    }
+
     /// The bridge's count of Rojo plugins running in a Studio that just opened a place.
     pub fn report_studio_rojo_plugins(&self, count: u32) {
         let changed = self.lock().studio_rojo_plugins.replace(count) != Some(count);
@@ -1692,6 +1758,10 @@ impl ControlHandler for Control {
         self.0.report_studio_rojo_plugins(count);
     }
 
+    fn report_output(&self, output: StudioOutput) {
+        self.0.report_output(output);
+    }
+
     fn settings(&self, changes: Option<&Map<String, Value>>) -> Result<Value, ControlError> {
         if let Some(changes) = changes {
             for (key, value) in changes {
@@ -1734,6 +1804,10 @@ impl ControlHandler for Control {
             return Ok(json!({ "bridge": installed, "instances": self.0.studio_instances() }));
         };
         let action = body.get("action").and_then(Value::as_str).unwrap_or_default();
+        if action == "output" {
+            let (since, count, level) = parse_output_query(body)?;
+            return self.0.studio_output(instance, since, level, count);
+        }
         let valid = match action {
             "status" | "disconnect" | "accept" | "abort" => true,
             "connect" => body.get("port").and_then(Value::as_u64).is_some_and(|port| (1..=65535).contains(&port)),
@@ -1742,7 +1816,7 @@ impl ControlHandler for Control {
         };
         if !valid {
             return Err(ControlError::bad(
-                "Pass action status, disconnect, accept, abort, connect (with port), or luau (with code)",
+                "Pass action status, disconnect, accept, abort, connect (with port), luau (with code), or output",
             ));
         }
         self.0.studio_command(instance, action, Value::Object(body.clone()))
@@ -1763,6 +1837,28 @@ impl ControlHandler for Control {
             "bridge": bridge,
         }))
     }
+}
+
+/// Read an output request: {since, lines, level}, defaulting to every line (the newest 100).
+fn parse_output_query(body: &Map<String, Value>) -> Result<(u64, usize, OutputKind), ControlError> {
+    let since = match body.get("since") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value.as_u64().ok_or_else(|| ControlError::bad("since must be a line number"))?,
+    };
+    let count = match body.get("lines") {
+        None | Some(Value::Null) => 100,
+        Some(value) => value
+            .as_u64()
+            .filter(|n| (1..=500).contains(n))
+            .ok_or_else(|| ControlError::bad("lines must be 1 to 500"))?,
+    };
+    let level = match body.get("level").and_then(Value::as_str) {
+        None | Some("all") => OutputKind::Output,
+        Some("warning") => OutputKind::Warning,
+        Some("error") => OutputKind::Error,
+        Some(_) => return Err(ControlError::bad("level must be all, warning, or error")),
+    };
+    Ok((since, count as usize, level))
 }
 
 /// Read an agent's update body (name, port, autostart, autoConnect, place, sourcemap) or link-place body
@@ -1818,6 +1914,35 @@ mod tests {
         assert!(parse_update("update", &body(json!({"colour": 1}))).unwrap_err().message.starts_with("Unknown field"));
         assert_eq!(parse_update("update", &body(json!({}))).unwrap_err().status, 400);
         assert_eq!(parse_update("link-place", &body(json!({"place": " 123 "}))).unwrap().1.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn studio_output_is_read_after_a_cursor_by_level_and_needs_a_new_bridge() {
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        engine.report_bridge(1, 100, 0, json!({"bridge": OUTPUT_BRIDGE}));
+        engine.report_bridge(2, 200, 0, json!({"bridge": OUTPUT_BRIDGE - 1}));
+        let line = |text: &str, kind| crate::control::OutputReport { text: text.into(), kind };
+        engine.report_output(StudioOutput {
+            place_id: 100,
+            context: OutputContext::Server,
+            lines: vec![
+                line("hi", OutputKind::Output),
+                line("careful", OutputKind::Warning),
+                line("boom", OutputKind::Error),
+            ],
+        });
+        let read = |since, level, count| engine.studio_output("1", since, level, count).unwrap();
+        let texts = |value: Value| -> Vec<String> {
+            value["lines"].as_array().unwrap().iter().map(|line| line["text"].as_str().unwrap().into()).collect()
+        };
+        let all = read(0, OutputKind::Output, 100);
+        assert_eq!(all["next"], 3);
+        assert_eq!(all["lines"][0], json!({"context": "server", "kind": "output", "text": "hi"}));
+        assert_eq!(texts(read(0, OutputKind::Warning, 100)), ["careful", "boom"]);
+        assert_eq!(texts(read(1, OutputKind::Output, 1)), ["boom"]);
+        assert_eq!(read(3, OutputKind::Output, 100), json!({"lines": [], "next": 3}));
+        assert_eq!(engine.studio_output("2", 0, OutputKind::Output, 100).unwrap_err().status, 409);
+        assert_eq!(engine.studio_output("9", 0, OutputKind::Output, 100).unwrap_err().status, 404);
     }
 
     #[test]

@@ -561,7 +561,7 @@ pub struct BridgeBuild {
 }
 
 /// The `VERSION` in RojoManagerBridge.luau; raise both together.
-pub const BRIDGE_VERSION: u32 = 7;
+pub const BRIDGE_VERSION: u32 = 8;
 
 /// Why the installed bridge needs rebuilding: an older Rojo Manager built it, Rojo changed since,
 /// or this app ships a newer bridge. `rojo` is the installed Rojo's `--version` output, once read.

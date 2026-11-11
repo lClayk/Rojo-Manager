@@ -24,6 +24,8 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or
   linked place, or removes a project from the list (its files are kept).
 - server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
+- studio_output reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a
+  playtest's server.
 - updates checks whether Rojo Manager and its Studio bridge are up to date, and installs either when the user asks.
 - get_connected_instances lists the Studio windows Rojo Manager's bridge reaches, and execute_luau runs Luau in one
   (plugin permissions, Edit mode). The user can turn these two off when another Studio MCP provides them.
@@ -170,6 +172,7 @@ mod tests {
             "open_place",
             "rojo_session",
             "server_logs",
+            "studio_output",
             "manage_project",
             "updates",
             "app_settings",
