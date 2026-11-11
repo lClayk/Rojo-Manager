@@ -424,13 +424,15 @@ impl MainView {
             return None;
         };
         let on_click = |choice: bool| cx.listener(move |this: &mut Self, _, _, cx| answer(this, choice, cx));
+        // As wide as the card's buttons need (the font is bundled), so its text is no wider than they are.
+        let width = if snapshot.studio_tools_prompt.is_some() { 280. } else { 257. };
         Some(
             div()
                 .absolute()
                 .occlude()
                 .top(px(TITLE_BAR + 8.))
                 .right(px(12.))
-                .w(px(280.))
+                .w(px(width))
                 .flex()
                 .flex_col()
                 .gap(px(10.))
