@@ -127,7 +127,10 @@ impl Host {
                 Msg::WindowClosed(id) => {
                     // Sent when the window starts closing and again when its process ends.
                     if self.window.as_ref().is_some_and(|(open, _)| *open == id) {
-                        self.window = None;
+                        if let Some((_, mut child)) = self.window.take() {
+                            // Reaped once it exits, so closed windows leave no zombie processes behind.
+                            std::thread::spawn(move || child.wait());
+                        }
                         *self.sink.lock().unwrap() = None;
                         // With the tray off, closing the window quits.
                         if !self.engine.settings().tray {
