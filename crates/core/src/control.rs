@@ -197,7 +197,7 @@ impl AutoConnectServer {
                 return (404, json!({}));
             }
             let post = *request.method() == tiny_http::Method::Post;
-            let url = request.url().trim_matches('/').to_string();
+            let url = request_path(request).trim_matches('/').to_string();
             let (route, rest) = url.split_once('/').unwrap_or((url.as_str(), ""));
             let number = rest.bytes().all(|b| b.is_ascii_digit()).then(|| rest.parse::<u64>().ok()).flatten();
             match (post, route, number) {
@@ -294,6 +294,16 @@ fn reply(request: tiny_http::Request, status: u16, body: &Value) {
     let _ = writer.write_all((head + &data).as_bytes()).and_then(|()| writer.flush());
 }
 
+/// The request's path. HTTP/1.1 servers must also accept the absolute form a client may send
+/// ("http://localhost:34871/bridge/1"), as Lune's HTTP client does.
+fn request_path(request: &tiny_http::Request) -> &str {
+    let url = request.url();
+    match url.split_once("://") {
+        Some((_, rest)) if !url.starts_with('/') => rest.find('/').map_or("", |slash| &rest[slash..]),
+        _ => url,
+    }
+}
+
 fn header<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {
     request.headers().iter().find(|header| header.field.equiv(name)).map(|header| header.value.as_str())
 }
@@ -307,7 +317,7 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
     if !same_bytes(supplied.strip_prefix("Bearer ").unwrap_or(supplied).as_bytes(), token.as_bytes()) {
         return Err(ControlError::new("Missing or invalid token", 401));
     }
-    let parts: Vec<String> = request.url().trim_matches('/').split('/').map(percent_decode).collect();
+    let parts: Vec<String> = request_path(request).trim_matches('/').split('/').map(percent_decode).collect();
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     let get = match request.method() {
         tiny_http::Method::Get => true,
@@ -610,6 +620,7 @@ mod tests {
             (response.status, serde_json::from_slice::<Value>(&response.body).unwrap())
         };
         assert_eq!(send("GET", "/rojo-plugins/2", None, &[]).0, 200);
+        assert_eq!(send("GET", &format!("http://localhost:{port}/rojo-plugins/2"), None, &[]).0, 200);
         assert_eq!(send("GET", "/rojo-plugins/x", None, &[]).0, 404);
         let poll = json!({"placeId": 42, "port": 0, "rojo": {"status": "NotConnected"}});
         assert_eq!(send("POST", "/bridge/9", Some(&poll), &[]), (200, json!({"port": 34880, "accept": true})));
