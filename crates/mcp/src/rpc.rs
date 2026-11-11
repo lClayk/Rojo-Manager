@@ -21,8 +21,8 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
   Passing both project and place links that place to the project first.
 - rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
   waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort.
-- manage_project adds project folders, changes a project's name, port, autostart, auto_connect, or linked place,
-  or removes a project from the list (its files are kept).
+- manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or
+  linked place, or removes a project from the list (its files are kept).
 - server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
 - updates checks whether Rojo Manager and its Studio bridge are up to date, and installs either when the user asks.
 - get_connected_instances lists the Studio windows Rojo Manager's bridge reaches, and execute_luau runs Luau in one

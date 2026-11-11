@@ -242,6 +242,15 @@ pub fn render(
                 .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::AutoConnect, cx))),
             )
         })
+        .child(
+            switch_link(
+                format!("sourcemap-{}", p.name),
+                "Sourcemap",
+                p.sourcemap,
+                "Keep sourcemap.json up to date for luau-lsp while the server runs (rojo sourcemap --watch)",
+            )
+            .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Sourcemap, cx))),
+        )
         .child(place)
         .when_some(p.place, |d, place| {
             d.child(
@@ -297,6 +306,7 @@ pub fn render(
 enum Flag {
     Autostart,
     AutoConnect,
+    Sourcemap,
 }
 
 /// The main row button: start, stop, cancel, or kill what holds the port (after asking).
@@ -436,6 +446,10 @@ impl MainView {
             Flag::AutoConnect => {
                 let value = !project.auto_connect;
                 (value, "auto-connect", Update { auto_connect: Some(value), ..Update::default() })
+            }
+            Flag::Sourcemap => {
+                let value = !project.sourcemap;
+                (value, "sourcemap", Update { sourcemap: Some(value), ..Update::default() })
             }
         };
         let name = name.to_string();

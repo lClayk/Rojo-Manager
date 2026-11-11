@@ -79,7 +79,8 @@ pub fn specs(studio_tools: bool) -> Value {
             "description": "Add, change, or remove Rojo Manager projects. add takes an absolute folder path: a Rojo \
                 project, or a parent folder whose project subfolders are all added on free ports. update \
                 changes any of name, port, autostart, auto_connect (connect Rojo when the linked place \
-                opens in Studio while the server runs), and place (a place ID or link; \"\" unlinks). \
+                opens in Studio while the server runs), sourcemap (keep sourcemap.json current with rojo \
+                sourcemap --watch while the server runs), and place (a place ID or link; \"\" unlinks). \
                 Renaming or changing the port needs the server stopped. remove drops the project from \
                 the list, stopping its server; its files are kept.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
@@ -90,6 +91,7 @@ pub fn specs(studio_tools: bool) -> Value {
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "autostart": {"type": "boolean", "description": "Start the server when Rojo Manager opens"},
                 "auto_connect": {"type": "boolean"},
+                "sourcemap": {"type": "boolean"},
                 "place": {"type": "string"}}},
         },
         {
@@ -184,6 +186,8 @@ struct Project {
     autostart: bool,
     #[serde(default)]
     auto_connect: bool,
+    #[serde(default)]
+    sourcemap: bool,
     /// Its last output lines.
     #[serde(default)]
     log: Vec<String>,
@@ -213,6 +217,8 @@ struct Brief {
     autostart: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     auto_connect: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    sourcemap: bool,
     /// Only in list_projects, when the linked place is open in Studio.
     #[serde(skip_serializing_if = "Option::is_none")]
     studio: Option<StudioPlace>,
@@ -228,6 +234,7 @@ impl From<Project> for Brief {
             experience: project.experience,
             autostart: project.autostart,
             auto_connect: project.auto_connect,
+            sourcemap: project.sourcemap,
             studio: None,
         }
     }
@@ -685,12 +692,13 @@ fn server_logs(backend: &dyn Backend, args: &Args) -> Result<Logs, String> {
 
 /// Tool argument names, mapped to the fields Rojo Manager stores. Sorted by stored name, so request
 /// bodies are identical whether or not serde_json's `preserve_order` is unified in (GPUI enables it).
-const PROJECT_FIELDS: [(&str, &str); 5] = [
+const PROJECT_FIELDS: [(&str, &str); 6] = [
     ("auto_connect", "autoConnect"),
     ("autostart", "autostart"),
     ("name", "name"),
     ("place", "place"),
     ("port", "port"),
+    ("sourcemap", "sourcemap"),
 ];
 
 #[derive(Debug, Serialize)]
@@ -857,7 +865,7 @@ mod tests {
             r#"{"project":{"name":"TestGame","state":"off","port":34879,"placeId":2,"auto_connect":true}}"#
         );
         assert_eq!(json_text(&removed), r#"{"removed":"TestGame"}"#);
-        assert_eq!(error, "Pass at least one of: auto_connect, autostart, name, place, port");
+        assert_eq!(error, "Pass at least one of: auto_connect, autostart, name, place, port, sourcemap");
         assert_eq!(
             fake.calls(),
             [
