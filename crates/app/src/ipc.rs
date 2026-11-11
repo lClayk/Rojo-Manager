@@ -67,6 +67,7 @@ pub enum Call {
     AnswerStudioTools {
         keep: bool,
     },
+    AnswerStar,
     CheckRojo,
     CheckAppUpdate,
     RefreshToolVersions,
@@ -133,6 +134,7 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
         Call::SetCollapsed { universe_id, collapsed } => json(engine.set_collapsed(universe_id, collapsed)),
         Call::AnswerStudioTools { keep } => json(engine.answer_studio_tools(keep)),
+        Call::AnswerStar => json(engine.answer_star()),
         Call::RunToolJob { job } => json(engine.run_tool_job(job)),
         Call::InstallAppUpdate => json(engine.install_app_update()),
         // Calls whose answer nobody waits for.
@@ -264,6 +266,9 @@ impl Client {
     }
     pub fn answer_studio_tools(&self, keep: bool) -> Result<(), String> {
         self.call(Call::AnswerStudioTools { keep })
+    }
+    pub fn answer_star(&self) -> Result<(), String> {
+        self.call(Call::AnswerStar)
     }
     pub fn check_rojo(&self) {
         self.send(Call::CheckRojo);

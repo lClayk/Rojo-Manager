@@ -13,6 +13,7 @@ use crate::https::{self, HttpsError};
 use crate::tooling::{self, Release};
 
 pub const REPOSITORY: &str = "lClayk/Rojo-Manager";
+pub const REPO_URL: &str = "https://github.com/lClayk/Rojo-Manager";
 pub const RELEASES_URL: &str = "https://github.com/lClayk/Rojo-Manager/releases";
 const DOWNLOADS: &str = "https://github.com/lClayk/Rojo-Manager/releases/download/";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
