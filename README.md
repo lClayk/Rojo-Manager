@@ -24,7 +24,9 @@ No installation or administrator access is needed. The app adds itself to the St
 
 Requires Windows 10 or 11, x64.
 
-### macOS
+### macOS (beta)
+
+macOS support is new and in beta. Everything works the same as on Windows, but it has had less real-world use, so please report anything that breaks on the [DevForum thread](https://devforum.roblox.com/t/4980026) or in [Issues](https://github.com/lClayk/Rojo-Manager/issues).
 
 1. Download **RojoManager-0.8.3-macos.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest) and open it, which extracts **Rojo Manager.app**.
 2. Move **Rojo Manager.app** to your Applications folder and open it. It runs in the menu bar, with no Dock icon.
