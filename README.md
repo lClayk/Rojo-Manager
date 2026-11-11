@@ -16,7 +16,7 @@ Questions, feedback, and release updates are on the [DevForum thread](https://de
 
 ### Windows
 
-1. Download **RojoManager-0.8.3-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest).
+1. Download **RojoManager-0.9.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest).
 2. Right-click the ZIP and choose **Extract All**.
 3. Open the extracted `RojoManager` folder and double-click **RojoManager.exe**.
 
@@ -28,7 +28,7 @@ Requires Windows 10 or 11, x64.
 
 macOS support is new and in beta. Everything works the same as on Windows, but it has had less real-world use, so please report anything that breaks on the [DevForum thread](https://devforum.roblox.com/t/4980026) or in [Issues](https://github.com/lClayk/Rojo-Manager/issues).
 
-1. Download **RojoManager-0.8.3-macos.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest) and open it, which extracts **Rojo Manager.app**.
+1. Download **RojoManager-0.9.0-macos.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest) and open it, which extracts **Rojo Manager.app**.
 2. Move **Rojo Manager.app** to your Applications folder and open it. It runs in the menu bar, with no Dock icon.
 
 The app is not signed with an Apple Developer ID yet, so macOS blocks the first launch. Open **System Settings > Privacy & Security**, find the message about Rojo Manager near the bottom, and click **Open Anyway**. On macOS, the tray is the menu bar, Windows startup is **Open at login**, and notifications go to Notification Center.
