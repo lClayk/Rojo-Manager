@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -105,6 +107,25 @@ def sourcemap_names(project: Path) -> str:
         return ""
 
 
+def answers(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def shim_rojo(folder: Path) -> Path:
+    """A rojo that runs the real one as its child, as Rokit's shim does on macOS, so stopping a server
+    has to end both."""
+    real = shutil.which("rojo")
+    assert real, "rojo is not on PATH"
+    shim = folder / "rojo"
+    write(shim, f'#!/bin/sh\n"{real}" "$@"\n')
+    shim.chmod(0o755)
+    return folder
+
+
 def check_login_item(mcp: Mcp, app_dir: Path) -> None:
     """Open at login writes and removes the system's startup entry for this executable."""
     def entry() -> str:
@@ -139,6 +160,8 @@ def check(app_dir: Path) -> None:
         }))
         env = os.environ.copy()
         env["ROJO_MANAGER_DATA_DIR"] = str(profile)
+        if not WINDOWS:
+            env["PATH"] = f"{shim_rojo(Path(directory) / 'shim')}{os.pathsep}{env['PATH']}"
         host = subprocess.Popen([str(executable(app_dir, "RojoManager")), "--hidden"], env=env, cwd=profile)
         bridge = mcp = None
         try:
@@ -189,10 +212,12 @@ def check(app_dir: Path) -> None:
             ran = mcp.call("execute_luau", code="print('from agent') return 40 + 2")
             assert ran["returnValue"] == 42 and ran["output"] == ["from agent"], ran
 
-            # Stopping disconnects Rojo first, ends the sourcemap watcher, and frees the port.
+            # Stopping disconnects Rojo first, ends the sourcemap watcher, and frees the port. On macOS
+            # the real rojo runs behind a shim, so this also shows the whole process group ends.
             stopped = mcp.call("rojo_server", project="MyGame", action="stop")
             assert stopped["project"]["state"] == "off", stopped
             events.expect("disconnect")
+            wait_for(lambda: not answers(PORT), 5, "the server's port to be free")
             write(project / "src" / "late.server.luau", "print(2)\n")
             time.sleep(3)
             assert '"late"' not in sourcemap_names(project), "the sourcemap watcher outlived its server"
