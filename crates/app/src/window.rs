@@ -68,8 +68,8 @@ pub fn run() {
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {
                 title: Some("Rojo Manager".into()),
-                // macOS keeps its traffic lights where AppKit puts them; moving them hid them.
-                traffic_light_position: None,
+                // Centered in the app's taller title bar.
+                traffic_light_position: Some(point(px(16.), px(15.))),
                 ..TitleBar::title_bar_options()
             }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(760.), px(820.)), cx))),
@@ -86,6 +86,9 @@ pub fn run() {
                     return;
                 }
             };
+        // macOS leaves a new window behind the app in front, where its traffic lights do not show.
+        #[cfg(target_os = "macos")]
+        cx.activate(true);
         let _ = handle.update(cx, |_, window, cx| {
             #[cfg(windows)]
             throttle_background_paints(window);
@@ -105,6 +108,8 @@ pub fn run() {
                         view.update(cx, |view, cx| view.confirm_update(cx)).ok();
                     }
                     ToWindow::Activate => {
+                        #[cfg(target_os = "macos")]
+                        cx.activate(true);
                         let _ = handle.update(cx, |_, window, _| window.activate_window());
                     }
                     ToWindow::Reply { .. } => {}
