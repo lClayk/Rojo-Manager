@@ -777,7 +777,10 @@ impl Engine {
         let pid = child.id();
         state.sourcemaps.insert(name.to_string(), child);
         drop(state);
-        self.log(name, &format!("$ rojo sourcemap {} --output sourcemap.json --watch", project.project_file));
+        self.log(
+            name,
+            &format!("$ rojo sourcemap {} --output sourcemap.json --include-non-scripts --watch", project.project_file),
+        );
         let engine = Arc::clone(self);
         let name = name.to_string();
         std::thread::spawn(move || {
