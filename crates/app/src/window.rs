@@ -86,12 +86,13 @@ pub fn run() {
                     return;
                 }
             };
-        // macOS leaves a new window behind the app in front, where its traffic lights do not show.
-        #[cfg(target_os = "macos")]
-        cx.activate(true);
         let _ = handle.update(cx, |_, window, cx| {
             #[cfg(windows)]
             throttle_background_paints(window);
+            // macOS leaves a new window behind the app in front, where its traffic lights do not
+            // show. It comes forward once its first frame is drawn, so it never shows up empty.
+            #[cfg(target_os = "macos")]
+            window.on_next_frame(|window, _| window.on_next_frame(|_, cx| cx.activate(true)));
             window.on_window_should_close(cx, move |_, _| {
                 closing.closing();
                 true
