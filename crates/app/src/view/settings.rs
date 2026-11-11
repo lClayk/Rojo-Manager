@@ -48,11 +48,20 @@ impl AgentHelp {
     }
 }
 
+#[cfg(windows)]
 const CLIENTS: [(&str, &str); 3] = [
     ("Claude Desktop", r"%APPDATA%\Claude\claude_desktop_config.json"),
     ("Cursor", r"%USERPROFILE%\.cursor\mcp.json"),
     ("Windsurf", r"%USERPROFILE%\.codeium\windsurf\mcp_config.json"),
 ];
+#[cfg(target_os = "macos")]
+const CLIENTS: [(&str, &str); 3] = [
+    ("Claude Desktop", "~/Library/Application Support/Claude/claude_desktop_config.json"),
+    ("Cursor", "~/.cursor/mcp.json"),
+    ("Windsurf", "~/.codeium/windsurf/mcp_config.json"),
+];
+
+const STARTUP_LABEL: &str = if cfg!(target_os = "macos") { "Open at login" } else { "Launch at Windows startup" };
 
 /// Read a setting from the snapshot; launch_at_startup lives in the registry, not config.json.
 fn value(snapshot: &Snapshot, key: &str) -> bool {
@@ -139,7 +148,7 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
         ("show_aftman", "Aftman install button", "On projects with aftman.toml"),
     ];
 
-    let mut general = vec![toggle(snapshot, "launch_at_startup", "Launch at Windows startup", None, cx)];
+    let mut general = vec![toggle(snapshot, "launch_at_startup", STARTUP_LABEL, None, cx)];
     // Starting hidden only applies to launches at Windows startup.
     if snapshot.launch_at_startup {
         general.push(toggle(snapshot, "start_hidden", "Start hidden in the tray", None, cx));

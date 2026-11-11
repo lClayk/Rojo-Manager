@@ -78,6 +78,8 @@ pub enum Call {
     /// The window is closing. The tray app handles this itself: a show request from now on opens
     /// a new window instead of reaching this one while its process winds down.
     Closing,
+    /// Quit Rojo Manager, as the tray menu's Quit does (Cmd+Q on macOS). Handled by the tray app too.
+    Quit,
 }
 
 /// Window to tray app.
@@ -154,7 +156,7 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
             engine.refresh_tool_versions();
             Ok(Value::Null)
         }
-        Call::Closing => Ok(Value::Null),
+        Call::Closing | Call::Quit => Ok(Value::Null),
     }
 }
 
@@ -280,6 +282,10 @@ impl Client {
     }
     pub fn closing(&self) {
         self.send(Call::Closing);
+    }
+    #[cfg(target_os = "macos")]
+    pub fn quit(&self) {
+        self.send(Call::Quit);
     }
 }
 

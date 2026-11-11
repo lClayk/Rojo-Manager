@@ -329,8 +329,11 @@ pub fn section(title: &'static str, rows: impl IntoIterator<Item = AnyElement>) 
 
 /// Height of the app's title bar, which holds the header actions.
 pub const TITLE_BAR: f32 = 44.;
-/// Width of the minimize, maximize, and close buttons together.
-const WINDOW_CONTROLS: f32 = 3. * 34.;
+/// Width of the minimize, maximize, and close buttons together; macOS puts its traffic lights on
+/// the left instead.
+const WINDOW_CONTROLS: f32 = if cfg!(target_os = "macos") { 0. } else { 3. * 34. };
+/// Space before the title bar's content, past the traffic lights on macOS.
+pub const TITLE_BAR_INSET: f32 = if cfg!(target_os = "macos") { 84. } else { 16. };
 
 /// A modal panel over the window: a scrim that closes it on click, a header with the title,
 /// optional actions and a close button, then the body. The scrim also dims the title bar but

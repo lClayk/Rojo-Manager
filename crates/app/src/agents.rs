@@ -77,11 +77,21 @@ pub fn config_snippet(path: &str) -> String {
 }
 
 /// The CLI on PATH; npm installs it as a .cmd shim, other installers as an .exe.
+#[cfg(windows)]
 fn find(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(format!("{name}.{ext}"))))
         .find(|file| file.is_file())
+}
+
+/// The CLI on PATH, or where installers put it: an app opened from Finder gets a short PATH.
+#[cfg(target_os = "macos")]
+fn find(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let home = std::env::home_dir().unwrap_or_default();
+    let usual = [home.join(".local/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()];
+    std::env::split_paths(&path).chain(usual).map(|dir| dir.join(name)).find(|file| file.is_file())
 }
 
 fn run(cli: &PathBuf, args: &[&str]) -> std::io::Result<Output> {

@@ -165,7 +165,64 @@ struct ToolJob {
     view: ToolJobView,
     /// Holds request.json and the installer's result.json; deleted with the job.
     folder: tempfile::TempDir,
-    process: Child,
+    console: Console,
+}
+
+/// The terminal running ToolInstaller: its own console process on Windows. On macOS, Terminal runs
+/// it through job.command, which records the installer's pid in the job folder.
+struct Console {
+    child: Child,
+    #[cfg(target_os = "macos")]
+    started: Instant,
+}
+
+impl Console {
+    #[cfg(windows)]
+    fn open(installer: &Path, request: &Path, app_dir: &Path) -> std::io::Result<Console> {
+        let mut command = Command::new(installer);
+        command.arg(request).current_dir(app_dir);
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0000_0010); // CREATE_NEW_CONSOLE
+        Ok(Console { child: command.spawn()? })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open(installer: &Path, request: &Path, app_dir: &Path) -> std::io::Result<Console> {
+        use std::os::unix::fs::PermissionsExt;
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"));
+        let folder = request.parent().unwrap_or(app_dir);
+        let script = folder.join("job.command");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > {}\ncd {} && exec {} {}\n",
+                quote(&folder.join("pid")),
+                quote(app_dir),
+                quote(installer),
+                quote(request)
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let child = Command::new("open").arg("-a").arg("Terminal").arg(&script).spawn()?;
+        Ok(Console { child, started: Instant::now() })
+    }
+
+    /// The installer exited, or its terminal was closed, without a result.
+    fn ended(&mut self, folder: &Path) -> bool {
+        #[cfg(windows)]
+        let _ = folder;
+        #[cfg(windows)]
+        return self.child.try_wait().ok().flatten().is_some();
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self.child.try_wait(); // `open` itself returns at once
+            let pid = std::fs::read_to_string(folder.join("pid")).ok().and_then(|pid| pid.trim().parse::<i32>().ok());
+            match pid {
+                // SAFETY: signal 0 only checks that the process exists.
+                Some(pid) => unsafe { libc::kill(pid, 0) != 0 },
+                None => self.started.elapsed() > Duration::from_secs(60),
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -464,7 +521,7 @@ impl Engine {
             studio_plugin: tooling::studio_plugin(),
             creator_store_rojo: tooling::creator_store_rojo_installed(),
             studio_rojo_plugins: state.studio_rojo_plugins,
-            mcp_path: self.app_dir.join("RojoManagerMCP.exe").display().to_string(),
+            mcp_path: self.app_dir.join(crate::executable("RojoManagerMCP")).display().to_string(),
             collapsed: state.config.collapsed.clone(),
             studio_tools_prompt: state
                 .other_studio_mcp
@@ -661,7 +718,7 @@ impl Engine {
         }
         match localnet::port_owner(port) {
             None => {}
-            Some((_, image)) if !image.eq_ignore_ascii_case("rojo.exe") => {
+            Some((_, image)) if !image.eq_ignore_ascii_case(&crate::executable("rojo")) => {
                 self.notice("The listener is not a Rojo process. Stop it from the application that started it.")
             }
             Some((pid, _)) => {
@@ -1318,20 +1375,17 @@ impl Engine {
             Job::Plugin { tool } => ("plugin", tool),
         };
         let view = ToolJobView { operation: operation.into(), tool: tool.clone() };
-        let installer = self.app_dir.join("ToolInstaller.exe");
+        let installer = self.app_dir.join(crate::executable("ToolInstaller"));
         if !installer.is_file() {
-            return Err("ToolInstaller.exe is missing. Extract the complete release ZIP and retry.".into());
+            return Err("ToolInstaller is missing. Extract the complete release ZIP and retry.".into());
         }
         let folder = tempfile::Builder::new().prefix("rojo-manager-job-").tempdir().map_err(|e| e.to_string())?;
         let request = folder.path().join("request.json");
         std::fs::write(&request, serde_json::to_vec(&job).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let mut command = Command::new(installer);
-        command.arg(&request).current_dir(&self.app_dir);
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0000_0010); // CREATE_NEW_CONSOLE
-        let process = command.spawn().map_err(|e| format!("Could not start installation: {e}"))?;
+        let console = Console::open(&installer, &request, &self.app_dir)
+            .map_err(|e| format!("Could not start installation: {e}"))?;
         let message = format!("Installing {}. Follow any prompts in the terminal.", view.tool);
-        state.tool_job = Some(ToolJob { view, folder, process });
+        state.tool_job = Some(ToolJob { view, folder, console });
         drop(state);
         self.changed();
         self.notice(message);
@@ -1357,7 +1411,7 @@ impl Engine {
                     None => "Installation failed: Invalid installer result".to_string(),
                 };
             }
-            if job.process.try_wait().ok().flatten().is_some() {
+            if job.console.ended(job.folder.path()) {
                 break "Installation failed: Installation ended without completing. Check the terminal and retry."
                     .into();
             }

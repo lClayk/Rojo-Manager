@@ -103,7 +103,7 @@ pub fn specs(studio_tools: bool) -> Value {
         },
         {
             "name": "app_settings",
-            "description": "Rojo Manager's own preferences, such as launching at Windows startup, the tray, update \
+            "description": "Rojo Manager's own preferences, such as launching at sign-in, the tray, update \
                 checks, and which install buttons projects show. Returns them; pass changes to set some. \
                 Only change these when the user asks.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {

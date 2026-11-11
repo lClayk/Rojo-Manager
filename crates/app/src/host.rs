@@ -1,6 +1,7 @@
-//! The tray app: owns the engine, the tray icon, and the control servers. It runs a plain Win32
-//! message loop (the tray icon needs one) and never starts GPUI. The window is a separate process
-//! (`--window`) started on demand, so closing it gives all of its memory back.
+//! The tray app: owns the engine, the tray icon, and the control servers. It runs the system's
+//! event loop on the main thread (see platform_*.rs; the tray icon needs one) and never starts
+//! GPUI. The window is a separate process (`--window`) started on demand, so closing it gives all
+//! of its memory back.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -12,17 +13,10 @@ use std::time::Duration;
 use rojo_manager_core::control::{AUTO_CONNECT_PORT, AutoConnectServer, ControlHandler, ControlServer};
 use rojo_manager_core::manager::{Control, Engine, Event, ServerState};
 use rojo_manager_core::updates;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    ASFW_ANY, AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-    MSG, PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WNDCLASSW,
-};
-use windows::core::w;
 
-use crate::instance;
 use crate::ipc::{self, Call, Request, ToWindow};
 use crate::tray::{self, TrayMenu, TrayState};
+use crate::{instance, platform};
 
 /// What the tray, second launches, the engine, and the window process ask of the tray app.
 pub enum Msg {
@@ -32,6 +26,8 @@ pub enum Msg {
     Quit,
     /// The window process with this id exited.
     WindowClosed(u64),
+    /// Create or update the tray icon; the first one waits for the event loop (see `run`).
+    SyncTray,
     /// The engine's state changed; the tray may need redrawing.
     Changed,
     /// A problem to notify about while the window is closed.
@@ -66,8 +62,8 @@ impl Launch {
     }
 }
 
-/// Messages queue here and wake the message loop through a message-only window.
-static INBOX: OnceLock<(mpsc::Sender<Msg>, usize)> = OnceLock::new();
+/// Messages queue here; `platform::wake` then has the main thread handle them.
+static INBOX: OnceLock<mpsc::Sender<Msg>> = OnceLock::new();
 /// A Changed message is queued; engine changes come in bursts, and one redraw covers them.
 static CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -77,12 +73,20 @@ thread_local! {
 
 /// Ask the tray app's thread to do something; callable from any thread.
 pub fn post(msg: Msg) {
-    if let Some((tx, hwnd)) = INBOX.get() {
+    if let Some(tx) = INBOX.get() {
         let _ = tx.send(msg);
-        // SAFETY: the message window lives for the whole process.
-        unsafe {
-            let _ = PostMessageW(Some(HWND(*hwnd as *mut _)), WM_APP, WPARAM(0), LPARAM(0));
+        platform::wake();
+    }
+}
+
+/// On the main thread, after `post`: handle the queued messages, and quit when one says so.
+fn on_wake() {
+    let quit = HOST.with(|host| host.borrow_mut().as_mut().is_some_and(|host| !host.drain()));
+    if quit {
+        if let Some(host) = HOST.with(|host| host.borrow_mut().take()) {
+            host.shutdown();
         }
+        platform::quit();
     }
 }
 
@@ -132,6 +136,7 @@ impl Host {
                     }
                     self.sync_tray();
                 }
+                Msg::SyncTray => self.sync_tray(),
                 Msg::Changed => {
                     CHANGED.store(false, Ordering::SeqCst);
                     self.sync_tray(); // the tray setting may have changed through the control API
@@ -176,7 +181,7 @@ impl Host {
         });
     }
 
-    /// A Windows notification while the window is closed and notifications are on. With the
+    /// A system notification while the window is closed and notifications are on. With the
     /// window open, the engine has already shown the message there.
     fn alert(&self, message: &str) {
         if self.window.is_none()
@@ -189,10 +194,7 @@ impl Host {
 
     /// Focus the window, starting its process when it is not open.
     fn show(&mut self) {
-        // SAFETY: plain call; lets the window process take the foreground.
-        unsafe {
-            let _ = AllowSetForegroundWindow(ASFW_ANY);
-        }
+        platform::allow_foreground();
         if self.window.is_some() {
             if let Some(tx) = &*self.sink.lock().unwrap() {
                 let _ = tx.send(ipc::line(&ToWindow::Activate));
@@ -236,8 +238,12 @@ impl Host {
                     eprintln!("Unreadable message from the window: {line}");
                     continue;
                 };
-                if matches!(call, Call::Closing) {
-                    post(Msg::WindowClosed(window));
+                match call {
+                    Call::Closing => post(Msg::WindowClosed(window)),
+                    Call::Quit => post(Msg::Quit),
+                    _ => {}
+                }
+                if matches!(call, Call::Closing | Call::Quit) {
                     continue;
                 }
                 let (engine, replies) = (Arc::clone(&engine), replies.clone());
@@ -321,55 +327,21 @@ impl Host {
     }
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg != WM_APP {
-        // SAFETY: forwards this window's own message.
-        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-    }
-    let quit = HOST.with(|host| host.borrow_mut().as_mut().is_some_and(|host| !host.drain()));
-    if quit {
-        if let Some(host) = HOST.with(|host| host.borrow_mut().take()) {
-            host.shutdown();
-        }
-        // SAFETY: ends this thread's message loop.
-        unsafe { PostQuitMessage(0) };
-    }
-    LRESULT(0)
-}
-
 /// A malformed config.json is reported and kept; the app does not start over it.
 fn report_bad_settings(error: &str) {
-    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-    use windows::core::HSTRING;
     let path = rojo_manager_core::config::config_path();
     let text = format!(
         "Could not load settings at:\n{}\n\n{error}\n\nYour settings have not been changed. \
          Move the file aside to start fresh.",
         path.display()
     );
-    // SAFETY: both strings outlive the call, and no owner window is needed.
-    unsafe {
-        MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("Rojo Manager could not open"), MB_OK | MB_ICONERROR);
-    }
-}
-
-/// Wait up to `timeout` for a process to exit; returns at once if it already has.
-fn wait_for_exit(pid: u32, timeout: Duration) {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-    // SAFETY: the handle is checked, waited on, and closed here.
-    unsafe {
-        if let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            WaitForSingleObject(process, timeout.as_millis() as u32);
-            let _ = CloseHandle(process);
-        }
-    }
+    platform::show_error("Rojo Manager could not open", &text);
 }
 
 pub fn run(launch: Launch) {
     // After an update, the replaced version is still shutting down and holds the instance lock.
     if let Some(pid) = launch.after {
-        wait_for_exit(pid, Duration::from_secs(20));
+        platform::wait_for_exit(pid, Duration::from_secs(20));
     }
     let config = match rojo_manager_core::config::load() {
         Ok(config) => config,
@@ -378,28 +350,9 @@ pub fn run(launch: Launch) {
             std::process::exit(1);
         }
     };
-    // SAFETY: registers and creates a message-only window owned by this thread.
-    let hwnd = unsafe {
-        let class = w!("RojoManagerHost");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(wndproc), lpszClassName: class, ..Default::default() });
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class,
-            w!(""),
-            WINDOW_STYLE(0),
-            0,
-            0,
-            0,
-            0,
-            Some(HWND_MESSAGE),
-            None,
-            None,
-            None,
-        )
-    };
-    let hwnd = hwnd.expect("the message window can be created");
+    platform::init(on_wake);
     let (tx, inbox) = mpsc::channel();
-    let _ = INBOX.set((tx, hwnd.0 as usize));
+    let _ = INBOX.set(tx);
 
     // A second launch asks this one to show its window (unless it is a hidden autostart) and exits.
     if !instance::claim(!launch.hidden) {
@@ -437,7 +390,7 @@ pub fn run(launch: Launch) {
     }
     tray::forward_events();
 
-    let mut host = Host {
+    let host = Host {
         engine,
         inbox,
         tray: None,
@@ -450,19 +403,8 @@ pub fn run(launch: Launch) {
         control,
         auto_connect,
     };
-    if launch.hidden {
-        host.sync_tray();
-    } else {
-        host.show();
-    }
     HOST.with(|slot| *slot.borrow_mut() = Some(host));
-
-    let mut msg = MSG::default();
-    // SAFETY: the standard message loop on the thread that owns the tray and message windows.
-    unsafe {
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
+    // Handled once the loop runs: macOS wants the tray icon made from a running app.
+    post(if launch.hidden { Msg::SyncTray } else { Msg::Show });
+    platform::run();
 }

@@ -335,13 +335,21 @@ fn quote_arg(arg: &str) -> String {
 }
 
 const ROKIT_DOWNLOADS: &str = "https://github.com/rojo-rbx/rokit/releases/download/";
+/// This machine's Rokit release archive ends in `-<ROKIT_PLATFORM>.zip`.
+const ROKIT_PLATFORM: &str = if cfg!(target_os = "macos") {
+    if cfg!(target_arch = "aarch64") { "macos-aarch64" } else { "macos-x86_64" }
+} else {
+    "windows-x86_64"
+};
+/// The binary in that archive.
+const ROKIT_BINARY: &str = if cfg!(windows) { "rokit.exe" } else { "rokit" };
 
 /// Rokit's path, downloading it from its official release and self-installing it when missing.
 fn ensure_rokit() -> Result<PathBuf, String> {
     if let Some(existing) = find_tool("Rokit") {
         return Ok(existing);
     }
-    if !cfg!(all(windows, target_arch = "x86_64")) {
+    if !cfg!(any(all(windows, target_arch = "x86_64"), target_os = "macos")) {
         return Err("Install Rokit from https://github.com/rojo-rbx/rokit, then retry".into());
     }
     let asset = rokit_asset(&latest_release(TOOLS[1].repository)?)?;
@@ -355,11 +363,11 @@ fn ensure_rokit() -> Result<PathBuf, String> {
     find_tool("Rokit").ok_or_else(|| "Rokit installed but could not be located. Restart the manager and retry.".into())
 }
 
-/// The release's Windows x64 archive. Without API assets (read from the release page), the name is
-/// the one documented by Rokit's official Windows installer script.
+/// The release's archive for this machine. Without API assets (read from the release page), the
+/// name follows Rokit's own naming, as its official installer scripts use it.
 fn rokit_asset(release: &Release) -> Result<Asset, String> {
-    let mut assets: Vec<Asset> =
-        release.assets.iter().filter(|asset| asset.name.ends_with("windows-x86_64.zip")).cloned().collect();
+    let suffix = format!("-{ROKIT_PLATFORM}.zip");
+    let mut assets: Vec<Asset> = release.assets.iter().filter(|asset| asset.name.ends_with(&suffix)).cloned().collect();
     if assets.is_empty() && release.from_release_page {
         let tag = &release.tag_name;
         let version = tag.strip_prefix('v').unwrap_or(tag);
@@ -367,10 +375,10 @@ fn rokit_asset(release: &Release) -> Result<Asset, String> {
         if parts.len() != 3 || !parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
             return Err("Unexpected Rokit stable release tag".into());
         }
-        let name = format!("rokit-{version}-windows-x86_64.zip");
+        let name = format!("rokit-{version}{suffix}");
         assets.push(Asset { browser_download_url: format!("{ROKIT_DOWNLOADS}{tag}/{name}"), name, digest: None });
     }
-    let [asset] = <[Asset; 1]>::try_from(assets).map_err(|_| "Could not find the Windows Rokit release".to_string())?;
+    let [asset] = <[Asset; 1]>::try_from(assets).map_err(|_| "Could not find Rokit for this computer".to_string())?;
     if !asset.browser_download_url.starts_with(ROKIT_DOWNLOADS) {
         return Err("Unexpected Rokit download location".into());
     }
@@ -378,7 +386,7 @@ fn rokit_asset(release: &Release) -> Result<Asset, String> {
 }
 
 /// Check the archive against GitHub's "sha256:<hex>" digest, when there is one, then copy its one
-/// rokit.exe into `folder`. Nothing else in the archive is written.
+/// Rokit binary into `folder`. Nothing else in the archive is written.
 fn extract_rokit(archive: &Path, digest: Option<&str>, folder: &Path) -> Result<PathBuf, String> {
     let data = fs::read(archive).map_err(|e| e.to_string())?;
     if let Some(expected) = digest.and_then(|digest| digest.strip_prefix("sha256:")) {
@@ -394,15 +402,20 @@ fn extract_rokit(archive: &Path, digest: Option<&str>, folder: &Path) -> Result<
     let binaries: Vec<usize> = (0..zipped.len())
         .filter(|&index| {
             let name = zipped.by_index(index).ok().and_then(|file| file.name().ok().map(|name| name.into_owned()));
-            name.is_some_and(|name| name.rsplit(['/', '\\']).next() == Some("rokit.exe"))
+            name.is_some_and(|name| name.rsplit(['/', '\\']).next() == Some(ROKIT_BINARY))
         })
         .collect();
-    let [index] =
-        <[usize; 1]>::try_from(binaries).map_err(|_| "The Rokit archive did not contain one rokit.exe".to_string())?;
+    let [index] = <[usize; 1]>::try_from(binaries)
+        .map_err(|_| format!("The Rokit archive did not contain one {ROKIT_BINARY}"))?;
     let mut source = zipped.by_index(index).map_err(|e| e.to_string())?;
-    let executable = folder.join("rokit.exe");
+    let executable = folder.join(ROKIT_BINARY);
     let mut output = fs::File::create(&executable).map_err(|e| e.to_string())?;
     std::io::copy(&mut source, &mut output).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        output.set_permissions(fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
     Ok(executable)
 }
 
@@ -514,12 +527,14 @@ const CREATOR_STORE_ROJO: &str = "13916111004";
 const BRIDGE_SCRIPT: &str = include_str!("../../../rojo_bridge/RojoManagerBridge.luau");
 const PATCH_SCRIPT: &str = include_str!("../../../rojo_bridge/patch_rojo_plugin.luau");
 
-/// %LOCALAPPDATA%\Roblox, which holds Studio's plugin folders.
+/// The folder that holds Studio's plugin folders: %LOCALAPPDATA%\Roblox on Windows,
+/// ~/Documents/Roblox on macOS.
 fn roblox_folder() -> PathBuf {
-    let local = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::home_dir().unwrap_or_default().join("AppData").join("Local"));
-    local.join("Roblox")
+    let home = std::env::home_dir().unwrap_or_default();
+    if cfg!(target_os = "macos") {
+        return home.join("Documents").join("Roblox");
+    }
+    std::env::var_os("LOCALAPPDATA").map_or_else(|| home.join("AppData").join("Local"), PathBuf::from).join("Roblox")
 }
 
 /// The Rojo plugin Rojo Manager installed in Studio's local Plugins folder.
@@ -764,18 +779,16 @@ mod tests {
     }
 
     #[test]
-    fn rokit_downloads_only_its_official_windows_archive() {
+    fn rokit_downloads_only_its_official_archive_for_this_computer() {
         let asset = |name: &str, url: &str| Asset { name: name.into(), browser_download_url: url.into(), digest: None };
-        let official = format!("{ROKIT_DOWNLOADS}v1.2.0/rokit-1.2.0-windows-x86_64.zip");
+        let name = format!("rokit-1.2.0-{ROKIT_PLATFORM}.zip");
+        let official = format!("{ROKIT_DOWNLOADS}v1.2.0/{name}");
         let release = |assets, from_release_page| Release { tag_name: "v1.2.0".into(), assets, from_release_page };
-        let api = release(
-            vec![asset("rokit-1.2.0-linux-x86_64.zip", ""), asset("rokit-1.2.0-windows-x86_64.zip", &official)],
-            false,
-        );
+        let api = release(vec![asset("rokit-1.2.0-linux-x86_64.zip", ""), asset(&name, &official)], false);
         assert_eq!(rokit_asset(&api).unwrap().browser_download_url, official);
         assert_eq!(rokit_asset(&release(Vec::new(), true)).unwrap().browser_download_url, official);
         assert!(rokit_asset(&release(Vec::new(), false)).is_err());
-        let moved = release(vec![asset("rokit-1.2.0-windows-x86_64.zip", "https://example.com/rokit.zip")], false);
+        let moved = release(vec![asset(&name, "https://example.com/rokit.zip")], false);
         assert_eq!(rokit_asset(&moved).unwrap_err(), "Unexpected Rokit download location");
         let odd = Release { tag_name: "v1.2.0/../x".into(), assets: Vec::new(), from_release_page: true };
         assert_eq!(rokit_asset(&odd).unwrap_err(), "Unexpected Rokit stable release tag");
@@ -787,7 +800,7 @@ mod tests {
         let archive = folder.path().join("rokit.zip");
         let mut zipped = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
         let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        zipped.start_file("nested/rokit.exe", options).unwrap();
+        zipped.start_file(format!("nested/{ROKIT_BINARY}"), options).unwrap();
         zipped.write_all(b"fake test binary").unwrap();
         zipped.start_file("README.md", options).unwrap();
         zipped.write_all(b"must never be extracted").unwrap();
@@ -801,7 +814,7 @@ mod tests {
         assert_eq!(fs::read(&executable).unwrap(), b"fake test binary");
         let mut names: Vec<_> = fs::read_dir(folder.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         names.sort();
-        assert_eq!(names, ["rokit.exe", "rokit.zip"]);
+        assert_eq!(names, [ROKIT_BINARY, "rokit.zip"]);
         fs::remove_file(&executable).unwrap();
         let error = extract_rokit(&archive, Some("sha256:bad"), folder.path()).unwrap_err();
         assert_eq!(error, "The Rokit download checksum did not match");

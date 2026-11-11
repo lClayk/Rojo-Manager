@@ -1400,6 +1400,7 @@ checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.2",
  "block2 0.6.2",
+ "libc",
  "objc2 0.6.5",
 ]
 
@@ -5854,9 +5855,13 @@ name = "rojo-manager"
 version = "0.8.3"
 dependencies = [
  "async-channel",
+ "dispatch2",
  "embed-resource",
  "gpui-kit",
  "image",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
  "raw-window-handle",
  "rojo-manager-core",
  "serde",
@@ -5870,6 +5875,7 @@ name = "rojo-manager-core"
 version = "0.8.3"
 dependencies = [
  "getrandom 0.4.3",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.1",

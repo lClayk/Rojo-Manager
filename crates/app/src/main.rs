@@ -8,6 +8,12 @@ mod host;
 mod instance;
 mod ipc;
 mod logic;
+#[cfg(target_os = "macos")]
+#[path = "platform_macos.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "platform_windows.rs"]
+mod platform;
 mod theme;
 mod tray;
 mod view;

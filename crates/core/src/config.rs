@@ -1,4 +1,5 @@
-//! Private per-user settings in %LOCALAPPDATA%\RojoManager\config.json (or $ROJO_MANAGER_DATA_DIR).
+//! Private per-user settings in %LOCALAPPDATA%\RojoManager\config.json on Windows,
+//! ~/Library/Application Support/RojoManager/config.json on macOS, or $ROJO_MANAGER_DATA_DIR.
 //! The file format is shared with Rojo Manager 0.5, so upgrading keeps every project.
 
 use std::collections::HashSet;
@@ -154,10 +155,12 @@ pub fn data_dir() -> PathBuf {
         let dir = PathBuf::from(dir);
         return std::path::absolute(&dir).unwrap_or(dir);
     }
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
-        home.join("AppData").join("Local")
-    });
+    let home = std::env::home_dir().unwrap_or_default();
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else {
+        std::env::var_os("LOCALAPPDATA").map_or_else(|| home.join("AppData").join("Local"), PathBuf::from)
+    };
     base.join("RojoManager")
 }
 
@@ -279,10 +282,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// An absolute project folder on this platform.
+    const FOLDER: &str = if cfg!(windows) { r"C:\Games\Game" } else { "/Games/Game" };
+
     #[test]
     fn a_v05_config_round_trips() {
         let stored = json!({
-            "projects": [{"name": "Game", "path": "C:\\Games\\Game", "projectFile": "default.project.json",
+            "projects": [{"name": "Game", "path": FOLDER, "projectFile": "default.project.json",
                           "port": 34872, "autostart": true, "autoConnect": true,
                           "place": {"placeId": 1, "universeId": 2}}],
             "settings": {"tray": false, "unknown": 1}
@@ -299,13 +305,13 @@ mod tests {
 
     #[test]
     fn duplicates_and_bad_values_are_refused() {
-        let project = |name: &str, port: u16| json!({"name": name, "path": "C:\\x", "port": port});
+        let project = |name: &str, port: u16| json!({"name": name, "path": FOLDER, "port": port});
         assert!(validate(&json!({"projects": [project("A", 1), project("a", 2)]})).is_err());
         assert!(validate(&json!({"projects": [project("A", 1), project("B", 1)]})).is_err());
         assert!(validate(&json!({"projects": [{"name": "A", "path": "relative", "port": 1}]})).is_err());
         assert!(
             validate(
-                &json!({"projects": [{"name": "A", "path": "C:\\x", "port": 1, "projectFile": "..\\a.project.json"}]})
+                &json!({"projects": [{"name": "A", "path": FOLDER, "port": 1, "projectFile": "..\\a.project.json"}]})
             )
             .is_err()
         );
