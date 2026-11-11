@@ -13,13 +13,30 @@
 -- the next poll. Commands only come from Rojo Manager, which takes them from agents through its
 -- token-protected API.
 -- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
+--
+-- In Edit mode and in a playtest's server it also sends Studio's Output to Rojo Manager in small
+-- batches as lines appear, so agents can read prints, warnings, and errors. A playtest's client
+-- cannot make HTTP requests, so its Output stays in Studio.
 
 local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 7
+local VERSION = 8
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
+local OUTPUT_URL = "http://localhost:34871/output"
+-- How long new Output lines wait to be sent together, and how many wait at most.
+local OUTPUT_DELAY = 0.5
+local MAX_OUTPUT_LINES = 500
+-- Characters sent per line; Rojo Manager keeps no more.
+local MAX_OUTPUT_TEXT = 2000
+local OUTPUT_KINDS = {
+	[Enum.MessageType.MessageOutput] = "output",
+	[Enum.MessageType.MessageInfo] = "info",
+	[Enum.MessageType.MessageWarning] = "warning",
+	[Enum.MessageType.MessageError] = "error",
+}
 -- How long to wait before trying again when Rojo Manager does not answer.
 local RETRY_SECONDS = 5
 -- The largest poll Rojo Manager accepts, results included.
@@ -29,6 +46,8 @@ local DEFAULT_PORT = 34872
 
 -- The attached app's current poll loop, so a detached or reattached app's loop stops.
 local attached: { [any]: {} } = {}
+-- The attached app's Output connection.
+local outputs: { [any]: RBXScriptConnection } = {}
 
 -- Rojo's live session, if any.
 local function connected(app): boolean
@@ -240,13 +259,65 @@ local function reportRojoPlugins()
 	})
 end
 
+-- Send this DataModel's Output to Rojo Manager: what it logged before the plugin loaded, then each
+-- new line, batched for OUTPUT_DELAY. Nothing is sent while the Output is quiet.
+local function forwardOutput(app, context: string)
+	local pending = {}
+	local scheduled = false
+	local function send()
+		scheduled = false
+		local lines = pending
+		pending = {}
+		local ok, json = pcall(HttpService.JSONEncode, HttpService, {
+			placeId = game.PlaceId,
+			context = context,
+			lines = lines,
+		})
+		if ok then
+			pcall(HttpService.RequestAsync, HttpService, {
+				Url = OUTPUT_URL,
+				Method = "POST",
+				Headers = { ["Content-Type"] = "application/json" },
+				Body = json,
+			})
+		end
+	end
+	local function add(text: string, messageType: Enum.MessageType)
+		if #pending >= MAX_OUTPUT_LINES then
+			table.remove(pending, 1)
+		end
+		-- Cut at a character boundary: half a UTF-8 character would make the whole batch fail to encode.
+		local cut = utf8.offset(text, MAX_OUTPUT_TEXT + 1)
+		if cut then
+			text = string.sub(text, 1, cut - 1)
+		end
+		table.insert(pending, { text = text, kind = OUTPUT_KINDS[messageType] or "output" })
+		if not scheduled then
+			scheduled = true
+			task.delay(OUTPUT_DELAY, send)
+		end
+	end
+	add(`{context} started`, Enum.MessageType.MessageInfo)
+	-- Only as much history as fits beside that first line.
+	local history = LogService:GetLogHistory()
+	for index = math.max(1, #history - MAX_OUTPUT_LINES + 2), #history do
+		add(history[index].message, history[index].messageType)
+	end
+	outputs[app] = LogService.MessageOut:Connect(add)
+end
+
 local Bridge = {}
 
--- Called from App:init. Only the Edit-mode plugin is controllable.
+-- Called from App:init. Only the Edit-mode plugin is controllable; it and a playtest's server
+-- forward Output.
 function Bridge.attach(app)
 	if not RunService:IsEdit() then
+		if RunService:IsServer() then
+			forwardOutput(app, "server")
+		end
 		return
 	end
+	forwardOutput(app, "edit")
 	local token = {}
 	attached[app] = token
 	-- Deferred until App:init has finished, so the host and port the poll reports are set.
@@ -257,6 +328,10 @@ end
 -- Called from App:willUnmount when the plugin unloads.
 function Bridge.detach(app)
 	attached[app] = nil
+	if outputs[app] then
+		outputs[app]:Disconnect()
+		outputs[app] = nil
+	end
 end
 
 return Bridge

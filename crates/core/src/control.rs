@@ -7,7 +7,8 @@
 //!
 //! AutoConnectServer is the one exception: the Rojo bridge in Studio cannot read control.json, so it
 //! polls a fixed port without a token. It reports its place and Rojo's state there, and receives the
-//! auto-connect server and the commands agents send it through this API.
+//! auto-connect server and the commands agents send it through this API. Bridges in Edit mode and in
+//! playtest servers also send Studio's Output there.
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
@@ -62,6 +63,7 @@ impl std::fmt::Display for ControlError {
 /// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
 /// - POST /bridge/<id>               poll_bridge(id, body) (AutoConnectServer, no token)
+/// - POST /output                    report_output(body) (AutoConnectServer, no token)
 ///
 /// Bodies are JSON objects ({} when empty). Errors reply {"error": message} with their status.
 pub trait ControlHandler: Send + Sync + 'static {
@@ -75,6 +77,8 @@ pub trait ControlHandler: Send + Sync + 'static {
     /// A bridge's poll. Answers {"port", "accept"}: the place's auto-connect server (null for none)
     /// and whether to accept Rojo's sync prompt, plus "command" once one is queued for this bridge.
     fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value;
+    /// New lines of Studio's Output from a bridge.
+    fn report_output(&self, output: StudioOutput);
     /// {"bridge", "instances"}: whether the bridge is installed and the Studio windows it reports from;
     /// or runs one command ({"action", ...}) in one of them and returns its result.
     fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError>;
@@ -103,6 +107,40 @@ pub struct CommandResult {
     pub ok: bool,
     #[serde(default)]
     pub value: Value,
+}
+
+/// New lines of Studio's Output, as a bridge in one of a place's DataModels sends them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioOutput {
+    pub place_id: u64,
+    pub context: OutputContext,
+    pub lines: Vec<OutputReport>,
+}
+
+/// The DataModel a line of Output came from: Edit mode, or a playtest's server. A playtest's client
+/// cannot make HTTP requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputContext {
+    Edit,
+    Server,
+}
+
+/// A line's MessageType, least severe first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputKind {
+    Output,
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OutputReport {
+    pub text: String,
+    pub kind: OutputKind,
 }
 
 pub fn control_path() -> PathBuf {
@@ -166,6 +204,18 @@ impl AutoConnectServer {
                 (false, "rojo-plugins", Some(count)) => {
                     handler.report_rojo_plugins(u32::try_from(count).unwrap_or(u32::MAX));
                     (200, json!({}))
+                }
+                (true, "output", None) if rest.is_empty() => {
+                    let output = body(request, MAX_BRIDGE_BODY).and_then(|body| {
+                        serde_json::from_value(Value::Object(body)).map_err(|e| ControlError::bad(e.to_string()))
+                    });
+                    match output {
+                        Ok(output) => {
+                            handler.report_output(output);
+                            (200, json!({}))
+                        }
+                        Err(error) => (error.status, json!({ "error": error.message })),
+                    }
                 }
                 (true, "bridge", Some(id)) => {
                     let poll = body(request, MAX_BRIDGE_BODY).and_then(|body| {
@@ -458,6 +508,11 @@ mod tests {
             }
         }
 
+        fn report_output(&self, output: StudioOutput) {
+            let lines: Vec<(&str, OutputKind)> = output.lines.iter().map(|l| (l.text.as_str(), l.kind)).collect();
+            self.calls.lock().unwrap().push(json!(["output", output.place_id, output.context, lines]));
+        }
+
         fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError> {
             self.calls.lock().unwrap().push(json!(["studio", command]));
             Ok(json!({}))
@@ -547,7 +602,8 @@ mod tests {
 
     #[test]
     fn bridge_server_answers_polls_without_a_token_but_not_browsers_and_owns_its_port() {
-        let server = AutoConnectServer::start(Arc::new(Fake::default()), 0).unwrap();
+        let fake = Arc::new(Fake::default());
+        let server = AutoConnectServer::start(fake.clone(), 0).unwrap();
         let port = server.served.server.server_addr().to_ip().unwrap().port();
         let send = |method: &str, path: &str, body: Option<&Value>, headers: &[(&str, &str)]| {
             let response = crate::localnet::request(port, method, path, body, headers, TIMEOUT, None).unwrap();
@@ -560,6 +616,13 @@ mod tests {
         assert_eq!(send("POST", "/bridge/9", Some(&json!({"port": 0})), &[]).0, 400);
         assert_eq!(send("POST", "/bridge/9", Some(&poll), &[("Origin", "https://example.invalid")]).0, 404);
         assert_eq!(send("GET", "/bridge/9/42/0", None, &[]).0, 404);
+        let output = json!({"placeId": 42, "context": "server", "lines": [{"text": "boom", "kind": "error"}]});
+        assert_eq!(send("POST", "/output", Some(&output), &[]).0, 200);
+        assert_eq!(
+            send("POST", "/output", Some(&json!({"placeId": 42, "context": "client", "lines": []})), &[]).0,
+            400
+        );
+        assert_eq!(fake.calls.lock().unwrap().last(), Some(&json!(["output", 42, "server", [["boom", "error"]]])));
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         server.close();
