@@ -30,6 +30,9 @@ pub struct Project {
     pub auto_connect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place: Option<Place>,
+    /// Keep sourcemap.json current with `rojo sourcemap --watch` while the server runs. Only stored when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sourcemap: bool,
 }
 
 /// App preferences. Field names are the JSON keys agents use.
@@ -220,6 +223,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         };
         let autostart = flag("autostart", "Project autostart must be true or false")?;
         let auto_connect = flag("autoConnect", "Project autoConnect must be true or false")?;
+        let sourcemap = flag("sourcemap", "Project sourcemap must be true or false")?;
         let place = match item.get("place") {
             None | Some(Value::Null) => None,
             Some(place) => {
@@ -238,6 +242,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
             autostart,
             auto_connect,
             place,
+            sourcemap,
         });
     }
     // Only a window preference, so a bad entry is dropped instead of refusing the file.
@@ -290,7 +295,7 @@ mod tests {
         let stored = json!({
             "projects": [{"name": "Game", "path": FOLDER, "projectFile": "default.project.json",
                           "port": 34872, "autostart": true, "autoConnect": true,
-                          "place": {"placeId": 1, "universeId": 2}}],
+                          "place": {"placeId": 1, "universeId": 2}, "sourcemap": true}],
             "settings": {"tray": false, "unknown": 1}
         });
         let config = validate(&stored).unwrap();

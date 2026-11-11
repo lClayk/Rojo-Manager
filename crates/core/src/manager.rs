@@ -71,6 +71,7 @@ pub struct ProjectView {
     /// The linked place's experience name, once looked up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experience: Option<String>,
+    pub sourcemap: bool,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -154,6 +155,7 @@ pub struct Update {
     /// Missing keeps the place; `null` unlinks it.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub place: Option<Option<Place>>,
+    pub sourcemap: Option<bool>,
 }
 
 /// A field that is present, even as `null`, is `Some`.
@@ -233,6 +235,8 @@ impl Console {
 struct State {
     config: Config,
     procs: HashMap<String, Child>,
+    /// `rojo sourcemap --watch` beside a server this app runs, by project.
+    sourcemaps: HashMap<String, Child>,
     starting: HashSet<String>,
     restarting: HashSet<String>,
     cancellations: HashMap<String, Arc<AtomicBool>>,
@@ -383,7 +387,7 @@ fn serves_project(project: &config::Project) -> Option<bool> {
     Some(name.is_none_or(|name| name == info.project_name))
 }
 
-/// Hide a server process's console on Windows. On macOS, run it in its own process group: Rokit's
+/// Hide a Rojo process's console on Windows. On macOS, run it in its own process group: Rokit's
 /// shim starts the real rojo as an ordinary child there, and `end_server` ends the whole group.
 fn own_group(command: &mut Command) {
     #[cfg(windows)]
@@ -460,8 +464,9 @@ impl Engine {
         }
         let children: Vec<_> = state.procs.drain().collect();
         let ports: Vec<u16> = children.iter().filter_map(|(name, _)| state.port(name).ok()).collect();
+        let sourcemaps: Vec<_> = state.sourcemaps.drain().collect();
         drop(state);
-        for (_, mut child) in children {
+        for (_, mut child) in children.into_iter().chain(sourcemaps) {
             end_server(&mut child);
         }
         // As in stop_server: the real rojo behind Rokit's shim ends a moment later. Waiting lets an
@@ -518,6 +523,7 @@ impl Engine {
             autostart: p.autostart,
             auto_connect: p.auto_connect,
             place: p.place,
+            sourcemap: p.sourcemap,
             experience: p.place.and_then(|place| state.experiences.get(&place.universe_id).cloned()),
             state: state.view_state(&p.name),
             badges: tooling::project_badges(Path::new(&p.path)).into_iter().map(String::from).collect(),
@@ -634,6 +640,7 @@ impl Engine {
             engine.wake_watcher();
             match launched {
                 Ok(Some(output)) => {
+                    engine.start_sourcemap(&name);
                     let mut reader = BufReader::new(output);
                     let mut line = Vec::new();
                     while reader.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
@@ -699,6 +706,71 @@ impl Engine {
         Ok(Some(reader))
     }
 
+    /// Run `rojo sourcemap --watch` beside a server this app runs, when its project asks for it, so
+    /// luau-lsp sees an up to date sourcemap.json. Its output goes to the project's log.
+    fn start_sourcemap(self: &Arc<Self>, name: &str) {
+        let mut state = self.lock();
+        let Some(project) = state.config.project(name).filter(|p| p.sourcemap).cloned() else { return };
+        if !state.procs.contains_key(name) || state.sourcemaps.contains_key(name) {
+            return;
+        }
+        let Some(rojo) = tooling::find_tool("Rojo") else { return };
+        let spawned = std::io::pipe().and_then(|(reader, writer)| {
+            let mut command = Command::new(rojo);
+            command
+                .arg("sourcemap")
+                .arg(Path::new(&project.path).join(&project.project_file))
+                .args(["--output", "sourcemap.json", "--include-non-scripts", "--watch"])
+                .current_dir(&project.path)
+                .stdin(std::process::Stdio::null())
+                .stdout(writer.try_clone()?)
+                .stderr(writer);
+            own_group(&mut command);
+            Ok((command.spawn()?, reader))
+        });
+        let (child, output) = match spawned {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                drop(state);
+                return self.log(name, &format!("[sourcemap could not start: {error}]"));
+            }
+        };
+        let pid = child.id();
+        state.sourcemaps.insert(name.to_string(), child);
+        drop(state);
+        self.log(name, &format!("$ rojo sourcemap {} --output sourcemap.json --watch", project.project_file));
+        let engine = Arc::clone(self);
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            // Rojo reports every rebuild; a repeat would push the server's own output out of view.
+            let mut last = String::new();
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() && line != last {
+                    engine.log(&name, &format!("[sourcemap] {line}"));
+                    last = line;
+                }
+            }
+            // It ended on its own; stop_sourcemap forgets the process before ending it.
+            let exited = {
+                let mut state = engine.lock();
+                let ours = state.sourcemaps.get(&name).is_some_and(|child| child.id() == pid);
+                if ours { state.sourcemaps.remove(&name) } else { None }
+            };
+            if let Some(mut child) = exited {
+                let code = child.wait().ok().and_then(|status| status.code());
+                let shown = code.map_or("unknown".to_string(), |c| c.to_string());
+                engine.log(&name, &format!("[sourcemap exited with code {shown}]"));
+            }
+        });
+    }
+
+    fn stop_sourcemap(&self, name: &str) {
+        let child = self.lock().sourcemaps.remove(name);
+        if let Some(mut child) = child {
+            end_server(&mut child);
+        }
+    }
+
     pub fn stop(&self, name: &str) {
         self.lock().restarting.remove(name);
         self.stop_server(name);
@@ -707,6 +779,7 @@ impl Engine {
     }
 
     fn stop_server(&self, name: &str) {
+        self.stop_sourcemap(name);
         let (child, project) = {
             let mut state = self.lock();
             if let Some(cancellation) = state.cancellations.get(name) {
@@ -970,6 +1043,7 @@ impl Engine {
                     exit.map(|status| (status, state.expected_stop.remove(&name).unwrap_or(false)))
                 };
                 if let Some((status, expected)) = exited {
+                    self.stop_sourcemap(&name);
                     // A signal (macOS) has no exit code; its status reads "signal: 11 (SIGSEGV)".
                     let shown = status.code().map_or_else(|| status.to_string(), |c| c.to_string());
                     self.log(&name, &format!("[process exited with code {shown}]"));
@@ -1102,6 +1176,7 @@ impl Engine {
             autostart: false,
             auto_connect: false,
             place: None,
+            sourcemap: false,
         });
         config::save(&config)?;
         state.config = config;
@@ -1156,6 +1231,7 @@ impl Engine {
         p.auto_connect = update.auto_connect.unwrap_or(p.auto_connect) && linked.is_some();
         p.place = linked;
         p.name = new_name.clone();
+        p.sourcemap = update.sourcemap.unwrap_or(p.sourcemap);
         config::save(&config)?;
         state.config = config;
         if new_name != name {
@@ -1169,6 +1245,12 @@ impl Engine {
         }
         let view = Self::view(&state, &new_name).ok_or_else(|| missing(&new_name))?;
         drop(state);
+        // A running server picks up the change at once.
+        match update.sourcemap {
+            Some(true) => self.start_sourcemap(&new_name),
+            Some(false) => self.stop_sourcemap(&new_name),
+            None => {}
+        }
         self.changed();
         if view.place.is_some() && view.experience.is_none() {
             self.look_up_experiences();
@@ -1683,10 +1765,10 @@ impl ControlHandler for Control {
     }
 }
 
-/// Read an agent's update body (name, port, autostart, autoConnect, place) or link-place body
+/// Read an agent's update body (name, port, autostart, autoConnect, place, sourcemap) or link-place body
 /// (place). The place text comes back separately, still to be looked up.
 fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Option<String>), ControlError> {
-    const FIELDS: &str = "name, port, autostart, autoConnect, place";
+    const FIELDS: &str = "name, port, autostart, autoConnect, place, sourcemap";
     if action == "link-place" {
         let place = body.get("place").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
         let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link"))?;
@@ -1708,6 +1790,7 @@ fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Opti
             }
             "autostart" => update.autostart = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
             "autoConnect" => update.auto_connect = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
+            "sourcemap" => update.sourcemap = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
             _ => return Err(ControlError::bad(format!("Unknown field {key}. Fields: {FIELDS}"))),
         }
     }
@@ -1731,6 +1814,7 @@ mod tests {
             parse_update("update", &body(json!({"port": 35000, "autoConnect": true, "place": ""}))).unwrap();
         assert_eq!((update.port, update.auto_connect, place.as_deref()), (Some(35000), Some(true), Some("")));
         assert_eq!(parse_update("update", &body(json!({"port": "1"}))).unwrap_err().message, "port must be a int");
+        assert_eq!(parse_update("update", &body(json!({"sourcemap": true}))).unwrap().0.sourcemap, Some(true));
         assert!(parse_update("update", &body(json!({"colour": 1}))).unwrap_err().message.starts_with("Unknown field"));
         assert_eq!(parse_update("update", &body(json!({}))).unwrap_err().status, 400);
         assert_eq!(parse_update("link-place", &body(json!({"place": " 123 "}))).unwrap().1.as_deref(), Some("123"));

@@ -244,6 +244,7 @@ mod tests {
             autostart: false,
             auto_connect: false,
             place: None,
+            sourcemap: false,
             experience: None,
             state,
             badges: vec![],
