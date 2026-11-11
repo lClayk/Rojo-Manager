@@ -48,9 +48,10 @@ impl Backend for Core {
         control::request(method, parts, body, timeout)
     }
 
-    /// Runs RojoManager.exe from this executable's folder with --hidden.
+    /// Runs RojoManager from this executable's folder with --hidden, detached from the agent.
     fn launch_manager(&self) -> io::Result<()> {
-        let mut command = Command::new(std::env::current_exe()?.with_file_name("RojoManager.exe"));
+        let manager = rojo_manager_core::executable("RojoManager");
+        let mut command = Command::new(std::env::current_exe()?.with_file_name(manager));
         command.arg("--hidden").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(windows)]
         {
@@ -59,6 +60,8 @@ impl Backend for Core {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         command.spawn()?;
         Ok(())
     }

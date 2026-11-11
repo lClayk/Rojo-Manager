@@ -76,11 +76,13 @@ pub fn config_snippet(path: &str) -> String {
     serde_json::to_string_pretty(&config).unwrap_or_default()
 }
 
-/// The CLI on PATH; npm installs it as a .cmd shim, other installers as an .exe.
+/// The CLI on PATH (which macOS extends at start). On Windows npm installs it as a .cmd shim,
+/// other installers as an .exe.
 fn find(name: &str) -> Option<PathBuf> {
+    let extensions: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat"] } else { &[""] };
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(format!("{name}.{ext}"))))
+        .flat_map(|dir| extensions.iter().map(move |ext| dir.join(format!("{name}{ext}"))))
         .find(|file| file.is_file())
 }
 

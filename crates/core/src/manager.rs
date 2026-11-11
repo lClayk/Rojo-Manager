@@ -165,7 +165,68 @@ struct ToolJob {
     view: ToolJobView,
     /// Holds request.json and the installer's result.json; deleted with the job.
     folder: tempfile::TempDir,
-    process: Child,
+    console: Console,
+}
+
+/// The terminal running ToolInstaller: its own console process on Windows. On macOS, Terminal runs
+/// it through job.command, which records the installer's pid in the job folder.
+struct Console {
+    child: Child,
+    #[cfg(target_os = "macos")]
+    started: Instant,
+}
+
+impl Console {
+    #[cfg(windows)]
+    fn open(installer: &Path, request: &Path, app_dir: &Path) -> std::io::Result<Console> {
+        let mut command = Command::new(installer);
+        command.arg(request).current_dir(app_dir);
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0000_0010); // CREATE_NEW_CONSOLE
+        Ok(Console { child: command.spawn()? })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open(installer: &Path, request: &Path, app_dir: &Path) -> std::io::Result<Console> {
+        use std::os::unix::fs::PermissionsExt;
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"));
+        let folder = request.parent().unwrap_or(app_dir);
+        let script = folder.join("job.command");
+        // Terminal does not pass on this app's environment, so an isolated profile is named here.
+        let profile = std::env::var_os("ROJO_MANAGER_DATA_DIR")
+            .map(|dir| format!("export ROJO_MANAGER_DATA_DIR={}\n", quote(Path::new(&dir))))
+            .unwrap_or_default();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{profile}echo $$ > {}\ncd {} && exec {} {}\n",
+                quote(&folder.join("pid")),
+                quote(app_dir),
+                quote(installer),
+                quote(request)
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let child = Command::new("open").arg("-a").arg("Terminal").arg(&script).spawn()?;
+        Ok(Console { child, started: Instant::now() })
+    }
+
+    /// The installer exited, or its terminal was closed, without a result.
+    fn ended(&mut self, folder: &Path) -> bool {
+        #[cfg(windows)]
+        let _ = folder;
+        #[cfg(windows)]
+        return self.child.try_wait().ok().flatten().is_some();
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self.child.try_wait(); // `open` itself returns at once
+            let pid = std::fs::read_to_string(folder.join("pid")).ok().and_then(|pid| pid.trim().parse::<i32>().ok());
+            match pid {
+                // SAFETY: signal 0 only checks that the process exists.
+                Some(pid) => unsafe { libc::kill(pid, 0) != 0 },
+                None => self.started.elapsed() > Duration::from_secs(60),
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -322,6 +383,34 @@ fn serves_project(project: &config::Project) -> Option<bool> {
     Some(name.is_none_or(|name| name == info.project_name))
 }
 
+/// Hide a server process's console on Windows. On macOS, run it in its own process group: Rokit's
+/// shim starts the real rojo as an ordinary child there, and `end_server` ends the whole group.
+fn own_group(command: &mut Command) {
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(command, crate::CREATE_NO_WINDOW);
+    #[cfg(target_os = "macos")]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+}
+
+/// End a process started with `own_group`. On macOS its whole group is asked to stop, then killed
+/// after a second, so the real rojo behind Rokit's shim never outlives it.
+fn end_server(child: &mut Child) {
+    #[cfg(target_os = "macos")]
+    {
+        let group = child.id() as libc::pid_t;
+        // SAFETY: plain signals to the process group this app created for the child.
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: as above; the shim may have exited and left the real rojo running.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
 }
@@ -373,8 +462,7 @@ impl Engine {
         let ports: Vec<u16> = children.iter().filter_map(|(name, _)| state.port(name).ok()).collect();
         drop(state);
         for (_, mut child) in children {
-            let _ = child.kill();
-            let _ = child.wait();
+            end_server(&mut child);
         }
         // As in stop_server: the real rojo behind Rokit's shim ends a moment later. Waiting lets an
         // update's restart start these servers again on the same ports.
@@ -464,7 +552,7 @@ impl Engine {
             studio_plugin: tooling::studio_plugin(),
             creator_store_rojo: tooling::creator_store_rojo_installed(),
             studio_rojo_plugins: state.studio_rojo_plugins,
-            mcp_path: self.app_dir.join("RojoManagerMCP.exe").display().to_string(),
+            mcp_path: self.app_dir.join(crate::executable("RojoManagerMCP")).display().to_string(),
             collapsed: state.config.collapsed.clone(),
             studio_tools_prompt: state
                 .other_studio_mcp
@@ -598,13 +686,13 @@ impl Engine {
             .stdin(std::process::Stdio::null())
             .stdout(writer.try_clone().map_err(|e| e.to_string())?)
             .stderr(writer);
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut command, crate::CREATE_NO_WINDOW);
+        own_group(&mut command);
         let mut child = command.spawn().map_err(|e| format!("Could not run Rojo: {e}"))?;
         drop(command); // closes our copies of the pipe's write end, so reading ends with the process
         let mut state = self.lock();
         if cancelled.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            drop(state);
+            end_server(&mut child);
             return Ok(None);
         }
         state.procs.insert(name.to_string(), child);
@@ -633,8 +721,7 @@ impl Engine {
         };
         let port = project.port;
         if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
+            end_server(&mut child);
             // Rokit's shim exits first; the real rojo holding the port ends a moment later. Until
             // it does, the watcher would take our own dying server for another app's.
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -661,7 +748,7 @@ impl Engine {
         }
         match localnet::port_owner(port) {
             None => {}
-            Some((_, image)) if !image.eq_ignore_ascii_case("rojo.exe") => {
+            Some((_, image)) if !image.eq_ignore_ascii_case(&crate::executable("rojo")) => {
                 self.notice("The listener is not a Rojo process. Stop it from the application that started it.")
             }
             Some((pid, _)) => {
@@ -848,8 +935,18 @@ impl Engine {
         // port -> (listener pid, checked at, is Rojo)
         let mut probes: HashMap<u16, (u32, Instant, bool)> = HashMap::new();
         while !self.closing.load(Ordering::SeqCst) {
-            let connections = !self.lock().procs.is_empty();
-            let Ok((listening, established)) = localnet::tcp_snapshot(connections) else {
+            let (connections, idle_ports) = {
+                let state = self.lock();
+                let idle = state.procs.is_empty() && state.starting.is_empty() && state.restarting.is_empty();
+                let ports: Vec<u16> = state.config.projects.iter().map(|p| p.port).collect();
+                (!state.procs.is_empty(), idle.then_some(ports))
+            };
+            // macOS reads every process's sockets for a snapshot; while this app runs no server, a
+            // connection attempt per project port shows whether there is anything to look at.
+            let quiet =
+                cfg!(target_os = "macos") && idle_ports.is_some_and(|ports| !ports.into_iter().any(localnet::answers));
+            let snapshot = if quiet { Ok(Default::default()) } else { localnet::tcp_snapshot(connections) };
+            let Ok((listening, established)) = snapshot else {
                 self.sleep_watcher(Duration::from_secs(1));
                 continue;
             };
@@ -870,13 +967,14 @@ impl Engine {
                     if exit.is_some() {
                         state.procs.remove(&name);
                     }
-                    exit.map(|status| (status.code(), state.expected_stop.remove(&name).unwrap_or(false)))
+                    exit.map(|status| (status, state.expected_stop.remove(&name).unwrap_or(false)))
                 };
-                if let Some((code, expected)) = exited {
-                    let shown = code.map_or("unknown".to_string(), |c| c.to_string());
+                if let Some((status, expected)) = exited {
+                    // A signal (macOS) has no exit code; its status reads "signal: 11 (SIGSEGV)".
+                    let shown = status.code().map_or_else(|| status.to_string(), |c| c.to_string());
                     self.log(&name, &format!("[process exited with code {shown}]"));
                     changed = true;
-                    if !expected && !matches!(code, Some(0) | None) {
+                    if !expected && !status.success() {
                         self.crashed(&name, &shown);
                     }
                 }
@@ -1318,20 +1416,17 @@ impl Engine {
             Job::Plugin { tool } => ("plugin", tool),
         };
         let view = ToolJobView { operation: operation.into(), tool: tool.clone() };
-        let installer = self.app_dir.join("ToolInstaller.exe");
+        let installer = self.app_dir.join(crate::executable("ToolInstaller"));
         if !installer.is_file() {
-            return Err("ToolInstaller.exe is missing. Extract the complete release ZIP and retry.".into());
+            return Err("ToolInstaller is missing. Extract the complete release ZIP and retry.".into());
         }
         let folder = tempfile::Builder::new().prefix("rojo-manager-job-").tempdir().map_err(|e| e.to_string())?;
         let request = folder.path().join("request.json");
         std::fs::write(&request, serde_json::to_vec(&job).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let mut command = Command::new(installer);
-        command.arg(&request).current_dir(&self.app_dir);
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0000_0010); // CREATE_NEW_CONSOLE
-        let process = command.spawn().map_err(|e| format!("Could not start installation: {e}"))?;
+        let console = Console::open(&installer, &request, &self.app_dir)
+            .map_err(|e| format!("Could not start installation: {e}"))?;
         let message = format!("Installing {}. Follow any prompts in the terminal.", view.tool);
-        state.tool_job = Some(ToolJob { view, folder, process });
+        state.tool_job = Some(ToolJob { view, folder, console });
         drop(state);
         self.changed();
         self.notice(message);
@@ -1357,7 +1452,7 @@ impl Engine {
                     None => "Installation failed: Invalid installer result".to_string(),
                 };
             }
-            if job.process.try_wait().ok().flatten().is_some() {
+            if job.console.ended(job.folder.path()) {
                 break "Installation failed: Installation ended without completing. Check the terminal and retry."
                     .into();
             }

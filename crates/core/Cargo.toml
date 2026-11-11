@@ -11,7 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 # Plain HTTP/1.1 servers for the loopback control and auto-connect APIs.
 tiny_http = "0.12"
-# HTTPS to GitHub and Roblox through Windows' own TLS (schannel).
+# HTTPS to GitHub and Roblox through the system's own TLS (schannel on Windows, Security.framework on macOS).
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 getrandom = "0.4"
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
@@ -30,3 +30,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

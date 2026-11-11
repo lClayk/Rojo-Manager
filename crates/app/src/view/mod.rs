@@ -21,7 +21,7 @@ use rojo_manager_core::updates::UpdateState;
 use crate::ipc::Client;
 use crate::logic;
 use crate::theme::*;
-use crate::widgets::{Button, Callback, Dialog, TITLE_BAR, Variant, tabbable};
+use crate::widgets::{Button, Callback, Dialog, TITLE_BAR, TITLE_BAR_INSET, Variant, tabbable};
 
 pub use logs::Logs;
 use settings::AgentHelp;
@@ -289,7 +289,7 @@ impl MainView {
 
     fn render_header(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let projects = &snapshot.projects;
-        TitleBar::new().h(px(TITLE_BAR)).pl(px(16.)).child(
+        TitleBar::new().h(px(TITLE_BAR)).pl(px(TITLE_BAR_INSET)).child(
             div()
                 .flex()
                 .items_center()

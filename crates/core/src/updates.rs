@@ -16,8 +16,20 @@ pub const REPOSITORY: &str = "lClayk/Rojo-Manager";
 pub const RELEASES_URL: &str = "https://github.com/lClayk/Rojo-Manager/releases";
 const DOWNLOADS: &str = "https://github.com/lClayk/Rojo-Manager/releases/download/";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
-/// The folder inside the release zip that holds the app.
+/// This platform's release zip ends in `-<ASSET>.zip`. BUNDLE is the folder inside it that holds the
+/// app, and MAIN the app's executable inside that folder.
+#[cfg(windows)]
+const ASSET: &str = "windows-x64";
+#[cfg(windows)]
 const BUNDLE: &str = "RojoManager";
+#[cfg(windows)]
+const MAIN: &str = "RojoManager.exe";
+#[cfg(target_os = "macos")]
+const ASSET: &str = "macos";
+#[cfg(target_os = "macos")]
+const BUNDLE: &str = "Rojo Manager.app";
+#[cfg(target_os = "macos")]
+const MAIN: &str = "Contents/MacOS/RojoManager";
 /// Files an update moved aside end with this; they are deleted on the next start.
 const ASIDE: &str = ".old";
 
@@ -98,9 +110,20 @@ fn update_status(release: Result<Release, HttpsError>, installed: &str) -> Updat
     status(UpdateState::Current, format!("Rojo Manager {installed} is up to date."), url)
 }
 
-/// Download the latest release and swap it into `app_dir`. Running executables are renamed aside,
-/// which Windows allows, and removed by `remove_replaced` on the next start. Returns the version.
+/// Where the app's files start, given the executables' folder: that folder on Windows, the .app
+/// bundle on macOS.
+fn install_root(app_dir: &Path) -> &Path {
+    if cfg!(target_os = "macos") && app_dir.ends_with("Contents/MacOS") {
+        return app_dir.parent().and_then(Path::parent).unwrap_or(app_dir);
+    }
+    app_dir
+}
+
+/// Download the latest release and swap it into the app's folder (`app_dir` holds the
+/// executables). On Windows, running executables are renamed aside and removed by
+/// `remove_replaced` on the next start. A macOS .app is replaced whole. Returns the version.
 pub fn install_latest(app_dir: &Path, installed: &str) -> Result<String, String> {
+    let root = install_root(app_dir);
     let release = tooling::fetch_latest_release(REPOSITORY).map_err(|_| "Could not reach GitHub. Try again later.")?;
     let tag = release.tag_name.clone();
     if is_newer(&tag, installed) != Some(true) {
@@ -108,22 +131,29 @@ pub fn install_latest(app_dir: &Path, installed: &str) -> Result<String, String>
     }
     let version = tag.trim_start_matches('v');
     // The link is built here, never taken from release metadata; the API adds the checksum.
-    let name = format!("RojoManager-{version}-windows-x64.zip");
+    let name = format!("RojoManager-{version}-{ASSET}.zip");
     let digest = release.assets.iter().find(|asset| asset.name == name).and_then(|asset| asset.digest.clone());
     let folder = tempfile::Builder::new().prefix("rojo-manager-update-").tempdir().map_err(|e| e.to_string())?;
     let archive = folder.path().join(&name);
-    https::download(&format!("{DOWNLOADS}{tag}/{name}"), &archive, DOWNLOAD_TIMEOUT)
+    https::download(format!("{DOWNLOADS}{tag}/{name}").as_str(), &archive, DOWNLOAD_TIMEOUT)
         .map_err(|e| format!("Could not download {name}: {e}"))?;
     let data = fs::read(&archive).map_err(|e| e.to_string())?;
     check_digest(&data, digest.as_deref())?;
-    let staged = tempfile::Builder::new().prefix(".update-").tempdir_in(app_dir).map_err(|e| match e.kind() {
+    // A bundle is staged beside itself, so it can be renamed into place.
+    let bundle = root.extension().is_some_and(|extension| extension == "app");
+    let staging = if bundle { root.parent().unwrap_or(root) } else { root };
+    let staged = tempfile::Builder::new().prefix(".update-").tempdir_in(staging).map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
             "Rojo Manager's folder is not writable. Move it to a folder you own, or download the release.".into()
         }
         _ => e.to_string(),
     })?;
     unpack(&data, staged.path())?;
-    swap(staged.path(), app_dir)?;
+    if bundle {
+        replace_bundle(staged.path(), root)?
+    } else {
+        swap(staged.path(), root)?
+    }
     Ok(version.to_string())
 }
 
@@ -137,7 +167,8 @@ fn check_digest(data: &[u8], digest: Option<&str>) -> Result<(), String> {
     if actual.eq_ignore_ascii_case(expected) { Ok(()) } else { Err("The download's checksum did not match".into()) }
 }
 
-/// Write the zip's RojoManager folder into `into`. Entries outside it are skipped.
+/// Write the zip's BUNDLE folder into `into`, keeping executables executable. Entries outside it
+/// are skipped.
 fn unpack(data: &[u8], into: &Path) -> Result<(), String> {
     let mut zipped = zip::ZipArchive::new(Cursor::new(data)).map_err(|e| e.to_string())?;
     for index in 0..zipped.len() {
@@ -153,9 +184,14 @@ fn unpack(data: &[u8], into: &Path) -> Result<(), String> {
         }
         let mut output = fs::File::create(&target).map_err(|e| e.to_string())?;
         std::io::copy(&mut file, &mut output).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if let Some(mode) = file.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            output.set_permissions(fs::Permissions::from_mode(mode & 0o777)).map_err(|e| e.to_string())?;
+        }
     }
-    if !into.join("RojoManager.exe").is_file() {
-        return Err("The download does not contain RojoManager.exe".into());
+    if !into.join(MAIN).is_file() {
+        return Err("The download does not contain Rojo Manager".into());
     }
     Ok(())
 }
@@ -214,6 +250,22 @@ fn swap(staged: &Path, app_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Replace a whole .app bundle with `staged`, so no file of the old version stays behind to break
+/// the bundle's signature. The old bundle is renamed aside and deleted (macOS allows that while it
+/// runs); if the new one cannot take its place, the old one is put back.
+fn replace_bundle(staged: &Path, bundle: &Path) -> Result<(), String> {
+    let mut name = bundle.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}{ASIDE}", std::process::id()));
+    let aside = bundle.with_file_name(name);
+    fs::rename(bundle, &aside).map_err(|e| format!("Could not replace the app: {e}"))?;
+    if let Err(error) = fs::rename(staged, bundle) {
+        let _ = fs::rename(&aside, bundle);
+        return Err(format!("Could not replace the app: {error}"));
+    }
+    let _ = fs::remove_dir_all(&aside);
+    Ok(())
+}
+
 /// A name `swap` gives a replaced executable: `<name>.exe.<pid>.old`.
 fn moved_aside(name: &str) -> bool {
     let split = name.strip_suffix(ASIDE).and_then(|rest| rest.rsplit_once('.'));
@@ -224,6 +276,7 @@ fn moved_aside(name: &str) -> bool {
 
 /// Delete the executables an earlier update moved aside while they ran. Only `app_dir` itself is
 /// looked at, and only names `swap` gives, since the app may sit in a folder with other files.
+/// macOS replaces the whole bundle at once, so this finds nothing there.
 pub fn remove_replaced(app_dir: &Path) {
     let Ok(entries) = fs::read_dir(app_dir) else { return };
     for entry in entries.flatten() {
@@ -251,22 +304,40 @@ mod tests {
     #[test]
     fn an_update_replaces_the_app_files_and_removes_the_old_ones() {
         let app = tempfile::tempdir().unwrap();
-        fs::write(app.path().join("RojoManager.exe"), "old").unwrap();
+        let main = app.path().join(MAIN);
+        fs::create_dir_all(main.parent().unwrap()).unwrap();
+        fs::write(&main, "old").unwrap();
         fs::write(app.path().join("notes.txt"), "mine").unwrap();
         let data = bundle(&[
-            ("RojoManager/RojoManager.exe", "new"),
-            ("RojoManager/licenses/LICENSE.txt", "license"),
-            ("RojoManager/../escape.txt", "outside"),
+            (format!("{BUNDLE}/{MAIN}").as_str(), "new"),
+            (format!("{BUNDLE}/licenses/LICENSE.txt").as_str(), "license"),
+            (format!("{BUNDLE}/../escape.txt").as_str(), "outside"),
             ("other/ignored.txt", "outside"),
         ]);
         let staged = tempfile::tempdir_in(app.path()).unwrap();
         unpack(&data, staged.path()).unwrap();
         swap(staged.path(), app.path()).unwrap();
-        assert_eq!(fs::read_to_string(app.path().join("RojoManager.exe")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&main).unwrap(), "new");
         assert_eq!(fs::read_to_string(app.path().join("licenses").join("LICENSE.txt")).unwrap(), "license");
         assert_eq!(fs::read_to_string(app.path().join("notes.txt")).unwrap(), "mine");
         assert!(!app.path().join("escape.txt").exists() && !app.path().join("ignored.txt").exists());
-        assert!(!app.path().join(format!("RojoManager.exe.{}.old", std::process::id())).exists());
+        let name = main.file_name().unwrap().display();
+        assert!(!main.with_file_name(format!("{name}.{}.old", std::process::id())).exists());
+    }
+
+    #[test]
+    fn a_bundle_update_replaces_the_whole_bundle() {
+        let parent = tempfile::tempdir().unwrap();
+        let app = parent.path().join("Rojo Manager.app");
+        fs::create_dir_all(app.join("Contents")).unwrap();
+        fs::write(app.join("Contents").join("obsolete"), "old").unwrap();
+        let staged = parent.path().join(".update-1");
+        fs::create_dir_all(staged.join("Contents")).unwrap();
+        fs::write(staged.join("Contents").join("Info.plist"), "new").unwrap();
+        replace_bundle(&staged, &app).unwrap();
+        assert_eq!(fs::read_to_string(app.join("Contents").join("Info.plist")).unwrap(), "new");
+        assert!(!app.join("Contents").join("obsolete").exists() && !staged.exists());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1, "the old bundle is deleted");
     }
 
     #[test]
@@ -288,8 +359,8 @@ mod tests {
     #[test]
     fn a_download_without_the_app_or_with_a_wrong_checksum_is_refused() {
         let folder = tempfile::tempdir().unwrap();
-        let error = unpack(&bundle(&[("RojoManager/README.md", "")]), folder.path()).unwrap_err();
-        assert_eq!(error, "The download does not contain RojoManager.exe");
+        let error = unpack(&bundle(&[(format!("{BUNDLE}/README.md").as_str(), "")]), folder.path()).unwrap_err();
+        assert_eq!(error, "The download does not contain Rojo Manager");
         assert!(check_digest(b"data", Some("sha256:00")).is_err());
         assert!(check_digest(b"data", None).is_ok());
     }

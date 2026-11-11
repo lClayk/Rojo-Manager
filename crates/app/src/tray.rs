@@ -1,5 +1,6 @@
-//! The tray icon: a menu to run each project's server without opening the window, a status dot,
-//! and Windows notifications. A left click shows the window.
+//! The tray (Windows) or menu bar (macOS) icon: a menu to run each project's server without
+//! opening the window, a status dot, and system notifications. On Windows a left click shows the
+//! window; on macOS any click opens the menu, as menu bar icons do.
 
 use std::sync::LazyLock;
 
@@ -32,12 +33,13 @@ pub fn guid() -> u128 {
 
 pub fn build(guid: u128) -> Result<TrayIcon, Box<dyn std::error::Error>> {
     // An icon left behind by a crashed run would make adding this GUID again fail.
+    #[cfg(windows)]
     shell_notify(guid, None, windows::Win32::UI::Shell::NIM_DELETE, |_| {});
     Ok(TrayIconBuilder::new()
         .with_id("tray")
         .with_guid(guid)
         .with_tooltip("Rojo Manager")
-        .with_menu_on_left_click(false)
+        .with_menu_on_left_click(cfg!(target_os = "macos"))
         .with_icon(icon(None)?)
         .build()?)
 }
@@ -59,12 +61,18 @@ pub fn apply(
         }
     }
     tray.set_icon(Some(icon(state.status.then(|| dot(&state.projects)).flatten())?))?;
-    // tray-icon's set_tooltip leaves out the GUID, which Windows needs to find this icon.
     let text = tooltip(&state.projects);
+    // tray-icon's set_tooltip leaves out the GUID, which Windows needs to find this icon.
+    #[cfg(windows)]
     shell_notify(guid, Some(tray), windows::Win32::UI::Shell::NIM_MODIFY, |data| {
         data.uFlags |= windows::Win32::UI::Shell::NIF_TIP | windows::Win32::UI::Shell::NIF_SHOWTIP;
         copy_into(&mut data.szTip, &text);
     });
+    #[cfg(not(windows))]
+    {
+        let _ = guid;
+        tray.set_tooltip(Some(text))?;
+    }
     Ok(())
 }
 
@@ -232,7 +240,8 @@ fn badged(color: Option<u32>) -> RgbaImage {
     image
 }
 
-/// Show a Windows notification from the tray icon. Quiet hours and Focus are respected.
+/// Show a notification from the tray icon. Quiet hours and Focus are respected.
+#[cfg(windows)]
 pub fn notify(tray: &TrayIcon, guid: u128, title: &str, text: &str) {
     use windows::Win32::UI::Shell::{NIF_INFO, NIIF_RESPECT_QUIET_TIME, NIIF_WARNING, NIM_MODIFY};
     shell_notify(guid, Some(tray), NIM_MODIFY, |data| {
@@ -243,7 +252,14 @@ pub fn notify(tray: &TrayIcon, guid: u128, title: &str, text: &str) {
     });
 }
 
+/// Show a notification in Notification Center.
+#[cfg(target_os = "macos")]
+pub fn notify(_: &TrayIcon, _: u128, title: &str, text: &str) {
+    crate::platform::notify(title, text);
+}
+
 /// Shell_NotifyIconW on the icon with this GUID.
+#[cfg(windows)]
 fn shell_notify(
     guid: u128,
     tray: Option<&TrayIcon>,
@@ -267,6 +283,7 @@ fn shell_notify(
 }
 
 /// Copy `text` into a fixed UTF-16 buffer, cut to fit and NUL-terminated.
+#[cfg(windows)]
 fn copy_into(buffer: &mut [u16], text: &str) {
     let units: Vec<u16> = text.encode_utf16().take(buffer.len() - 1).collect();
     buffer[..units.len()].copy_from_slice(&units);
@@ -276,7 +293,10 @@ fn copy_into(buffer: &mut [u16], text: &str) {
 /// Route tray clicks and menu picks to the tray app. Set once; it covers every tray icon built later.
 pub fn forward_events() {
     TrayIconEvent::set_event_handler(Some(|event| {
-        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+        let show =
+            matches!(event, TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. });
+        // On macOS a click opens the menu instead.
+        if show && cfg!(windows) {
             host::post(Msg::Show);
         }
     }));
@@ -320,6 +340,8 @@ mod tests {
     }
 
     #[test]
+    // macOS only builds menus on the main thread, which tests do not run on.
+    #[cfg(not(target_os = "macos"))]
     fn the_menu_lists_projects_with_their_state_and_linked_places() {
         use tray_icon::menu::MenuItemKind;
         let lobby = TrayProject { linked: true, ..project("Lobby & Co", ServerState::Serving) };
@@ -375,6 +397,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn notification_text_is_cut_to_fit_and_terminated() {
         let mut buffer = [1u16; 4];
         copy_into(&mut buffer, "abcdef");

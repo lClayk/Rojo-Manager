@@ -22,3 +22,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Hides the console window a GUI process would otherwise flash when it starts a console program.
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `name` as an executable file name: "name.exe" on Windows, "name" elsewhere.
+pub fn executable(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
