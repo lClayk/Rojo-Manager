@@ -286,7 +286,12 @@ local function forwardOutput(app, context: string)
 		if #pending >= MAX_OUTPUT_LINES then
 			table.remove(pending, 1)
 		end
-		table.insert(pending, { text = string.sub(text, 1, MAX_OUTPUT_TEXT), kind = OUTPUT_KINDS[messageType] or "output" })
+		-- Cut at a character boundary: half a UTF-8 character would make the whole batch fail to encode.
+		local cut = utf8.offset(text, MAX_OUTPUT_TEXT + 1)
+		if cut then
+			text = string.sub(text, 1, cut - 1)
+		end
+		table.insert(pending, { text = text, kind = OUTPUT_KINDS[messageType] or "output" })
 		if not scheduled then
 			scheduled = true
 			task.delay(OUTPUT_DELAY, send)
