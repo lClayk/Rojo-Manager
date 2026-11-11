@@ -39,6 +39,8 @@ const OUTPUT_CAP: usize = 2000;
 const OUTPUT_TEXT: usize = 2000;
 /// The first bridge version that sends Studio's Output.
 const OUTPUT_BRIDGE: u64 = 8;
+/// The window asks for a star on GitHub once the app has been in use this long.
+const STAR_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,6 +128,8 @@ pub struct Snapshot {
     /// Another Studio MCP set up in an agent ("robloxstudio in Codex"), while the Studio tools are on
     /// and the window has not asked whether to keep them.
     pub studio_tools_prompt: Option<String>,
+    /// Ask for a star on GitHub; see `star_due`.
+    pub star_prompt: bool,
 }
 
 fn version() -> &'static str {
@@ -406,6 +410,18 @@ fn serves_project(project: &config::Project) -> Option<bool> {
     Some(name.is_none_or(|name| name == info.project_name))
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}
+
+/// Whether to ask for a star: not asked before, projects added, and in use for STAR_AFTER.
+fn star_due(config: &Config, now: u64) -> bool {
+    !config.star_asked
+        && !config.projects.is_empty()
+        && config.first_run > 0
+        && now.saturating_sub(config.first_run) >= STAR_AFTER.as_secs()
+}
+
 /// Hide a Rojo process's console on Windows. On macOS, run it in its own process group: Rokit's
 /// shim starts the real rojo as an ordinary child there, and `end_server` ends the whole group.
 fn own_group(command: &mut Command) {
@@ -455,6 +471,7 @@ impl Engine {
     pub fn run(self: &Arc<Self>) {
         let engine = Arc::clone(self);
         std::thread::spawn(move || engine.watch());
+        self.record_first_run();
         self.check_rojo(false);
         let auto_update = self.settings().auto_update;
         self.check_app_update(false, auto_update);
@@ -552,6 +569,10 @@ impl Engine {
     pub fn snapshot(&self) -> Snapshot {
         let state = self.lock();
         let projects = state.config.projects.iter().filter_map(|p| Self::view(&state, &p.name)).collect();
+        let studio_tools_prompt = state
+            .other_studio_mcp
+            .clone()
+            .filter(|_| state.config.settings.studio_tools && !state.config.studio_tools_asked);
         Snapshot {
             version: crate::VERSION,
             projects,
@@ -579,10 +600,9 @@ impl Engine {
             studio_rojo_plugins: state.studio_rojo_plugins,
             mcp_path: self.app_dir.join(crate::executable("RojoManagerMCP")).display().to_string(),
             collapsed: state.config.collapsed.clone(),
-            studio_tools_prompt: state
-                .other_studio_mcp
-                .clone()
-                .filter(|_| state.config.settings.studio_tools && !state.config.studio_tools_asked),
+            // One question at a time.
+            star_prompt: studio_tools_prompt.is_none() && star_due(&state.config, unix_now()),
+            studio_tools_prompt,
         }
     }
 
@@ -1356,6 +1376,31 @@ impl Engine {
         Ok(())
     }
 
+    /// Remember when this profile first ran, for the star prompt.
+    fn record_first_run(&self) {
+        let mut state = self.lock();
+        if state.config.first_run != 0 {
+            return;
+        }
+        let mut config = state.config.clone();
+        config.first_run = unix_now();
+        if config::save(&config).is_ok() {
+            state.config = config;
+        }
+    }
+
+    /// The star prompt was answered, either way; it is not shown again.
+    pub fn answer_star(&self) -> Result<(), String> {
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        config.star_asked = true;
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
     /// Show or hide an experience's places in the window.
     pub fn set_collapsed(&self, universe_id: u64, collapsed: bool) -> Result<(), String> {
         let mut state = self.lock();
@@ -1943,6 +1988,28 @@ mod tests {
         assert_eq!(read(3, OutputKind::Output, 100), json!({"lines": [], "next": 3}));
         assert_eq!(engine.studio_output("2", 0, OutputKind::Output, 100).unwrap_err().status, 409);
         assert_eq!(engine.studio_output("9", 0, OutputKind::Output, 100).unwrap_err().status, 404);
+    }
+
+    #[test]
+    fn the_star_prompt_waits_for_projects_and_three_days_and_asks_once() {
+        let project = config::Project {
+            name: "MyGame".into(),
+            path: "C:\\Games\\MyGame".into(),
+            project_file: "default.project.json".into(),
+            port: FIRST_PORT,
+            autostart: false,
+            auto_connect: false,
+            place: None,
+            sourcemap: false,
+        };
+        let day = 24 * 60 * 60;
+        let mut config = Config { projects: vec![project], first_run: 10 * day, ..Config::default() };
+        assert!(!star_due(&config, 12 * day));
+        assert!(star_due(&config, 13 * day));
+        config.star_asked = true;
+        assert!(!star_due(&config, 13 * day));
+        let empty = Config { first_run: 10 * day, ..Config::default() };
+        assert!(!star_due(&empty, 13 * day));
     }
 
     #[test]

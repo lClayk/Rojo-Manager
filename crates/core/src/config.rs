@@ -141,6 +141,16 @@ pub struct Config {
     /// The window asked whether to keep the Studio tools beside another Studio MCP.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub studio_tools_asked: bool,
+    /// When this profile first ran (Unix seconds), so the star prompt waits until the app is in use.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub first_run: u64,
+    /// The window asked for a star on GitHub.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub star_asked: bool,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Config {
@@ -251,7 +261,9 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         _ => Vec::new(),
     };
     let studio_tools_asked = object.get("studio_tools_asked").and_then(Value::as_bool).unwrap_or(false);
-    Ok(Config { projects, settings, collapsed, studio_tools_asked })
+    let first_run = object.get("first_run").and_then(Value::as_u64).unwrap_or(0);
+    let star_asked = object.get("star_asked").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Config { projects, settings, collapsed, studio_tools_asked, first_run, star_asked })
 }
 
 /// Read config.json; a missing file is an empty config. A malformed file is reported, never overwritten.

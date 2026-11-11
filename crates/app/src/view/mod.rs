@@ -394,18 +394,45 @@ impl MainView {
             .child(action)
     }
 
-    /// A small card in the top right, until answered: another Studio MCP already gives agents
-    /// execute_luau, so offer to hide Rojo Manager's copy.
-    fn render_studio_tools_prompt(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
-        let server = snapshot.studio_tools_prompt.as_ref()?;
-        let answer = |keep: bool| cx.listener(move |this: &mut Self, _, _, cx| this.answer_studio_tools(keep, cx));
+    /// A small card in the top right with one question, until answered: another Studio MCP already
+    /// gives agents execute_luau, so offer to hide Rojo Manager's copy; or, once the app has been in
+    /// use for a while, ask for a star on GitHub.
+    fn render_prompt(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+        let (title, message, (no_id, no), (yes_id, yes), answer): (
+            _,
+            _,
+            _,
+            _,
+            fn(&mut Self, bool, &mut Context<Self>),
+        ) = if let Some(server) = &snapshot.studio_tools_prompt {
+            (
+                "Duplicate Studio tools",
+                format!("{server} has them too. Hide Rojo Manager's copy?"),
+                ("studio-tools-keep", "Keep"),
+                ("studio-tools-hide", "Hide"),
+                |this, hide, cx| this.answer_studio_tools(!hide, cx),
+            )
+        } else if snapshot.star_prompt {
+            (
+                "Enjoying Rojo Manager?",
+                "A star on GitHub helps other Roblox developers find it.".to_string(),
+                ("star-never", "Don't ask again"),
+                ("star-open", "Star on GitHub"),
+                |this, star, cx| this.answer_star(star, cx),
+            )
+        } else {
+            return None;
+        };
+        let on_click = |choice: bool| cx.listener(move |this: &mut Self, _, _, cx| answer(this, choice, cx));
+        // As wide as the card's buttons need (the font is bundled), so its text is no wider than they are.
+        let width = if snapshot.studio_tools_prompt.is_some() { 280. } else { 257. };
         Some(
             div()
                 .absolute()
                 .occlude()
                 .top(px(TITLE_BAR + 8.))
                 .right(px(12.))
-                .w(px(280.))
+                .w(px(width))
                 .flex()
                 .flex_col()
                 .gap(px(10.))
@@ -419,37 +446,31 @@ impl MainView {
                         .flex()
                         .flex_col()
                         .gap(px(4.))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Duplicate Studio tools"))
-                        .child(
-                            div()
-                                .text_size(TEXT_SM)
-                                .text_color(rgb(MUTED))
-                                .child(format!("{server} has them too. Hide Rojo Manager's copy?")),
-                        ),
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                        .child(div().text_size(TEXT_SM).text_color(rgb(MUTED)).child(message)),
                 )
                 .child(
                     div()
                         .flex()
                         .justify_end()
                         .gap(px(8.))
-                        .child(
-                            Button::new("studio-tools-keep")
-                                .label("Keep")
-                                .variant(Variant::Ghost)
-                                .on_click(answer(true)),
-                        )
-                        .child(
-                            Button::new("studio-tools-hide")
-                                .label("Hide")
-                                .variant(Variant::Primary)
-                                .on_click(answer(false)),
-                        ),
+                        .child(Button::new(no_id).label(no).variant(Variant::Ghost).on_click(on_click(false)))
+                        .child(Button::new(yes_id).label(yes).variant(Variant::Primary).on_click(on_click(true))),
                 ),
         )
     }
 
     fn answer_studio_tools(&mut self, keep: bool, cx: &mut Context<Self>) {
         self.run(cx, move |engine| engine.answer_studio_tools(keep), |_, (), _| {});
+    }
+
+    /// Either answer ends the star prompt; `star` also opens the repository.
+    fn answer_star(&mut self, star: bool, cx: &mut Context<Self>) {
+        use rojo_manager_core::updates::REPO_URL;
+        if star && rojo_manager_core::shell::open(REPO_URL).is_err() {
+            self.notify(format!("Open {REPO_URL} in your browser."), cx);
+        }
+        self.run(cx, |engine| engine.answer_star(), |_, (), _| {});
     }
 
     fn render_banners(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Vec<Div> {
@@ -747,7 +768,7 @@ impl Render for MainView {
             .children(banners)
             .child(list)
             .child(self.render_footer(&snapshot))
-            .children((top == 0).then(|| self.render_studio_tools_prompt(&snapshot, cx)).flatten())
+            .children((top == 0).then(|| self.render_prompt(&snapshot, cx)).flatten())
             .when(self.settings_open, |root| root.child(tabbable(top == 1, || settings::render(self, &snapshot, cx))))
             .when(self.tools_open, |root| {
                 root.child(tabbable(top == 2, || settings::render_tools(self, &snapshot, cx)))
