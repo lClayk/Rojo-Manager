@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use rojo_manager_core::config::{self, Place};
 use rojo_manager_core::control::{self, RequestError};
-use rojo_manager_core::rojo_api;
 use rojo_manager_core::studio::{self, ResolveError};
 use serde_json::Value;
 
@@ -22,8 +21,6 @@ pub trait Backend: Sync {
     ) -> Result<Value, RequestError>;
     /// Start Rojo Manager hidden, detached from this process.
     fn launch_manager(&self) -> io::Result<()>;
-    /// Whether a Rojo server answers on this port; the manager's watcher can lag a restart.
-    fn rojo_answers(&self, port: u16) -> bool;
     /// Whether agents get get_connected_instances and execute_luau (the studio_tools setting).
     fn studio_tools(&self) -> bool;
     /// Look up the place and universe IDs for a place ID or link.
@@ -64,10 +61,6 @@ impl Backend for Core {
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         command.spawn()?;
         Ok(())
-    }
-
-    fn rojo_answers(&self, port: u16) -> bool {
-        rojo_api::server_info(port, Duration::from_secs(1)).is_some()
     }
 
     /// Read from the settings file, so listing tools does not start the manager.

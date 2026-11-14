@@ -257,6 +257,13 @@ def check(app_dir: Path) -> None:
             mcp.call("manage_project", action="remove", project="MyGame-lane")
             assert "MyGame-lane" not in [p["name"] for p in mcp.call("list_projects")["projects"]]
 
+            # Connect waits in Studio until Rojo has connected, and answers with that.
+            mcp.call("rojo_session", project="MyGame", action="disconnect")
+            events.expect("disconnect")
+            reconnected = mcp.call("rojo_session", project="MyGame", action="connect")
+            assert reconnected["rojo"]["status"] == "Connected", reconnected
+            events.expect(f"connect {PORT}")
+
             # Agent Luau runs in the bridge and comes back with what it printed and returned.
             ran = mcp.call("execute_luau", instance_id=instance, code="print('from agent') return 40 + 2")
             assert ran["returnValue"] == 42 and ran["output"] == ["from agent"], ran

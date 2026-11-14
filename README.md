@@ -85,9 +85,9 @@ AI agents can run your Rojo servers, open places in Studio, connect or disconnec
 | Tool | What it does |
 | --- | --- |
 | `list_projects` | Projects with server state, port, linked place, and Rojo status in any Studio that has the place open |
-| `rojo_server` | Starts, stops, or restarts a project's Rojo server |
+| `rojo_server` | Starts, stops, or restarts a project's Rojo server, and answers once the server responds or has stopped |
 | `open_place` | Opens a project's place, or any place ID or link, in Studio, building a local place first if needed. Passing both a project and a place links them. `connect_rojo` also starts the server and connects Rojo |
-| `rojo_session` | Connects or disconnects Rojo in an open place, reads its status, or accepts or aborts Rojo's initial sync confirmation. While Rojo waits for that confirmation, the status summarizes what accepting would add, change, and remove, and warns about removing instances that exist only in Studio |
+| `rojo_session` | Connects or disconnects Rojo in an open place (connect answers once Rojo has connected or asks to confirm), reads its status, or accepts or aborts Rojo's initial sync confirmation. While Rojo waits for that confirmation, the status summarizes what accepting would add, change, and remove, and warns about removing instances that exist only in Studio |
 | `lane` | Gives an agent an isolated Studio for parallel work. `create` makes a temporary project from a copy of a project, such as a git worktree, with a local place of its own, then opens it in Studio, starts its server, connects Rojo, and accepts the first sync. `remove` closes that Studio, stops the server, and deletes the place |
 | `server_logs` | Reads a project's recent Rojo output, such as sync errors or why the server stopped |
 | `studio_output` | Reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a playtest's server, filtered by level and read on from the last line seen |

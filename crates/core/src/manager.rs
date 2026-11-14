@@ -451,6 +451,8 @@ pub struct Engine {
     app_dir: PathBuf,
     closing: AtomicBool,
     wake: (Mutex<bool>, Condvar),
+    /// Counts snapshot changes, so `wait_until` can sleep until the next one.
+    changes: (Mutex<u64>, Condvar),
     /// Commands on their way to the bridges in Studio.
     link: Link,
 }
@@ -572,6 +574,7 @@ impl Engine {
             app_dir,
             closing: AtomicBool::new(false),
             wake: (Mutex::new(false), Condvar::new()),
+            changes: (Mutex::new(0), Condvar::new()),
             link: Link::default(),
         })
     }
@@ -636,7 +639,44 @@ impl Engine {
     }
 
     fn changed(&self) {
+        *self.changes.0.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.changes.1.notify_all();
         (self.emit)(Event::Changed);
+    }
+
+    /// Block until `done` holds or `timeout` passes; false on timeout. Checks after each change, and
+    /// at least every 250 ms, since a server can begin answering without one. Costs nothing while
+    /// no one waits.
+    fn wait_until(&self, timeout: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = *self.changes.0.lock().unwrap_or_else(|p| p.into_inner());
+            if done() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let guard = self.changes.0.lock().unwrap_or_else(|p| p.into_inner());
+            let slice = (deadline - now).min(Duration::from_millis(250));
+            let _ = self.changes.1.wait_timeout_while(guard, slice, |count| *count == seen);
+        }
+    }
+
+    /// Wait for a start, restart, or stop to finish: a server that answers, or none.
+    fn wait_for_server(&self, name: &str, action: &str) {
+        let stop = action == "stop";
+        let timeout = Duration::from_secs(if stop { 10 } else { 30 });
+        self.wait_until(timeout, || {
+            let Some(project) = self.project(name) else { return true };
+            match project.state {
+                ServerState::Off | ServerState::Blocked => true,
+                ServerState::Starting => false,
+                _ if stop => false,
+                _ => rojo_api::server_info(project.port, Duration::from_millis(500)).is_some(),
+            }
+        });
     }
 
     pub fn notice(&self, message: impl Into<String>) {
@@ -1179,7 +1219,12 @@ impl Engine {
             .ok()
             .filter(|id| self.lock().bridges.get(id).is_some_and(|report| self.bridge_live(*id, report)));
         let id = id.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
-        let timeout = if action == "luau" { LUAU_TIMEOUT } else { Duration::from_secs(15) };
+        let timeout = match action {
+            "luau" => LUAU_TIMEOUT,
+            // The bridge waits up to 30 seconds for Rojo to connect.
+            "connect" if args.get("wait") == Some(&Value::Bool(true)) => Duration::from_secs(40),
+            _ => Duration::from_secs(15),
+        };
         self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
     }
 
@@ -2041,6 +2086,17 @@ impl ControlHandler for Control {
             return Err(ControlError::new(missing(name), 404));
         };
         let reply = |name: &str| Ok(json!({ "project": engine.agent_view(name) }));
+        // With "wait", start, restart, and stop answer once the server is up or gone.
+        let wait = match body.get("wait") {
+            None | Some(Value::Null) => false,
+            Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("wait must be a bool"))?,
+        };
+        let waited = |name: &str| {
+            if wait {
+                engine.wait_for_server(name, action);
+            }
+            reply(name)
+        };
         match action {
             "update" | "link-place" => {
                 let (mut update, place) = parse_update(action, body)?;
@@ -2077,17 +2133,17 @@ impl ControlHandler for Control {
                         .map_err(|e| ControlError::new(format!("Rojo could not be started. {e}"), 409))?;
                 }
                 engine.notice(format!("{name}: start requested by an agent"));
-                reply(name)
+                waited(name)
             }
             "stop" => {
                 engine.stop(name);
                 engine.notice(format!("{name}: stop requested by an agent"));
-                reply(name)
+                waited(name)
             }
             "restart" => {
                 engine.restart(name).map_err(|e| ControlError::new(e, 409))?;
                 engine.notice(format!("{name}: restart requested by an agent"));
-                reply(name)
+                waited(name)
             }
             "open-studio" => {
                 let status = if view.place.is_none() { 409 } else { 500 };
@@ -2456,6 +2512,25 @@ mod tests {
         assert_eq!(pending().unwrap().summary, None);
         engine.report_bridge(7, 100, None, 0, json!({"status": "Connected", "port": "34880"}));
         assert_eq!(pending(), None);
+    }
+
+    #[test]
+    fn waiting_wakes_on_a_change_and_gives_up_at_the_timeout() {
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let (engine, flag) = (Arc::clone(&engine), Arc::clone(&flag));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+                engine.changed();
+            })
+        };
+        let started = Instant::now();
+        assert!(engine.wait_until(Duration::from_secs(5), || flag.load(Ordering::SeqCst)));
+        assert!(started.elapsed() < Duration::from_millis(240)); // woken by the change, not the slice
+        setter.join().unwrap();
+        assert!(!engine.wait_until(Duration::from_millis(100), || false));
     }
 
     #[test]

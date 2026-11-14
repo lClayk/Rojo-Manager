@@ -25,7 +25,7 @@ local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 10
+local VERSION = 11
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
@@ -48,6 +48,9 @@ local MAX_POLL_BYTES = 1024 * 1024
 local DEFAULT_PORT = 34872
 -- Paths a pending sync summary lists per kind of change.
 local MAX_PENDING_PATHS = 20
+-- How long connect with wait waits for Rojo to connect, ask to confirm, or fail.
+local CONNECT_WAIT = 30
+local SETTLED = { Connected = true, Confirming = true, Error = true }
 
 -- game.Name for an unpublished place, which Rojo Manager matches to a local place's file.
 local function placeName(): string?
@@ -216,13 +219,22 @@ end
 
 local actions = {
 	status = status,
-	-- Connect Rojo to the Rojo server on this computer at args.port.
+	-- Connect Rojo to the Rojo server on this computer at args.port. With args.wait, return once Rojo
+	-- connects, asks to confirm the initial sync, or fails, instead of at once.
 	connect = function(app, args)
 		endSession(app)
+		-- A stale error would read as this attempt's outcome; clear it as Rojo's Okay button does.
+		if (app.state or {}).appStatus == "Error" then
+			app:setState({ appStatus = "NotConnected" })
+		end
 		app.setHost("localhost")
 		app.setPort(tostring(args.port))
-		-- Starting can yield on the sync lock; return so the caller can poll status.
+		-- Starting can yield on the sync lock, so it runs on its own thread.
 		task.spawn(app.startSession, app)
+		local deadline = os.clock() + CONNECT_WAIT
+		while args.wait == true and not SETTLED[status(app).status] and os.clock() < deadline do
+			task.wait(0.1)
+		end
 		return status(app)
 	end,
 	disconnect = function(app)

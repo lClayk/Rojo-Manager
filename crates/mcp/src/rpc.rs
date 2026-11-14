@@ -16,7 +16,8 @@ use crate::tools;
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Roblox projects.
 - list_projects shows each project's server state, linked place, and whether that place is open in Studio.
-- rojo_server starts, stops, or restarts a project's Rojo server.
+- rojo_server starts, stops, or restarts a project's Rojo server, and waits until it answers or is gone, so there
+  is no need to poll list_projects; rojo_session connect likewise waits until Rojo connects or asks to confirm.
 - open_place opens a project's place in Roblox Studio; connect_rojo=true also starts the server and connects Rojo.
   Passing both project and place links that place to the project first. place=local gives a project a local
   place: an unpublished file Rojo Manager builds from the project with rojo build, named by its placeFile.

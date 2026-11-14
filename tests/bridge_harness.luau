@@ -224,6 +224,13 @@ app = {
 	setPort = function(newPort)
 		app.port.current = newPort
 	end,
+	setState = function(self, changes)
+		local state = table.clone(self.state)
+		for key, value in changes do
+			state[key] = value
+		end
+		self.state = state
+	end,
 	startSession = function()
 		app.serveSession = {
 			getStatus = function()
