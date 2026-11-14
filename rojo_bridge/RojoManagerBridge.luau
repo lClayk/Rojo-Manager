@@ -5,7 +5,8 @@
 -- patch_rojo_plugin.luau adds this module to the official Rojo plugin on the user's machine.
 -- In Edit mode it polls Rojo Manager on a fixed local port without pause. Each poll reports the
 -- place, the server Rojo is connected to, and Rojo's status, so Rojo Manager shows Connected only for
--- real sessions. Rojo Manager holds the poll until it has a command for this Studio, or a few seconds.
+-- real sessions. An unpublished place (PlaceId 0) is named by game.Name, which Studio sets to the
+-- file name of a local place. Rojo Manager holds the poll until it has a command for this Studio, or a few seconds.
 --
 -- The answer names the server of a running project with auto-connect linked to this place; the
 -- bridge connects when that offer appears, accepting Rojo's initial sync prompt unless Rojo
@@ -22,7 +23,7 @@ local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 8
+local VERSION = 9
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
@@ -43,6 +44,11 @@ local RETRY_SECONDS = 5
 local MAX_POLL_BYTES = 1024 * 1024
 -- Rojo's port when its port field is empty.
 local DEFAULT_PORT = 34872
+
+-- game.Name for an unpublished place, which Rojo Manager matches to a local place's file.
+local function placeName(): string?
+	return if game.PlaceId == 0 then game.Name else nil
+end
 
 -- The attached app's current poll loop, so a detached or reattached app's loop stops.
 local attached: { [any]: {} } = {}
@@ -200,7 +206,13 @@ local function poll(app, token: {})
 	local result = nil
 	while attached[app] == token do
 		local started = os.clock()
-		local report = { placeId = game.PlaceId, port = connectedPort(app), rojo = status(app), result = result }
+		local report = {
+			placeId = game.PlaceId,
+			placeName = placeName(),
+			port = connectedPort(app),
+			rojo = status(app),
+			result = result,
+		}
 		local encoded, json = pcall(HttpService.JSONEncode, HttpService, report)
 		if result and (not encoded or #json > MAX_POLL_BYTES) then
 			local problem = if encoded
@@ -270,6 +282,7 @@ local function forwardOutput(app, context: string)
 		pending = {}
 		local ok, json = pcall(HttpService.JSONEncode, HttpService, {
 			placeId = game.PlaceId,
+			placeName = placeName(),
 			context = context,
 			lines = lines,
 		})

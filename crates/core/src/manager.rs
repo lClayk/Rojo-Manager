@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::config::{self, Config, Place, Settings};
+use crate::config::{self, Config, LocalPlace, Place, PlaceLink, Settings};
 use crate::control::{BridgePoll, ControlError, ControlHandler, OutputContext, OutputKind, StudioOutput};
 use crate::localnet::{self, port_in_use};
 use crate::studio::{self, ResolveError};
@@ -39,6 +39,8 @@ const OUTPUT_CAP: usize = 2000;
 const OUTPUT_TEXT: usize = 2000;
 /// The first bridge version that sends Studio's Output.
 const OUTPUT_BRIDGE: u64 = 8;
+/// The longest unpublished place name kept from a bridge; local place files are much shorter.
+const MAX_PLACE_NAME: usize = 255;
 /// The window asks for a star on GitHub once the app has been in use this long.
 const STAR_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
@@ -74,7 +76,7 @@ pub struct ProjectView {
     pub port: u16,
     pub autostart: bool,
     pub auto_connect: bool,
-    pub place: Option<Place>,
+    pub place: Option<PlaceLink>,
     /// The linked place's experience name, once looked up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experience: Option<String>,
@@ -166,8 +168,16 @@ pub struct Update {
     pub auto_connect: Option<bool>,
     /// Missing keeps the place; `null` unlinks it.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-    pub place: Option<Option<Place>>,
+    pub place: Option<Option<PlaceChoice>>,
     pub sourcemap: Option<bool>,
+}
+
+/// A place to link: a published place, or a local place file, which the engine names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaceChoice {
+    Published(Place),
+    Local,
 }
 
 /// A field that is present, even as `null`, is `Some`.
@@ -275,8 +285,8 @@ struct State {
     experiences: HashMap<u64, String>,
     /// Another Studio MCP set up in an agent, found at launch.
     other_studio_mcp: Option<String>,
-    /// Studio's recent Output by place, from its Edit DataModel and playtests.
-    output: HashMap<u64, VecDeque<OutputLine>>,
+    /// Studio's recent Output by place (ID, and name when unpublished), from its Edit DataModel and playtests.
+    output: HashMap<(u64, Option<String>), VecDeque<OutputLine>>,
     output_seq: u64,
 }
 
@@ -294,6 +304,8 @@ pub struct OutputLine {
 /// What a Studio bridge last said and was told.
 struct BridgeReport {
     place_id: u64,
+    /// `game.Name` of an unpublished place (place ID 0): the file name of a local place.
+    place_name: Option<String>,
     /// The server its Rojo is connected to, or 0.
     port: u16,
     /// The Rojo plugin's status, as the bridge describes it.
@@ -305,10 +317,10 @@ struct BridgeReport {
 
 impl State {
     /// The running server whose project auto-connects to this place: (project name, port).
-    fn auto_connect_target(&self, place_id: u64) -> Option<(String, u16)> {
+    fn auto_connect_target(&self, place_id: u64, place_name: Option<&str>) -> Option<(String, u16)> {
         let project = self.config.projects.iter().find(|p| {
             p.auto_connect
-                && p.place.is_some_and(|place| place.place_id == place_id)
+                && p.place.as_ref().is_some_and(|place| place.matches(place_id, place_name))
                 && self.states.get(&p.name).is_some_and(|s| s.running())
         })?;
         Some((project.name.clone(), project.port))
@@ -561,10 +573,14 @@ impl Engine {
             port: p.port,
             autostart: p.autostart,
             auto_connect: p.auto_connect,
-            place: p.place,
+            place: p.place.clone(),
             sourcemap: p.sourcemap,
             temporary: p.temporary,
-            experience: p.place.and_then(|place| state.experiences.get(&place.universe_id).cloned()),
+            experience: p
+                .place
+                .as_ref()
+                .and_then(PlaceLink::published)
+                .and_then(|place| state.experiences.get(&place.universe_id).cloned()),
             state: state.view_state(&p.name),
             badges: tooling::project_badges(Path::new(&p.path)).into_iter().map(String::from).collect(),
         })
@@ -971,12 +987,20 @@ impl Engine {
     /// show as Connected. Answers with the place's auto-connect server and whether to accept Rojo's
     /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
     /// starting the server connects an open place.
-    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16, rojo: Value) -> Option<(u16, bool)> {
+    pub fn report_bridge(
+        &self,
+        id: u64,
+        place_id: u64,
+        place_name: Option<String>,
+        port: u16,
+        rojo: Value,
+    ) -> Option<(u16, bool)> {
         let (target, previous, accept) = {
             let mut state = self.lock();
-            let target = state.auto_connect_target(place_id);
+            let place_name = place_name.filter(|name| place_id == 0 && name.len() <= MAX_PLACE_NAME);
+            let target = state.auto_connect_target(place_id, place_name.as_deref());
             let offered = target.as_ref().map(|(_, port)| *port);
-            let report = BridgeReport { place_id, port, rojo, offered, seen: Instant::now() };
+            let report = BridgeReport { place_id, place_name, port, rojo, offered, seen: Instant::now() };
             (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept)
         };
         if previous.as_ref().map(|report| report.port) != Some(port) {
@@ -1017,13 +1041,20 @@ impl Engine {
         report.seen.elapsed() < BRIDGE_TTL || self.link.busy(id)
     }
 
-    /// The Studio windows whose bridge polled recently: {instanceId, placeId, rojo}.
+    /// The Studio windows whose bridge polled recently: {instanceId, placeId, placeName, rojo}, with
+    /// placeName only for an unpublished place.
     pub fn studio_instances(&self) -> Vec<Value> {
         let state = self.lock();
         let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
         let mut instances: Vec<(u64, &BridgeReport)> = live.map(|(id, report)| (*id, report)).collect();
         instances.sort_by_key(|(id, _)| *id);
-        let instance = |(id, report): (u64, &BridgeReport)| json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
+        let instance = |(id, report): (u64, &BridgeReport)| {
+            let mut instance = json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
+            if let Some(name) = &report.place_name {
+                instance["placeName"] = json!(name);
+            }
+            instance
+        };
         instances.into_iter().map(instance).collect()
     }
 
@@ -1042,7 +1073,8 @@ impl Engine {
     pub fn report_output(&self, output: StudioOutput) {
         let mut guard = self.lock();
         let state = &mut *guard;
-        let buffer = state.output.entry(output.place_id).or_default();
+        let name = output.place_name.filter(|name| output.place_id == 0 && name.len() <= MAX_PLACE_NAME);
+        let buffer = state.output.entry((output.place_id, name)).or_default();
         for line in output.lines {
             let mut text = line.text;
             if let Some((end, _)) = text.char_indices().nth(OUTPUT_TEXT) {
@@ -1070,7 +1102,7 @@ impl Engine {
         let report = id.and_then(|id| state.bridges.get(&id).filter(|report| self.bridge_live(id, report)));
         let report =
             report.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
-        let buffer = state.output.get(&report.place_id);
+        let buffer = state.output.get(&(report.place_id, report.place_name.clone()));
         let bridge = report.rojo.get("bridge").and_then(Value::as_u64).unwrap_or(0);
         if buffer.is_none() && bridge < OUTPUT_BRIDGE {
             return Err(ControlError::new(
@@ -1285,11 +1317,13 @@ impl Engine {
         Ok(name)
     }
 
-    /// Look up a place ID or link with Roblox; empty text means "unlink". Call before `update`.
-    pub fn resolve_place(text: &str) -> Result<Option<Place>, ResolveError> {
+    /// Look up a place ID or link with Roblox; empty text means "unlink", and "local" a local place
+    /// file. Call before `update`.
+    pub fn resolve_place(text: &str) -> Result<Option<PlaceChoice>, ResolveError> {
         match text.trim() {
             "" => Ok(None),
-            text => studio::resolve_place(text).map(Some),
+            text if text.eq_ignore_ascii_case("local") => Ok(Some(PlaceChoice::Local)),
+            text => studio::resolve_place(text).map(|place| Some(PlaceChoice::Published(place))),
         }
     }
 
@@ -1297,14 +1331,23 @@ impl Engine {
     pub fn update(self: &Arc<Self>, name: &str, update: Update) -> Result<ProjectView, String> {
         let mut state = self.lock();
         let project = state.config.project(name).cloned().ok_or_else(|| missing(name))?;
-        let linked = update.place.unwrap_or(project.place);
+        let new_name = update.name.as_deref().map(str::trim).unwrap_or(name).to_string();
+        let linked = match update.place {
+            None => project.place.clone(),
+            Some(None) => None,
+            Some(Some(PlaceChoice::Published(place))) => Some(PlaceLink::Published(place)),
+            // A project that already has a local place keeps its file.
+            Some(Some(PlaceChoice::Local)) => match &project.place {
+                Some(local @ PlaceLink::Local(_)) => Some(local.clone()),
+                _ => Some(PlaceLink::Local(LocalPlace::new(&new_name))),
+            },
+        };
         if update.auto_connect == Some(true) && linked.is_none() {
             return Err("Auto-connect needs a linked place.".into());
         }
         if update.autostart == Some(true) && project.temporary {
             return Err("A temporary project does not autostart. Keep it first.".into());
         }
-        let new_name = update.name.as_deref().map(str::trim).unwrap_or(name).to_string();
         if new_name != name {
             if new_name.is_empty() {
                 return Err("Project name cannot be empty".into());
@@ -1357,7 +1400,7 @@ impl Engine {
             None => {}
         }
         self.changed();
-        if view.place.is_some() && view.experience.is_none() {
+        if view.place.as_ref().is_some_and(|place| place.published().is_some()) && view.experience.is_none() {
             self.look_up_experiences();
         }
         Ok(view)
@@ -1369,7 +1412,8 @@ impl Engine {
         std::thread::spawn(move || {
             let missing: HashSet<u64> = {
                 let state = engine.lock();
-                let linked = state.config.projects.iter().filter_map(|p| p.place).map(|place| place.universe_id);
+                let linked = state.config.projects.iter().filter_map(|p| p.place.as_ref()?.published());
+                let linked = linked.map(|place| place.universe_id);
                 linked.filter(|id| !state.experiences.contains_key(id)).collect()
             };
             for universe_id in missing {
@@ -1469,11 +1513,53 @@ impl Engine {
         Ok(())
     }
 
-    pub fn open_studio(&self, name: &str) -> Result<Place, String> {
-        let place = self.lock().config.project(name).ok_or_else(|| missing(name))?.place;
+    /// Open the project's place in Studio. A local place is built first when its file is missing,
+    /// so what Studio saves into it is kept.
+    pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
+        let project = self.lock().config.project(name).cloned().ok_or_else(|| missing(name))?;
+        let place = project.place.clone();
         let place = place.ok_or_else(|| format!("{name} has no linked place. Set one in Rojo Manager."))?;
-        studio::open_place(&place).map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
+        let opened = match &place {
+            PlaceLink::Published(place) => studio::open_place(place),
+            PlaceLink::Local(local) => {
+                let path = local.path();
+                if !path.is_file() {
+                    self.build_place(&project, &path)?;
+                }
+                crate::shell::open(&path.to_string_lossy())
+            }
+        };
+        opened.map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
         Ok(place)
+    }
+
+    /// Build the project into a place file with `rojo build`; its output goes to the project's log.
+    fn build_place(&self, project: &config::Project, path: &Path) -> Result<(), String> {
+        let rojo = tooling::find_tool("Rojo").ok_or("Rojo is not installed.")?;
+        let folder = path.parent().ok_or("Invalid place folder")?;
+        std::fs::create_dir_all(folder).map_err(|e| format!("Could not create {}: {e}", folder.display()))?;
+        let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        self.log(&project.name, &format!("$ rojo build {} --output {file}", project.project_file));
+        let mut command = Command::new(rojo);
+        command
+            .arg("build")
+            .arg(Path::new(&project.path).join(&project.project_file))
+            .arg("--output")
+            .arg(path)
+            .current_dir(&project.path)
+            .stdin(std::process::Stdio::null());
+        own_group(&mut command);
+        let output = command.output().map_err(|e| format!("Could not run Rojo: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            self.log(&project.name, line);
+        }
+        if output.status.success() && path.is_file() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(path); // a half-written file would be opened next time
+        let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output");
+        Err(format!("Could not build {}'s place: {}", project.name, strip_ansi(last)))
     }
 
     pub fn open_folder(&self, name: &str) -> Result<(), String> {
@@ -1872,7 +1958,7 @@ impl ControlHandler for Control {
     }
 
     fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value {
-        let offer = self.0.report_bridge(id, poll.place_id, poll.port, poll.rojo);
+        let offer = self.0.report_bridge(id, poll.place_id, poll.place_name, poll.port, poll.rojo);
         let result = poll.result.map(|result| {
             let outcome = match result.ok {
                 true => Ok(result.value),
@@ -1953,7 +2039,7 @@ fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Opti
     const FIELDS: &str = "name, port, autostart, autoConnect, place, sourcemap";
     if action == "link-place" {
         let place = body.get("place").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
-        let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link"))?;
+        let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link, or local"))?;
         return Ok((Update::default(), Some(place.to_string())));
     }
     if body.is_empty() {
@@ -2005,11 +2091,25 @@ mod tests {
     #[test]
     fn studio_output_is_read_after_a_cursor_by_level_and_needs_a_new_bridge() {
         let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
-        engine.report_bridge(1, 100, 0, json!({"bridge": OUTPUT_BRIDGE}));
-        engine.report_bridge(2, 200, 0, json!({"bridge": OUTPUT_BRIDGE - 1}));
+        engine.report_bridge(1, 100, None, 0, json!({"bridge": OUTPUT_BRIDGE}));
+        engine.report_bridge(2, 200, None, 0, json!({"bridge": OUTPUT_BRIDGE - 1}));
+        engine.report_bridge(3, 0, Some("Lane-1.rbxl".into()), 0, json!({"bridge": OUTPUT_BRIDGE}));
         let line = |text: &str, kind| crate::control::OutputReport { text: text.into(), kind };
         engine.report_output(StudioOutput {
+            place_id: 0,
+            place_name: Some("Lane-2.rbxl".into()),
+            context: OutputContext::Edit,
+            lines: vec![line("other lane", OutputKind::Output)],
+        });
+        engine.report_output(StudioOutput {
+            place_id: 0,
+            place_name: Some("Lane-1.rbxl".into()),
+            context: OutputContext::Edit,
+            lines: vec![line("lane", OutputKind::Output)],
+        });
+        engine.report_output(StudioOutput {
             place_id: 100,
+            place_name: None,
             context: OutputContext::Server,
             lines: vec![
                 line("hi", OutputKind::Output),
@@ -2022,11 +2122,12 @@ mod tests {
             value["lines"].as_array().unwrap().iter().map(|line| line["text"].as_str().unwrap().into()).collect()
         };
         let all = read(0, OutputKind::Output, 100);
-        assert_eq!(all["next"], 3);
+        assert_eq!(all["next"], 5);
         assert_eq!(all["lines"][0], json!({"context": "server", "kind": "output", "text": "hi"}));
         assert_eq!(texts(read(0, OutputKind::Warning, 100)), ["careful", "boom"]);
-        assert_eq!(texts(read(1, OutputKind::Output, 1)), ["boom"]);
-        assert_eq!(read(3, OutputKind::Output, 100), json!({"lines": [], "next": 3}));
+        assert_eq!(texts(read(3, OutputKind::Output, 1)), ["boom"]);
+        assert_eq!(read(5, OutputKind::Output, 100), json!({"lines": [], "next": 5}));
+        assert_eq!(texts(engine.studio_output("3", 0, OutputKind::Output, 100).unwrap()), ["lane"]);
         assert_eq!(engine.studio_output("2", 0, OutputKind::Output, 100).unwrap_err().status, 409);
         assert_eq!(engine.studio_output("9", 0, OutputKind::Output, 100).unwrap_err().status, 404);
     }
@@ -2075,6 +2176,29 @@ mod tests {
         engine.keep("MyGame 2").unwrap();
         assert_eq!(saved(), ["MyGame", "MyGame 2"]);
         assert!(!engine.project("MyGame 2").unwrap().temporary);
+    }
+
+    #[test]
+    fn auto_connect_finds_a_local_place_by_its_file_name() {
+        let local = config::Project {
+            name: "Lane".into(),
+            path: "C:\\Games\\Lane".into(),
+            project_file: "default.project.json".into(),
+            port: FIRST_PORT,
+            autostart: false,
+            auto_connect: true,
+            place: Some(PlaceLink::Local(LocalPlace { file: "Lane-1.rbxl".into() })),
+            sourcemap: false,
+            temporary: true,
+        };
+        let engine = Engine::new(Config { projects: vec![local], ..Config::default() }, PathBuf::new(), |_| {});
+        engine.lock().states.insert("Lane".into(), ServerState::Serving);
+        let offer =
+            |place_id, name: Option<&str>| engine.report_bridge(1, place_id, name.map(Into::into), 0, json!({}));
+        assert_eq!(offer(0, Some("Lane-1.rbxl")), Some((FIRST_PORT, true)));
+        assert_eq!(offer(0, Some("Lane-2.rbxl")), None);
+        assert_eq!(offer(0, None), None); // an older bridge does not name the place
+        assert_eq!(offer(7, Some("Lane-1.rbxl")), None);
     }
 
     #[test]

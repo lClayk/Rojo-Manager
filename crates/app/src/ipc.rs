@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::manager::{Engine, Event, ProjectView, Snapshot, Update};
 use rojo_manager_core::tooling::Job;
 use serde::de::DeserializeOwned;
@@ -259,7 +259,7 @@ impl Client {
     pub fn keep(&self, name: &str) -> Result<(), String> {
         self.call(Call::Keep { name: name.into() })
     }
-    pub fn open_studio(&self, name: &str) -> Result<Place, String> {
+    pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
         self.call(Call::OpenStudio { name: name.into() })
     }
     pub fn open_folder(&self, name: &str) -> Result<(), String> {
@@ -304,6 +304,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rojo_manager_core::config::Place;
+    use rojo_manager_core::manager::PlaceChoice;
 
     #[test]
     fn updates_keep_the_difference_between_unchanged_and_unlinked_places() {
@@ -316,7 +318,9 @@ mod tests {
         };
         assert_eq!(round_trip(Update { port: Some(1), ..Update::default() }).place, None);
         assert_eq!(round_trip(Update { place: Some(None), ..Update::default() }).place, Some(None));
-        let place = Place { place_id: 2, universe_id: 3 };
+        let place = PlaceChoice::Published(Place { place_id: 2, universe_id: 3 });
         assert_eq!(round_trip(Update { place: Some(Some(place)), ..Update::default() }).place, Some(Some(place)));
+        let local = Some(Some(PlaceChoice::Local));
+        assert_eq!(round_trip(Update { place: local, ..Update::default() }).place, local);
     }
 }

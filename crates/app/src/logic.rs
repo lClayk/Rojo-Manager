@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use rojo_manager_core::config::Settings;
+use rojo_manager_core::config::{PlaceLink, Settings};
 use rojo_manager_core::manager::{ProjectView, ServerState};
 use rojo_manager_core::tooling::{StudioPlugin, bridge_outdated};
 
@@ -116,7 +116,7 @@ pub enum ListItem<'a> {
 /// Temporary projects come last, under their own header.
 pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
     let (temporary, projects): (Vec<&ProjectView>, Vec<&ProjectView>) = projects.iter().partition(|p| p.temporary);
-    let universe = |p: &ProjectView| p.place.map(|place| place.universe_id).filter(|_| group);
+    let universe = |p: &ProjectView| p.place.as_ref()?.published().map(|place| place.universe_id).filter(|_| group);
     let (mut items, mut grouped) = (Vec::new(), HashSet::new());
     for &project in &projects {
         let Some(id) = universe(project) else {
@@ -157,6 +157,15 @@ pub fn badge_tip(badge: &str) -> &'static str {
         "Install this project's Wally packages"
     } else {
         "Install this project's pinned tools (Rokit also supports Aftman)"
+    }
+}
+
+/// The place editor's text for a project's place: its ID, "local", or empty.
+pub fn place_text(place: Option<&PlaceLink>) -> String {
+    match place {
+        Some(PlaceLink::Published(place)) => place.place_id.to_string(),
+        Some(PlaceLink::Local(_)) => "local".into(),
+        None => String::new(),
     }
 }
 
@@ -240,6 +249,7 @@ pub fn version_number(output: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rojo_manager_core::config::Place;
     use rojo_manager_core::tooling::BRIDGE_VERSION;
 
     fn project(state: ServerState) -> ProjectView {
@@ -263,7 +273,7 @@ mod tests {
     fn places_of_one_experience_share_a_header_where_the_first_one_was() {
         let linked = |name: &str, universe_id, experience: Option<&str>| ProjectView {
             name: name.into(),
-            place: Some(rojo_manager_core::config::Place { place_id: 1, universe_id }),
+            place: Some(PlaceLink::Published(Place { place_id: 1, universe_id })),
             experience: experience.map(Into::into),
             ..project(ServerState::Off)
         };

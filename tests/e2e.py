@@ -22,6 +22,7 @@ WINDOWS = sys.platform == "win32"
 ROOT = Path(__file__).resolve().parent.parent
 PLACE_ID = 123456
 PORT = 35990
+BRIDGE_PORT = "34871"
 
 
 def executable(folder: Path, name: str) -> Path:
@@ -126,6 +127,16 @@ def shim_rojo(folder: Path) -> Path:
     return folder
 
 
+def run_bridge(place: str) -> tuple[subprocess.Popen, Lines]:
+    """The real bridge under Lune, in a stand-in Studio with this place ("<id>" or "0:<file name>")."""
+    bridge = subprocess.Popen(["lune", "run", str(ROOT / "tests" / "bridge_harness.luau"),
+                               str(ROOT / "rojo_bridge" / "RojoManagerBridge.luau"), place, BRIDGE_PORT],
+                              stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    events = Lines(bridge)
+    events.expect("attached")
+    return bridge, events
+
+
 def check_login_item(mcp: Mcp, app_dir: Path) -> None:
     """Open at login writes and removes the system's startup entry for this executable."""
     def entry() -> str:
@@ -163,7 +174,7 @@ def check(app_dir: Path) -> None:
         if not WINDOWS:
             env["PATH"] = f"{shim_rojo(Path(directory) / 'shim')}{os.pathsep}{env['PATH']}"
         host = subprocess.Popen([str(executable(app_dir, "RojoManager")), "--hidden"], env=env, cwd=profile)
-        bridge = mcp = None
+        bridge = lane_bridge = mcp = None
         try:
             wait_for(lambda: (profile / "control.json").exists(), 30, "the control API")
             mcp = Mcp(executable(app_dir, "RojoManagerMCP"), env)
@@ -180,11 +191,7 @@ def check(app_dir: Path) -> None:
             assert any(line.startswith("$ rojo sourcemap") for line in logs), logs
 
             # The bridge reports in, connects Rojo through auto-connect, and sends its Output.
-            bridge = subprocess.Popen(["lune", "run", str(ROOT / "tests" / "bridge_harness.luau"),
-                                       str(ROOT / "rojo_bridge" / "RojoManagerBridge.luau"), str(PLACE_ID)],
-                                      stdout=subprocess.PIPE, text=True, encoding="utf-8")
-            events = Lines(bridge)
-            events.expect("attached")
+            bridge, events = run_bridge(str(PLACE_ID))
             events.expect(f"connect {PORT}")
             instances = wait_for(lambda: mcp.call("get_connected_instances")["instances"], 30, "the bridge")
             assert [(i["placeId"], i.get("project")) for i in instances] == [(PLACE_ID, "MyGame")], instances
@@ -208,8 +215,31 @@ def check(app_dir: Path) -> None:
             assert [line["text"] for line in errors] == ["e2e error"], errors
             assert mcp.call("studio_output", instance_id=instance, since=output["next"])["lines"] == []
 
+            # A temporary copy of the project with a local place: the bridge in an unpublished place names
+            # it by its file, so auto-connect finds that project's server, and its Output stays its own.
+            lane = Path(directory) / "MyGame-lane"
+            shutil.copytree(project, lane)
+            added = mcp.call("manage_project", action="add", path=str(lane), temporary=True)["added"][0]
+            assert added["temporary"] is True and added["name"] == "MyGame-lane", added
+            linked = mcp.call("manage_project", action="update", project="MyGame-lane", place="local",
+                              auto_connect=True)["project"]
+            place_file = linked["placeFile"]
+            assert place_file.startswith("MyGame-lane-") and place_file.endswith(".rbxl"), linked
+            assert "MyGame-lane" not in (profile / "config.json").read_text(encoding="utf-8")
+            lane_port = mcp.call("rojo_server", project="MyGame-lane", action="start")["project"]["port"]
+            lane_bridge, lane_events = run_bridge(f"0:{place_file}")
+            lane_events.expect(f"connect {lane_port}")
+            def lane_connected():
+                listed = {p["name"]: p for p in mcp.call("list_projects")["projects"]}
+                return listed["MyGame-lane"].get("studio", {}).get("rojo", {}).get("status") == "Connected"
+            wait_for(lane_connected, 30, "the lane's Rojo to report Connected")
+            lane_output = wait_for(lambda: mcp.call("studio_output", project="MyGame-lane")["lines"], 30, "lane Output")
+            assert [line["text"] for line in lane_output].count("edit started") == 1, lane_output
+            mcp.call("manage_project", action="remove", project="MyGame-lane")
+            assert "MyGame-lane" not in [p["name"] for p in mcp.call("list_projects")["projects"]]
+
             # Agent Luau runs in the bridge and comes back with what it printed and returned.
-            ran = mcp.call("execute_luau", code="print('from agent') return 40 + 2")
+            ran = mcp.call("execute_luau", instance_id=instance, code="print('from agent') return 40 + 2")
             assert ran["returnValue"] == 42 and ran["output"] == ["from agent"], ran
 
             # Stopping disconnects Rojo first, ends the sourcemap watcher, and frees the port. On macOS
@@ -225,13 +255,14 @@ def check(app_dir: Path) -> None:
             if os.environ.get("CI"):
                 check_login_item(mcp, app_dir)
         finally:
-            for process in (bridge, host):
+            for process in (bridge, lane_bridge, host):
                 if process and process.poll() is None:
                     process.kill()
                     process.wait()
             if mcp:
                 mcp.close()
-    print("Sourcemap, Rojo server, bridge auto-connect, Studio Output, agent Luau, and login item passed.")
+    print("Sourcemap, Rojo server, bridge auto-connect, local places, Studio Output, agent Luau, and login item "
+          "passed.")
 
 
 if __name__ == "__main__":

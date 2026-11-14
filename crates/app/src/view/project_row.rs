@@ -4,7 +4,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::component::input::Input;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::manager::{Engine, ProjectView, ServerState, Snapshot, Update};
 use rojo_manager_core::studio::ResolveError;
 use rojo_manager_core::tooling::Job;
@@ -225,13 +225,14 @@ pub fn render(
         tip_link(
             format!("place-{}", p.name),
             match &p.place {
-                Some(place) => format!("Place {}", place.place_id),
+                Some(PlaceLink::Published(place)) => format!("Place {}", place.place_id),
+                Some(PlaceLink::Local(_)) => "Local place".to_string(),
                 None => "Set place".to_string(),
             },
-            "Roblox place this project opens in Studio. Paste a place ID or link; an experience link uses its start place. Clear it to unset.",
+            "Roblox place this project opens in Studio. Paste a place ID or link; an experience link uses its start place. Type local for an unpublished place file built from the project. Clear it to unset.",
         )
         .on_click(on_click(&p.name, cx, |this, name, window, cx| {
-            let place = this.project(name).and_then(|p| p.place).map(|p| p.place_id.to_string()).unwrap_or_default();
+            let place = this.project(name).map(|p| logic::place_text(p.place.as_ref())).unwrap_or_default();
             this.edit(name, Field::Place, place, window, cx);
         }))
         .into_any_element()
@@ -273,13 +274,13 @@ pub fn render(
             .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Sourcemap, cx))),
         )
         .child(place)
-        .when_some(p.place, |d, place| {
+        .when_some(p.place.as_ref(), |d, place| {
             d.child(
-                tip_link(format!("studio-{}", p.name), "Open Studio", format!("Open place {} in Roblox Studio", place.place_id))
+                tip_link(format!("studio-{}", p.name), "Open Studio", format!("Open {} in Roblox Studio", place.describe()))
                     .on_click(on_click(&p.name, cx, |this, name, _, cx| {
                         let name = name.to_string();
-                        this.run(cx, move |engine| engine.open_studio(&name), |this, place: Place, cx| {
-                            this.notify(format!("Opening place {} in Roblox Studio", place.place_id), cx)
+                        this.run(cx, move |engine| engine.open_studio(&name), |this, place: PlaceLink, cx| {
+                            this.notify(format!("Opening {} in Roblox Studio", place.describe()), cx)
                         });
                     })),
             )
@@ -406,10 +407,10 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
             }
         },
         Field::Place => {
-            if text == project.place.map(|p| p.place_id.to_string()).unwrap_or_default() {
+            if text.eq_ignore_ascii_case(&logic::place_text(project.place.as_ref())) {
                 return;
             }
-            if !text.is_empty() {
+            if !text.is_empty() && !text.eq_ignore_ascii_case("local") {
                 view.notify("Looking up place...", cx);
             }
             let label = name.clone();
@@ -419,7 +420,7 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
                 move |view, project, cx| {
                     view.notify(
                         match project.place {
-                            Some(place) => format!("{label}: opens place {} in Studio", place.place_id),
+                            Some(place) => format!("{label}: opens {} in Studio", place.describe()),
                             None => format!("{label}: place cleared"),
                         },
                         cx,
@@ -430,7 +431,7 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
     }
 }
 
-/// Link a place ID or Roblox link to a project; empty text unlinks.
+/// Link a place ID or Roblox link, or "local", to a project; empty text unlinks.
 fn set_place(engine: &Client, name: &str, text: &str) -> Result<ProjectView, String> {
     let place = Engine::resolve_place(text).map_err(|error| match error {
         ResolveError::Invalid(message) => message,
@@ -464,7 +465,7 @@ impl MainView {
             match action {
                 GroupAction::Start => self.run(cx, move |engine| engine.start_server(&name), |_, (), _| {}),
                 GroupAction::Stop => self.run(cx, move |engine| engine.stop_server(&name), |_, (), _| {}),
-                GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: Place, _| {}),
+                GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: PlaceLink, _| {}),
             }
         }
     }

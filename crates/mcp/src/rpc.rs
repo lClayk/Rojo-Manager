@@ -18,7 +18,8 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - list_projects shows each project's server state, linked place, and whether that place is open in Studio.
 - rojo_server starts, stops, or restarts a project's Rojo server.
 - open_place opens a project's place in Roblox Studio; connect_rojo=true also starts the server and connects Rojo.
-  Passing both project and place links that place to the project first.
+  Passing both project and place links that place to the project first. place=local gives a project a local
+  place: an unpublished file Rojo Manager builds from the project with rojo build, named by its placeFile.
 - rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
   waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort.
 - manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or

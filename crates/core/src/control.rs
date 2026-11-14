@@ -87,11 +87,14 @@ pub trait ControlHandler: Send + Sync + 'static {
 }
 
 /// A bridge's poll: its place, the server its Rojo is connected to (0 for none), the Rojo plugin's
-/// status, and the result of the command the previous poll handed it.
+/// status, and the result of the command the previous poll handed it. Bridges since version 9 also
+/// send `game.Name` for an unpublished place, which is a local place's file name.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgePoll {
     pub place_id: u64,
+    #[serde(default)]
+    pub place_name: Option<String>,
     #[serde(default)]
     pub port: u16,
     #[serde(default)]
@@ -114,6 +117,8 @@ pub struct CommandResult {
 #[serde(rename_all = "camelCase")]
 pub struct StudioOutput {
     pub place_id: u64,
+    #[serde(default)]
+    pub place_name: Option<String>,
     pub context: OutputContext,
     pub lines: Vec<OutputReport>,
 }
