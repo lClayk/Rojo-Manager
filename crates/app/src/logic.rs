@@ -83,9 +83,9 @@ pub fn summary(projects: &[ProjectView]) -> String {
     tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), "project")
 }
 
-/// An experience header's line: "2 places · 1 running".
-pub fn experience_summary(projects: &[&ProjectView]) -> String {
-    tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), "place")
+/// A group header's line: "2 places · 1 running", with `noun` "place".
+pub fn group_summary(projects: &[&ProjectView], noun: &str) -> String {
+    tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), noun)
 }
 
 fn tally(states: &[ServerState], noun: &str) -> String {
@@ -108,13 +108,17 @@ pub enum ListItem<'a> {
         name: String,
         projects: Vec<&'a ProjectView>,
     },
+    /// The temporary projects, after all the others.
+    Temporary(Vec<&'a ProjectView>),
 }
 
 /// The list in project order; with `group`, places of the same experience gather under one header.
+/// Temporary projects come last, under their own header.
 pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
+    let (temporary, projects): (Vec<&ProjectView>, Vec<&ProjectView>) = projects.iter().partition(|p| p.temporary);
     let universe = |p: &ProjectView| p.place.map(|place| place.universe_id).filter(|_| group);
     let (mut items, mut grouped) = (Vec::new(), HashSet::new());
-    for project in projects {
+    for &project in &projects {
         let Some(id) = universe(project) else {
             items.push(ListItem::Project(project));
             continue;
@@ -122,7 +126,7 @@ pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
         if grouped.contains(&id) {
             continue;
         }
-        let members: Vec<&ProjectView> = projects.iter().filter(|p| universe(p) == Some(id)).collect();
+        let members: Vec<&ProjectView> = projects.iter().copied().filter(|p| universe(p) == Some(id)).collect();
         if members.len() < 2 {
             items.push(ListItem::Project(project));
             continue;
@@ -130,6 +134,9 @@ pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
         grouped.insert(id);
         let name = members.iter().find_map(|p| p.experience.clone()).unwrap_or_else(|| format!("Experience {id}"));
         items.push(ListItem::Experience { universe_id: id, name, projects: members });
+    }
+    if !temporary.is_empty() {
+        items.push(ListItem::Temporary(temporary));
     }
     items
 }
@@ -245,6 +252,7 @@ mod tests {
             auto_connect: false,
             place: None,
             sourcemap: false,
+            temporary: false,
             experience: None,
             state,
             badges: vec![],
@@ -261,6 +269,7 @@ mod tests {
         };
         let projects = [
             project(ServerState::Off),
+            ProjectView { temporary: true, ..linked("Scratch", 7, None) },
             linked("Lobby", 7, None),
             linked("Solo", 8, None),
             linked("Arena", 7, Some("Game")),
@@ -273,11 +282,17 @@ mod tests {
                     ListItem::Experience { name, projects, .. } => {
                         format!("{name}: {}", projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))
                     }
+                    ListItem::Temporary(projects) => {
+                        format!(
+                            "Temporary: {}",
+                            projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+                        )
+                    }
                 })
                 .collect()
         };
-        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo"]);
-        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena"]);
+        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo", "Temporary: Scratch"]);
+        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena", "Temporary: Scratch"]);
     }
 
     #[test]

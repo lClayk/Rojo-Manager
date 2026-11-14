@@ -71,7 +71,11 @@ pub fn render_experience(
                 .child(name.to_string()),
         )
         .child(
-            div().flex_shrink_0().text_size(TEXT_SM).text_color(rgb(MUTED)).child(logic::experience_summary(projects)),
+            div()
+                .flex_shrink_0()
+                .text_size(TEXT_SM)
+                .text_color(rgb(MUTED))
+                .child(logic::group_summary(projects, "place")),
         );
     div()
         .id(format!("experience-{universe_id}"))
@@ -95,6 +99,21 @@ pub fn render_experience(
                 })
                 .child(action("open", "Open places", "Open every place in Roblox Studio", GroupAction::Open)),
         )
+        .into_any_element()
+}
+
+/// The header over temporary projects, which are gone when Rojo Manager exits unless kept.
+pub fn render_temporary(projects: &[&ProjectView]) -> AnyElement {
+    div()
+        .id("temporary")
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(16.))
+        .py(px(10.))
+        .tooltip(crate::widgets::tooltip("Removed when Rojo Manager exits. Keep one to save it."))
+        .child(div().text_size(TEXT_LG).font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)).child("Temporary"))
+        .child(div().text_size(TEXT_SM).text_color(rgb(MUTED)).child(logic::group_summary(projects, "project")))
         .into_any_element()
 }
 
@@ -227,10 +246,12 @@ pub fn render(
         .mt(px(6.))
         .mx(px(-6.))
         .child(port)
-        .child(
-            switch_link(format!("autostart-{}", p.name), "Autostart", p.autostart, "Start this project when Rojo Manager opens")
-                .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Autostart, cx))),
-        )
+        .when(!p.temporary, |d| {
+            d.child(
+                switch_link(format!("autostart-{}", p.name), "Autostart", p.autostart, "Start this project when Rojo Manager opens")
+                    .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Autostart, cx))),
+            )
+        })
         .when(p.place.is_some(), |d| {
             d.child(
                 switch_link(
@@ -274,6 +295,18 @@ pub fn render(
             div()
                 .flex()
                 .ml_auto()
+                .when(p.temporary, |d| {
+                    d.child(
+                        tip_link(format!("keep-{}", p.name), "Keep", "Save this project, so it stays after Rojo Manager exits")
+                            .on_click(on_click(&p.name, cx, |this, name, _, cx| {
+                                let name = name.to_string();
+                                let label = name.clone();
+                                this.run(cx, move |engine| engine.keep(&name), move |view, (), cx| {
+                                    view.notify(format!("Kept {label}"), cx)
+                                });
+                            })),
+                    )
+                })
                 .child(
                     tip_link(format!("logs-{}", p.name), "Logs", format!("View logs for {}", p.name))
                         .opacity(0.)

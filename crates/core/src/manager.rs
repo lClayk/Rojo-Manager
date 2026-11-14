@@ -79,6 +79,9 @@ pub struct ProjectView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experience: Option<String>,
     pub sourcemap: bool,
+    /// Kept only until it is removed or the app exits; see `config::Project::temporary`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -560,6 +563,7 @@ impl Engine {
             auto_connect: p.auto_connect,
             place: p.place,
             sourcemap: p.sourcemap,
+            temporary: p.temporary,
             experience: p.place.and_then(|place| state.experiences.get(&place.universe_id).cloned()),
             state: state.view_state(&p.name),
             badges: tooling::project_badges(Path::new(&p.path)).into_iter().map(String::from).collect(),
@@ -1194,11 +1198,12 @@ impl Engine {
 
     // ------------------------------------------------------------- projects
 
-    /// Add the Rojo project at `path`, or each new project in its immediate subfolders.
-    /// Returns the added names; errors when nothing could be added.
-    pub fn add_projects(&self, path: &Path) -> Result<Vec<String>, String> {
+    /// Add the Rojo project at `path`, or each new project in its immediate subfolders. A temporary
+    /// project is never saved, so it is gone when the app exits. Returns the added names; errors
+    /// when nothing could be added.
+    pub fn add_projects(&self, path: &Path, temporary: bool) -> Result<Vec<String>, String> {
         let added = if !project_files(path).is_empty() {
-            vec![self.register(path)?]
+            vec![self.register(path, temporary)?]
         } else {
             let entries = std::fs::read_dir(path).map_err(|e| format!("Cannot read that folder: {e}"))?;
             let mut children: Vec<PathBuf> = entries
@@ -1212,7 +1217,7 @@ impl Engine {
             if children.is_empty() {
                 return Err("No Rojo projects found in that folder or its children".into());
             }
-            let added: Vec<String> = children.iter().filter_map(|child| self.register(child).ok()).collect();
+            let added: Vec<String> = children.iter().filter_map(|child| self.register(child, temporary).ok()).collect();
             if added.is_empty() {
                 return Err("None of the Rojo projects in that folder could be added".into());
             }
@@ -1221,7 +1226,11 @@ impl Engine {
         self.changed();
         if let [name] = added.as_slice() {
             let port = self.lock().port(name).unwrap_or_default();
-            self.notice(format!("Added {name} on port {port}. Click the port to change it."));
+            if temporary {
+                self.notice(format!("Added {name} as a temporary project on port {port}"));
+            } else {
+                self.notice(format!("Added {name} on port {port}. Click the port to change it."));
+            }
         } else {
             let folder =
                 path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -1230,8 +1239,9 @@ impl Engine {
         Ok(added)
     }
 
-    /// Save the project at `path` on the first free port and return its name.
-    fn register(&self, path: &Path) -> Result<String, String> {
+    /// Save the project at `path` on the first free port and return its name. A temporary project
+    /// takes the folder's name with a number when that name is taken.
+    fn register(&self, path: &Path, temporary: bool) -> Result<String, String> {
         let mut files = project_files(path);
         if files.is_empty() {
             return Err("No *.project.json file found in that folder".into());
@@ -1241,16 +1251,18 @@ impl Engine {
             None => files.remove(0),
         };
         let path_text = path.to_string_lossy().into_owned();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Choose a folder, not a drive")?;
+        let folder =
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Choose a folder, not a drive")?;
         let mut state = self.lock();
-        if state
-            .config
-            .projects
-            .iter()
-            .any(|p| p.name.to_lowercase() == name.to_lowercase() || same_path(&p.path, &path_text))
-        {
-            return Err(format!("A project named {name} is already registered"));
+        let taken = |name: &str| state.config.projects.iter().any(|p| p.name.to_lowercase() == name.to_lowercase());
+        if let Some(other) = state.config.projects.iter().find(|p| same_path(&p.path, &path_text)) {
+            return Err(format!("{} already has that folder", other.name));
         }
+        let name = match temporary {
+            true => (1..).map(|n| if n == 1 { folder.clone() } else { format!("{folder} {n}") }).find(|n| !taken(n)),
+            false => Some(folder.clone()).filter(|n| !taken(n)),
+        };
+        let name = name.ok_or_else(|| format!("A project named {folder} is already registered"))?;
         let used: HashSet<u16> = state.config.projects.iter().map(|p| p.port).collect();
         let listening = localnet::listeners().unwrap_or_default();
         let port = (FIRST_PORT..=u16::MAX)
@@ -1266,6 +1278,7 @@ impl Engine {
             auto_connect: false,
             place: None,
             sourcemap: false,
+            temporary,
         });
         config::save(&config)?;
         state.config = config;
@@ -1287,6 +1300,9 @@ impl Engine {
         let linked = update.place.unwrap_or(project.place);
         if update.auto_connect == Some(true) && linked.is_none() {
             return Err("Auto-connect needs a linked place.".into());
+        }
+        if update.autostart == Some(true) && project.temporary {
+            return Err("A temporary project does not autostart. Keep it first.".into());
         }
         let new_name = update.name.as_deref().map(str::trim).unwrap_or(name).to_string();
         if new_name != name {
@@ -1412,6 +1428,19 @@ impl Engine {
         if collapsed {
             config.collapsed.push(universe_id);
         }
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    /// Turn a temporary project into a normal one, saved with the others.
+    pub fn keep(&self, name: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        let project = config.project_mut(name).ok_or_else(|| missing(name))?;
+        project.temporary = false;
         config::save(&config)?;
         state.config = config;
         drop(state);
@@ -1734,7 +1763,11 @@ impl ControlHandler for Control {
             if !path.is_absolute() || !path.is_dir() {
                 return Err(ControlError::new(format!("No folder at {}. Pass an absolute path.", path.display()), 404));
             }
-            let names = engine.add_projects(&path).map_err(|e| ControlError::new(e, 409))?;
+            let temporary = match body.get("temporary") {
+                None | Some(Value::Null) => false,
+                Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("temporary must be a bool"))?,
+            };
+            let names = engine.add_projects(&path, temporary).map_err(|e| ControlError::new(e, 409))?;
             let added: Vec<Value> = names.iter().filter_map(|name| engine.agent_view(name)).collect();
             return Ok(json!({ "added": added }));
         }
@@ -1762,6 +1795,11 @@ impl ControlHandler for Control {
                 engine.remove(name).map_err(|e| ControlError::new(e, 500))?;
                 engine.notice(format!("{name}: removed by an agent"));
                 Ok(json!({ "removed": name }))
+            }
+            "keep" => {
+                engine.keep(name).map_err(|e| ControlError::new(e, 500))?;
+                engine.notice(format!("{name}: kept by an agent"));
+                reply(name)
             }
             "start" | "restart" if view.state == ServerState::Blocked => {
                 Err(ControlError::new(format!("Port {} is used by another application", view.port), 409))
@@ -2004,6 +2042,7 @@ mod tests {
             auto_connect: false,
             place: None,
             sourcemap: false,
+            temporary: false,
         };
         let day = 24 * 60 * 60;
         let mut config = Config { projects: vec![project], first_run: 10 * day, ..Config::default() };
@@ -2013,6 +2052,29 @@ mod tests {
         assert!(!star_due(&config, 13 * day));
         let empty = Config { first_run: 10 * day, ..Config::default() };
         assert!(!star_due(&empty, 13 * day));
+    }
+
+    #[test]
+    fn temporary_projects_are_never_saved_until_kept() {
+        let _guard = crate::isolated();
+        let folders = tempfile::tempdir().unwrap();
+        let folder = |parent: &str| {
+            let path = folders.path().join(parent).join("MyGame");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("default.project.json"), "{}").unwrap();
+            path
+        };
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        assert_eq!(engine.add_projects(&folder("main"), false).unwrap(), ["MyGame"]);
+        assert_eq!(engine.add_projects(&folder("lane"), true).unwrap(), ["MyGame 2"]);
+        assert!(engine.project("MyGame 2").unwrap().temporary);
+        let saved = || config::load().unwrap().projects.into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(saved(), ["MyGame"]);
+        let autostart = Update { autostart: Some(true), ..Update::default() };
+        assert!(engine.update("MyGame 2", autostart).is_err());
+        engine.keep("MyGame 2").unwrap();
+        assert_eq!(saved(), ["MyGame", "MyGame 2"]);
+        assert!(!engine.project("MyGame 2").unwrap().temporary);
     }
 
     #[test]

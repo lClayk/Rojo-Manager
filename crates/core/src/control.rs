@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
+pub const ACTIONS: [&str; 8] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove", "keep"];
 pub const MAX_BODY: usize = 16384;
 /// A bridge poll can carry a command's result, such as the output of agent Luau.
 pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
@@ -465,18 +465,8 @@ pub fn request(method: &str, parts: &[&str], body: Option<&Value>, timeout: Dura
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Point control.json at a temporary folder, one test at a time.
-    fn isolated() -> MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = DIR.get_or_init(|| tempfile::tempdir().unwrap());
-        // SAFETY: only tests in this module change the environment, and they hold LOCK.
-        unsafe { std::env::set_var("ROJO_MANAGER_DATA_DIR", dir.path()) };
-        guard
-    }
+    use crate::isolated;
+    use std::sync::Mutex;
 
     /// Records every call as JSON.
     #[derive(Default)]

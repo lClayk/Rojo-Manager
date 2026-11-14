@@ -76,17 +76,20 @@ pub fn specs(studio_tools: bool) -> Value {
         },
         {
             "name": "manage_project",
-            "description": "Add, change, or remove Rojo Manager projects. add takes an absolute folder path: a Rojo \
-                project, or a parent folder whose project subfolders are all added on free ports. update \
+            "description": "Add, change, keep, or remove Rojo Manager projects. add takes an absolute folder path: a \
+                Rojo project, or a parent folder whose project subfolders are all added on free ports. With \
+                temporary, the project is never saved: it is gone when removed or when Rojo Manager exits, and its \
+                server stops with it; keep saves it like any other project. update \
                 changes any of name, port, autostart, auto_connect (connect Rojo when the linked place \
                 opens in Studio while the server runs), sourcemap (keep sourcemap.json current with rojo \
                 sourcemap --watch while the server runs), and place (a place ID or link; \"\" unlinks). \
                 Renaming or changing the port needs the server stopped. remove drops the project from \
                 the list, stopping its server; its files are kept.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
-                "action": {"type": "string", "enum": ["add", "update", "remove"]},
-                "project": {"type": "string", "description": "Project name, for update and remove"},
+                "action": {"type": "string", "enum": ["add", "update", "keep", "remove"]},
+                "project": {"type": "string", "description": "Project name, for update, keep, and remove"},
                 "path": {"type": "string", "description": "Absolute folder path, for add"},
+                "temporary": {"type": "boolean", "default": false, "description": "For add"},
                 "name": {"type": "string"},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "autostart": {"type": "boolean", "description": "Start the server when Rojo Manager opens"},
@@ -204,6 +207,8 @@ struct Project {
     auto_connect: bool,
     #[serde(default)]
     sourcemap: bool,
+    #[serde(default)]
+    temporary: bool,
     /// Its last output lines.
     #[serde(default)]
     log: Vec<String>,
@@ -235,6 +240,8 @@ struct Brief {
     auto_connect: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sourcemap: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    temporary: bool,
     /// Only in list_projects, when the linked place is open in Studio.
     #[serde(skip_serializing_if = "Option::is_none")]
     studio: Option<StudioPlace>,
@@ -251,6 +258,7 @@ impl From<Project> for Brief {
             autostart: project.autostart,
             auto_connect: project.auto_connect,
             sourcemap: project.sourcemap,
+            temporary: project.temporary,
             studio: None,
         }
     }
@@ -750,11 +758,15 @@ enum Managed {
 }
 
 fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String> {
-    let action = choice(args, "action", &["add", "update", "remove"])?;
+    let action = choice(args, "action", &["add", "update", "keep", "remove"])?;
     if action == "add" {
         let path = string(args, "path")?;
+        let temporary = match args.get("temporary") {
+            None | Some(Value::Null) => false,
+            Some(value) => value.as_bool().ok_or("temporary must be true or false")?,
+        };
         manager_projects(backend)?; // starts the manager if needed
-        let body = json!({ "path": path });
+        let body = if temporary { json!({ "path": path, "temporary": true }) } else { json!({ "path": path }) };
         let reply = call(backend, "POST", &["projects"], Some(&body), Duration::from_secs(30))?;
         let added: Vec<Project> = field(reply, "added")?;
         return Ok(Managed::Added { added: added.into_iter().map(Brief::from).collect() });
@@ -762,6 +774,10 @@ fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String>
     let name = find_project(backend, &string(args, "project")?)?.name;
     if action == "remove" {
         return Ok(Managed::Removed(call(backend, "POST", &["projects", &name, "remove"], None, CALL_TIMEOUT)?));
+    }
+    if action == "keep" {
+        let project = act(backend, &name, "keep", None)?;
+        return Ok(Managed::Updated(Box::new(ProjectResult { project: project.into(), rojo: None })));
     }
     let changes: Map<String, Value> =
         PROJECT_FIELDS.iter().filter_map(|(key, stored)| Some((stored.to_string(), args.get(*key)?.clone()))).collect();
@@ -886,11 +902,15 @@ mod tests {
                     updated["autoConnect"] = json!(true);
                     json!({"project": updated})
                 }
+                [.., "keep"] => json!({"project": project("off", true)}),
                 _ => json!({"removed": parts[1]}),
             },
             ..Fake::default()
         };
         let added = manage_project(&fake, &args(json!({"action": "add", "path": "C:/Games/Lobby"}))).unwrap();
+        let temporary = json!({"action": "add", "path": "C:/Games/Lobby", "temporary": true});
+        manage_project(&fake, &args(temporary)).unwrap();
+        manage_project(&fake, &args(json!({"action": "keep", "project": "TestGame"}))).unwrap();
         let update = json!({"action": "update", "project": "testgame", "auto_connect": true, "port": 34900});
         let updated = manage_project(&fake, &args(update)).unwrap();
         let removed = manage_project(&fake, &args(json!({"action": "remove", "project": "TestGame"}))).unwrap();
@@ -908,6 +928,10 @@ mod tests {
             [
                 "GET projects",
                 r#"POST projects {"path":"C:/Games/Lobby"}"#,
+                "GET projects",
+                r#"POST projects {"path":"C:/Games/Lobby","temporary":true}"#,
+                "GET projects",
+                "POST projects/TestGame/keep",
                 "GET projects",
                 r#"POST projects/TestGame/update {"autoConnect":true,"port":34900}"#,
                 "GET projects",

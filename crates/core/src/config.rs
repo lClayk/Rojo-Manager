@@ -33,6 +33,9 @@ pub struct Project {
     /// Keep sourcemap.json current with `rojo sourcemap --watch` while the server runs. Only stored when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sourcemap: bool,
+    /// Lives only in this run's memory: `save` leaves it out, so it is gone when the app exits.
+    #[serde(skip)]
+    pub temporary: bool,
 }
 
 /// App preferences. Field names are the JSON keys agents use.
@@ -253,6 +256,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
             auto_connect,
             place,
             sourcemap,
+            temporary: false,
         });
     }
     // Only a window preference, so a bad entry is dropped instead of refusing the file.
@@ -278,9 +282,14 @@ pub fn load() -> Result<Config, String> {
     validate(&value)
 }
 
-/// Validate, then atomically replace config.json.
+/// Validate, then atomically replace config.json. Temporary projects are left out.
 pub fn save(config: &Config) -> Result<(), String> {
-    let clean = validate(&serde_json::to_value(config).map_err(|e| e.to_string())?)?;
+    let mut value = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    if let Some(Value::Array(projects)) = value.get_mut("projects") {
+        let mut temporary = config.projects.iter().map(|p| p.temporary);
+        projects.retain(|_| !temporary.next().unwrap_or(false));
+    }
+    let clean = validate(&value)?;
     let path = config_path();
     let dir = path.parent().ok_or("Invalid settings folder")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;

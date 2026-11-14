@@ -22,7 +22,8 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
   waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort.
 - manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or
-  linked place, or removes a project from the list (its files are kept).
+  linked place, or removes a project from the list (its files are kept). temporary=true adds a project that is
+  never saved and is gone when removed or when Rojo Manager exits; keep saves it.
 - server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
 - studio_output reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a
   playtest's server.

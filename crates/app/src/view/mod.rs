@@ -629,6 +629,10 @@ impl MainView {
                         rows.extend(projects.iter().map(|p| project_row::render(self, p, snapshot, true, window, cx)));
                     }
                 }
+                logic::ListItem::Temporary(projects) => {
+                    rows.push(project_row::render_temporary(&projects));
+                    rows.extend(projects.iter().map(|p| project_row::render(self, p, snapshot, true, window, cx)));
+                }
             }
         }
         div()

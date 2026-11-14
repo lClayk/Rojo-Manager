@@ -54,6 +54,7 @@ If Rojo is missing, use **Install Rojo** in the warning or open **Settings > Too
 - **Notify when a server fails** shows a system notification while the window is closed, for example when a crashed server is not restarted or another application takes a project's port.
 - **Restart servers that crash** starts a server again when it exits unexpectedly, up to 3 times a minute.
 - **Remove** removes a project from the list. It keeps all project files.
+- **Temporary** projects are added by agents (`manage_project` with `temporary`) for short-lived work, such as a second copy of a project in a git worktree. They are listed last under their own header, never saved, and gone when removed or when the manager exits, with their servers stopped. They get a free port and never autostart. **Keep** turns one into a normal project.
 - **Existing** means a Rojo server for this project is already running outside this manager session. **Port busy** means another application, or a Rojo server for a different project, owns the port. **Kill** names that process and asks before force-closing it.
 
 ## Tools and packages
@@ -87,7 +88,7 @@ AI agents can run your Rojo servers, open places in Studio, connect or disconnec
 | `rojo_session` | Connects or disconnects Rojo in an open place, reads its status, or accepts or aborts Rojo's initial sync confirmation |
 | `server_logs` | Reads a project's recent Rojo output, such as sync errors or why the server stopped |
 | `studio_output` | Reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a playtest's server, filtered by level and read on from the last line seen |
-| `manage_project` | Adds a project folder, or every project in a parent folder; changes a project's name, port, autostart, auto-connect, or linked place; or removes it from the list |
+| `manage_project` | Adds a project folder, or every project in a parent folder, optionally as a temporary project; changes a project's name, port, autostart, auto-connect, or linked place; keeps a temporary project; or removes it from the list |
 | `updates` | Checks whether the app and the Studio bridge are up to date, and installs either. Installing the app restarts it |
 | `app_settings` | Reads or changes the app's own preferences. Agents are told to change these only when asked |
 | `get_connected_instances` | Lists the open Studio windows with the bridge, with each one's place, linked project, and Rojo status |
