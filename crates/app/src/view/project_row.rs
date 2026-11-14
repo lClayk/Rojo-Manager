@@ -124,12 +124,12 @@ pub(super) enum GroupAction {
     Open,
 }
 
-/// One project in the list; `nested` indents it under its experience's header.
+/// One project in the list; `depth` indents it under a header, or a lane under its project.
 pub fn render(
     view: &MainView,
     p: &ProjectView,
     snapshot: &Snapshot,
-    nested: bool,
+    depth: usize,
     _: &mut Window,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
@@ -167,7 +167,18 @@ pub fn render(
         .flex()
         .items_center()
         .gap(px(12.))
-        .child(div().flex().flex_1().min_w_0().items_center().child(title))
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(px(8.))
+                .child(title)
+                .when_some(logic::lane_label(p), |d, label| {
+                    d.child(div().flex_shrink_0().text_size(TEXT_SM).text_color(rgb(MUTED)).child(label))
+                }),
+        )
         .child(
             div()
                 .id(format!("status-{}", p.name))
@@ -296,7 +307,7 @@ pub fn render(
             div()
                 .flex()
                 .ml_auto()
-                .when(p.temporary, |d| {
+                .when(p.temporary && p.lane.is_none(), |d| {
                     d.child(
                         tip_link(format!("keep-{}", p.name), "Keep", "Save this project, so it stays after Rojo Manager exits")
                             .on_click(on_click(&p.name, cx, |this, name, _, cx| {
@@ -326,7 +337,7 @@ pub fn render(
     div()
         .id(format!("row-{}", p.name))
         .group(group)
-        .pl(px(if nested { 38. } else { 16. }))
+        .pl(px(16. + 22. * depth as f32))
         .pr(px(16.))
         .py(px(12.))
         .hover(|s| s.bg(rgb(CARD_HOVER)))
@@ -519,6 +530,14 @@ impl MainView {
                 move |view, (), cx| view.notify(format!("Removed {label}"), cx),
             );
         };
+        if project.lane.is_some() {
+            let message = format!(
+                "Remove lane {}? Its Studio window closes, its server stops, and its place file is deleted.",
+                project.name
+            );
+            let on_confirm = Box::new(remove);
+            return self.ask(Confirm { title: "Remove lane", message, label: "Remove", danger: true, on_confirm }, cx);
+        }
         if !logic::is_active(project.state) {
             return remove(self, cx);
         }

@@ -61,6 +61,7 @@ impl std::fmt::Display for ControlError {
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
 /// - GET  /updates, POST /updates/<target>  updates(None) or updates(Some(target)), target app or bridge
 /// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
+/// - POST /lanes, POST /lanes/<name>/remove  lane(None, body) or lane(Some(name), body)
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
 /// - POST /bridge/<id>               poll_bridge(id, body) (AutoConnectServer, no token)
 /// - POST /output                    report_output(body) (AutoConnectServer, no token)
@@ -84,6 +85,8 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError>;
     /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
+    /// Makes a lane ({"from", "path", "holder"}), answering {"lane", "project"}; or removes one.
+    fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError>;
 }
 
 /// A bridge's poll: its place, the server its Rojo is connected to (0 for none), the Rojo plugin's
@@ -342,6 +345,8 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
         (false, ["studio", instance]) => handler.studio(Some((instance, &body(request, MAX_BRIDGE_BODY)?))),
         (true, ["updates"]) => handler.updates(None),
         (false, ["updates", target]) => handler.updates(Some(target)),
+        (false, ["lanes"]) => handler.lane(None, &body(request, MAX_BODY)?),
+        (false, ["lanes", name, "remove"]) => handler.lane(Some(name), &body(request, MAX_BODY)?),
         _ => Err(ControlError::new("Unknown route", 404)),
     }
 }
@@ -527,6 +532,11 @@ mod tests {
             self.calls.lock().unwrap().push(json!(["updates", install]));
             Ok(json!({}))
         }
+
+        fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError> {
+            self.calls.lock().unwrap().push(json!(["lane", name, body]));
+            Ok(json!({}))
+        }
     }
 
     fn status(port: u16, method: &str, path: &str, body: Option<&Value>, headers: &[(&str, &str)]) -> u16 {
@@ -568,6 +578,8 @@ mod tests {
         request("POST", &["projects"], Some(&json!({"path": "C:/Games"})), TIMEOUT).unwrap();
         assert_eq!(request("GET", &["settings"], None, TIMEOUT).unwrap(), json!({"settings": {"tray": true}}));
         request("POST", &["settings"], Some(&json!({"tray": false})), TIMEOUT).unwrap();
+        request("POST", &["lanes"], Some(&json!({"from": "Game/Lobby", "path": "C:/Lane"})), TIMEOUT).unwrap();
+        request("POST", &["lanes", "Lobby 2", "remove"], None, TIMEOUT).unwrap();
         match request("POST", &["projects", "Missing", "start"], None, TIMEOUT) {
             Err(RequestError::Refused(error)) => assert_eq!(error, ControlError::new("No project named Missing", 404)),
             other => panic!("{other:?}"),
@@ -584,6 +596,8 @@ mod tests {
                 json!([null, "add", {"path": "C:/Games"}]),
                 json!(["settings", null]),
                 json!(["settings", {"tray": false}]),
+                json!(["lane", null, {"from": "Game/Lobby", "path": "C:/Lane"}]),
+                json!(["lane", "Lobby 2", {}]),
                 json!(["Missing", "start", {}]),
             ]
         );

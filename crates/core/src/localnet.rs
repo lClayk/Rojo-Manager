@@ -17,6 +17,14 @@ mod platform;
 
 pub use platform::{kill_process, listeners, process_name, tcp_snapshot};
 
+/// The processes owning a top-level window whose title starts with `prefix`. Windows only.
+#[cfg(windows)]
+pub use platform::window_owners;
+#[cfg(not(windows))]
+pub fn window_owners(_prefix: &str) -> Vec<u32> {
+    Vec::new()
+}
+
 /// Whether something accepts a TCP connection on 127.0.0.1 at `port`, within 100 ms. Much cheaper
 /// than a snapshot on macOS, though it misses a listener bound to another local address.
 pub fn answers(port: u16) -> bool {

@@ -113,9 +113,13 @@ pub enum ListItem<'a> {
 }
 
 /// The list in project order; with `group`, places of the same experience gather under one header.
-/// Temporary projects come last, under their own header.
+/// Temporary projects come last, under their own header. Lanes are left out: they show under the
+/// project they were made from (see `lanes_of`), or with the temporary ones once it is gone.
 pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
-    let (temporary, projects): (Vec<&ProjectView>, Vec<&ProjectView>) = projects.iter().partition(|p| p.temporary);
+    let has_parent =
+        |p: &ProjectView| p.lane.as_ref().is_some_and(|lane| projects.iter().any(|other| other.name == lane.parent));
+    let shown = projects.iter().filter(|p| !has_parent(p));
+    let (temporary, projects): (Vec<&ProjectView>, Vec<&ProjectView>) = shown.partition(|p| p.temporary);
     let universe = |p: &ProjectView| p.place.as_ref()?.published().map(|place| place.universe_id).filter(|_| group);
     let (mut items, mut grouped) = (Vec::new(), HashSet::new());
     for &project in &projects {
@@ -139,6 +143,20 @@ pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
         items.push(ListItem::Temporary(temporary));
     }
     items
+}
+
+/// The lanes made from this project.
+pub fn lanes_of<'a>(projects: &'a [ProjectView], parent: &str) -> Vec<&'a ProjectView> {
+    projects.iter().filter(|p| p.lane.as_ref().is_some_and(|lane| lane.parent == parent)).collect()
+}
+
+/// A lane row's label: "Lane", with who holds it.
+pub fn lane_label(project: &ProjectView) -> Option<String> {
+    let lane = project.lane.as_ref()?;
+    Some(match &lane.holder {
+        Some(holder) => format!("Lane held by {holder}"),
+        None => "Lane".into(),
+    })
 }
 
 /// The project's tool badges the person chose to show.
@@ -249,7 +267,8 @@ pub fn version_number(output: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rojo_manager_core::config::Place;
+    use rojo_manager_core::config::{LocalPlace, Place};
+    use rojo_manager_core::manager::Lane;
     use rojo_manager_core::tooling::BRIDGE_VERSION;
 
     fn project(state: ServerState) -> ProjectView {
@@ -263,6 +282,7 @@ mod tests {
             place: None,
             sourcemap: false,
             temporary: false,
+            lane: None,
             experience: None,
             state,
             badges: vec![],
@@ -277,9 +297,22 @@ mod tests {
             experience: experience.map(Into::into),
             ..project(ServerState::Off)
         };
+        let lane = |name: &str, parent: &str| ProjectView {
+            name: name.into(),
+            temporary: true,
+            lane: Some(Lane {
+                name: name.into(),
+                parent: parent.into(),
+                holder: Some("codex".into()),
+                place: LocalPlace { file: format!("{name}.rbxl") },
+            }),
+            ..project(ServerState::Off)
+        };
         let projects = [
             project(ServerState::Off),
             ProjectView { temporary: true, ..linked("Scratch", 7, None) },
+            lane("Lobby-fix", "Lobby"),
+            lane("Orphan", "Gone"),
             linked("Lobby", 7, None),
             linked("Solo", 8, None),
             linked("Arena", 7, Some("Game")),
@@ -301,8 +334,11 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo", "Temporary: Scratch"]);
-        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena", "Temporary: Scratch"]);
+        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo", "Temporary: Scratch, Orphan"]);
+        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena", "Temporary: Scratch, Orphan"]);
+        let lanes = lanes_of(&projects, "Lobby");
+        assert_eq!(lanes.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Lobby-fix"]);
+        assert_eq!(lane_label(lanes[0]).as_deref(), Some("Lane held by codex"));
     }
 
     #[test]

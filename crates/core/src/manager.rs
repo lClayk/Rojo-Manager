@@ -84,6 +84,9 @@ pub struct ProjectView {
     /// Kept only until it is removed or the app exits; see `config::Project::temporary`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub temporary: bool,
+    /// The lane whose place this project syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -170,6 +173,20 @@ pub struct Update {
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub place: Option<Option<PlaceChoice>>,
     pub sourcemap: Option<bool>,
+}
+
+/// An isolated Studio with a stable identity: a local place file of its own, made from a project and
+/// held by whoever asked for it, such as an agent. The Rojo server syncing it is a separate thing,
+/// the project whose place is this file, so another sync tool could drive a lane too. Lanes live in
+/// memory only, like temporary projects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lane {
+    pub name: String,
+    /// The project it was made from.
+    pub parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    pub place: LocalPlace,
 }
 
 /// A place to link: a published place, or a local place file, which the engine names.
@@ -279,6 +296,7 @@ struct State {
     /// Recent unexpected exits per project, for the crash restart limit.
     crashes: HashMap<String, Vec<Instant>>,
     studio_rojo_plugins: Option<u32>,
+    lanes: Vec<Lane>,
     /// Each running Studio bridge's last poll, by the random id it picked when it loaded.
     bridges: HashMap<u64, BridgeReport>,
     /// Experience names by universe ID, looked up once per run.
@@ -324,6 +342,12 @@ impl State {
                 && self.states.get(&p.name).is_some_and(|s| s.running())
         })?;
         Some((project.name.clone(), project.port))
+    }
+
+    /// The lane whose place this project syncs.
+    fn lane_of(&self, project: &config::Project) -> Option<&Lane> {
+        let Some(PlaceLink::Local(place)) = &project.place else { return None };
+        self.lanes.iter().find(|lane| lane.place == *place)
     }
 
     fn view_state(&self, name: &str) -> ServerState {
@@ -465,6 +489,14 @@ fn end_server(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A temporary project's local place file, which goes with it.
+fn temporary_place(project: &config::Project) -> Option<PathBuf> {
+    match &project.place {
+        Some(PlaceLink::Local(place)) if project.temporary => Some(place.path()),
+        _ => None,
+    }
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
 }
@@ -516,9 +548,18 @@ impl Engine {
         let children: Vec<_> = state.procs.drain().collect();
         let ports: Vec<u16> = children.iter().filter_map(|(name, _)| state.port(name).ok()).collect();
         let sourcemaps: Vec<_> = state.sourcemaps.drain().collect();
+        // Lanes and temporary projects end with the app: their Studios close and their places go.
+        let lanes: Vec<PathBuf> = state.lanes.drain(..).map(|lane| lane.place.path()).collect();
+        let places: Vec<PathBuf> = state.config.projects.iter().filter_map(temporary_place).collect();
         drop(state);
         for (_, mut child) in children.into_iter().chain(sourcemaps) {
             end_server(&mut child);
+        }
+        for path in &lanes {
+            studio::close_place_file(path);
+        }
+        for path in places {
+            let _ = std::fs::remove_file(path);
         }
         // As in stop_server: the real rojo behind Rokit's shim ends a moment later. Waiting lets an
         // update's restart start these servers again on the same ports.
@@ -576,6 +617,7 @@ impl Engine {
             place: p.place.clone(),
             sourcemap: p.sourcemap,
             temporary: p.temporary,
+            lane: state.lane_of(p).cloned(),
             experience: p
                 .place
                 .as_ref()
@@ -1492,8 +1534,63 @@ impl Engine {
         Ok(())
     }
 
-    /// Stop the project's server if it runs, then drop the project. Its files are kept.
+    /// Make a lane from the project `parent`, at `path`, a copy of it such as a git worktree: a
+    /// temporary project there, with a local place of its own and auto-connect on, so its Studio
+    /// connects as soon as it opens. Opening it is up to the caller.
+    pub fn create_lane(&self, parent: &str, path: &Path, holder: Option<String>) -> Result<Lane, String> {
+        let parent = self.lock().config.project(parent).map(|p| p.name.clone()).ok_or_else(|| missing(parent))?;
+        let name = self.register(path, true)?;
+        let lane = Lane { name: name.clone(), parent, holder, place: LocalPlace::new(&name) };
+        {
+            let mut state = self.lock();
+            if let Some(project) = state.config.project_mut(&name) {
+                project.place = Some(PlaceLink::Local(lane.place.clone()));
+                project.auto_connect = true;
+            }
+            state.lanes.push(lane.clone());
+        }
+        self.changed();
+        let held = lane.holder.as_deref().map(|holder| format!(" for {holder}")).unwrap_or_default();
+        self.notice(format!("Made lane {name} from {}{held}", lane.parent));
+        Ok(lane)
+    }
+
+    /// Close a lane's Studio, remove the projects syncing it (stopping their servers), and delete its
+    /// place file.
+    pub fn remove_lane(&self, name: &str) -> Result<(), String> {
+        let (lane, projects) = {
+            let state = self.lock();
+            let lane = state.lanes.iter().find(|lane| lane.name == name).cloned();
+            let lane = lane.ok_or_else(|| format!("No lane named {name}"))?;
+            let syncing = state.config.projects.iter().filter(|p| state.lane_of(p) == Some(&lane));
+            let projects: Vec<String> = syncing.map(|p| p.name.clone()).collect();
+            (lane, projects)
+        };
+        let path = lane.place.path();
+        studio::close_place_file(&path);
+        self.lock().lanes.retain(|other| other.name != name);
+        for project in projects {
+            self.remove_project(&project)?;
+        }
+        let _ = std::fs::remove_file(path);
+        self.changed();
+        Ok(())
+    }
+
+    /// Stop the project's server if it runs, then drop the project. Its files are kept, but a
+    /// temporary project's local place goes with it, and removing a lane's project removes the lane.
     pub fn remove(&self, name: &str) -> Result<(), String> {
+        let lane = {
+            let state = self.lock();
+            state.config.project(name).and_then(|p| state.lane_of(p)).map(|lane| lane.name.clone())
+        };
+        match lane {
+            Some(lane) => self.remove_lane(&lane),
+            None => self.remove_project(name),
+        }
+    }
+
+    fn remove_project(&self, name: &str) -> Result<(), String> {
         let (busy, port) = {
             let state = self.lock();
             (state.busy(name), state.port(name)?)
@@ -1502,6 +1599,7 @@ impl Engine {
             self.stop(name);
         }
         let mut state = self.lock();
+        let place = state.config.project(name).and_then(temporary_place);
         let mut config = state.config.clone();
         config.projects.retain(|p| p.name != name);
         config::save(&config)?;
@@ -1509,6 +1607,9 @@ impl Engine {
         state.logs.remove(name);
         state.states.remove(name);
         drop(state);
+        if let Some(path) = place {
+            let _ = std::fs::remove_file(path);
+        }
         self.changed();
         Ok(())
     }
@@ -1920,6 +2021,24 @@ impl ControlHandler for Control {
         }
     }
 
+    fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError> {
+        let engine = &self.0;
+        if let Some(name) = name {
+            engine.remove_lane(name).map_err(|e| ControlError::new(e, 404))?;
+            engine.notice(format!("Lane {name}: removed by an agent"));
+            return Ok(json!({ "removed": name }));
+        }
+        let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
+        let parent = text("from").ok_or_else(|| ControlError::bad("Pass from, the project to make the lane from"))?;
+        let path = PathBuf::from(text("path").ok_or_else(|| ControlError::bad("Pass the lane folder's path"))?);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(ControlError::new(format!("No folder at {}. Pass an absolute path.", path.display()), 404));
+        }
+        let holder = text("holder").map(|holder| holder.chars().take(100).collect::<String>());
+        let lane = engine.create_lane(parent, &path, holder).map_err(|e| ControlError::new(e, 409))?;
+        Ok(json!({ "lane": lane, "project": engine.agent_view(&lane.name) }))
+    }
+
     fn logs(&self, project: &str) -> Result<Value, ControlError> {
         let view = self.0.project(project).ok_or_else(|| ControlError::new(missing(project), 404))?;
         let lines: Vec<String> = self.0.logs(&view.name).into_iter().map(|(_, line)| line).collect();
@@ -2199,6 +2318,32 @@ mod tests {
         assert_eq!(offer(0, Some("Lane-2.rbxl")), None);
         assert_eq!(offer(0, None), None); // an older bridge does not name the place
         assert_eq!(offer(7, Some("Lane-1.rbxl")), None);
+    }
+
+    #[test]
+    fn a_lane_is_a_temporary_project_with_its_own_place_and_goes_with_it() {
+        let _guard = crate::isolated();
+        let folders = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let path = folders.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("default.project.json"), "{}").unwrap();
+            path
+        };
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        engine.add_projects(&folder("MyGame"), false).unwrap();
+        assert!(engine.create_lane("Missing", &folder("Lane"), None).is_err());
+        let lane = engine.create_lane("MyGame", &folder("MyGame-feature"), Some("agent".into())).unwrap();
+        assert_eq!((lane.name.as_str(), lane.parent.as_str()), ("MyGame-feature", "MyGame"));
+        let view = engine.project("MyGame-feature").unwrap();
+        assert!(view.temporary && view.auto_connect && view.lane.as_ref() == Some(&lane));
+        assert_eq!(view.place, Some(PlaceLink::Local(lane.place.clone())));
+        // Removing the lane's project removes the lane and its built place.
+        std::fs::create_dir_all(lane.place.path().parent().unwrap()).unwrap();
+        std::fs::write(lane.place.path(), "built").unwrap();
+        engine.remove("MyGame-feature").unwrap();
+        assert!(engine.project("MyGame-feature").is_none() && !lane.place.path().exists());
+        assert!(engine.remove_lane("MyGame-feature").is_err());
     }
 
     #[test]
