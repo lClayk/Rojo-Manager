@@ -5,7 +5,7 @@ use gpui_kit::component::input::Input;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rojo_manager_core::config::PlaceLink;
-use rojo_manager_core::manager::{Engine, ProjectView, ServerState, Snapshot, Update};
+use rojo_manager_core::manager::{Engine, PendingSync, ProjectView, ServerState, Snapshot, Update};
 use rojo_manager_core::studio::ResolveError;
 use rojo_manager_core::tooling::Job;
 
@@ -344,7 +344,55 @@ pub fn render(
         .child(top)
         .child(path)
         .child(links)
+        .when_some(p.pending_sync.as_ref(), |d, pending| d.child(render_pending(&p.name, pending, cx)))
         .into_any_element()
+}
+
+/// The line under a project whose Studio waits for Rojo's initial sync: what accepting would do, with
+/// Accept and Abort.
+fn render_pending(name: &str, pending: &PendingSync, cx: &mut Context<MainView>) -> Div {
+    let answer = |accept: bool| {
+        let instance = pending.instance.clone();
+        cx.listener(move |this: &mut MainView, _: &ClickEvent, _, cx| {
+            let instance = instance.clone();
+            this.run(cx, move |engine| engine.answer_sync(&instance, accept), |_, (), _| {});
+        })
+    };
+    let tip = pending.summary.as_ref().map(logic::sync_paths).unwrap_or_default();
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(6.))
+        .mt(px(6.))
+        .text_size(TEXT_SM)
+        .child(
+            div()
+                .id(format!("pending-{name}"))
+                .flex()
+                .flex_wrap()
+                .gap_x(px(6.))
+                .when(!tip.is_empty(), |d| d.tooltip(crate::widgets::tooltip(tip)))
+                .child(div().text_color(rgb(TEXT)).child("Studio waits to sync:"))
+                .children(
+                    logic::sync_parts(pending.summary.as_ref())
+                        .into_iter()
+                        .map(|(part, warn)| div().text_color(rgb(if warn { RED } else { MUTED })).child(part)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .ml_auto()
+                .mr(px(-6.))
+                .child(
+                    tip_link(format!("accept-{name}"), "Accept", "Apply the project to Studio").on_click(answer(true)),
+                )
+                .child(
+                    tip_link(format!("abort-{name}"), "Abort", "Cancel this sync and disconnect")
+                        .on_click(answer(false)),
+                ),
+        )
 }
 
 #[derive(Clone, Copy)]

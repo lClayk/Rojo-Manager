@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::control::{ControlError, RequestError};
+use rojo_manager_core::manager::SyncSummary;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -403,11 +404,36 @@ struct Rojo {
     address: Option<String>,
     #[serde(skip_serializing_if = "blank")]
     error: Option<String>,
+    /// While Confirming: what accepting would do (bridge 10 and later).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "summary")]
+    pending: Option<SyncSummary>,
+}
+
+/// A pending sync summary, or None when the bridge sent something else.
+fn summary<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<SyncSummary>, D::Error> {
+    Ok(SyncSummary::deserialize(Value::deserialize(deserializer)?).ok())
 }
 
 impl Rojo {
     fn status(&self) -> &str {
         self.status.as_deref().unwrap_or_default()
+    }
+
+    /// What to do next while Rojo waits for the initial sync to be confirmed, warning first about
+    /// instances accepting would delete.
+    fn next(&self) -> Option<String> {
+        if self.status() != "Confirming" {
+            return None;
+        }
+        let ask = "Rojo is waiting for the initial sync to be approved. Use action accept or abort.";
+        Some(match self.pending.as_ref().map(|pending| pending.removed.count) {
+            Some(removed) if removed > 0 => format!(
+                "{ask} Accepting deletes {removed} instance{} found only in Studio (pending.removed); abort \
+                 keeps them.",
+                if removed == 1 { "" } else { "s" }
+            ),
+            _ => ask.to_string(),
+        })
     }
 }
 
@@ -492,7 +518,7 @@ struct Session {
     instance_id: String,
     rojo: Rojo,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next: Option<&'static str>,
+    next: Option<String>,
 }
 
 /// rojo_session: connect (starting the server if needed and waiting for the plugin), or pass any
@@ -502,7 +528,7 @@ fn run_session(backend: &dyn Backend, name: &str, action: &str) -> Result<Sessio
     let instance_id = place_instance(backend, &project)?;
     if action != "connect" {
         let rojo = bridge(backend, &instance_id, action, None)?;
-        return Ok(Session { instance_id, rojo, next: None });
+        return Ok(Session { instance_id, next: rojo.next(), rojo });
     }
     if !project.running() {
         project = run_server(backend, name, "start")?;
@@ -514,8 +540,7 @@ fn run_session(backend: &dyn Backend, name: &str, action: &str) -> Result<Sessio
         rojo = bridge(backend, &instance_id, "status", None)?;
     }
     let next = match rojo.status() {
-        "Confirming" => Some("Rojo is waiting for the initial sync to be approved. Use action accept or abort."),
-        "Connected" => None,
+        "Confirming" | "Connected" => rojo.next(),
         status => {
             let reason = rojo.error.as_deref().filter(|error| !error.is_empty()).unwrap_or(status);
             return Err(format!("Rojo did not connect: {reason}"));
@@ -574,7 +599,7 @@ struct Opened {
     #[serde(skip_serializing_if = "Option::is_none")]
     rojo: Option<Rojo>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next: Option<&'static str>,
+    next: Option<String>,
 }
 
 /// open_place: reuses a Studio that already has the place open, otherwise opens it and waits up to
@@ -901,6 +926,7 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
     let opened = open_place(backend, Some(name.clone()), None, true).and_then(|mut opened| {
         if let (Some(instance_id), Some("Confirming")) = (&opened.instance_id, opened.rojo.as_ref().map(Rojo::status)) {
             opened.rojo = Some(bridge(backend, instance_id, "accept", None)?);
+            opened.next = None;
         }
         Ok(opened)
     });
@@ -1149,6 +1175,28 @@ mod tests {
                 r#"POST studio/7 {"action":"status"}"#,
                 r#"POST studio/7 {"action":"status"}"#,
             ]
+        );
+    }
+
+    #[test]
+    fn status_shows_a_pending_sync_and_warns_about_studio_only_removals() {
+        let pending = json!({"removed": {"count": 2, "paths": ["Workspace.Map", "Workspace.Spawn"]},
+                             "added": {"count": 1, "paths": ["ServerScriptService.Main"]},
+                             "changed": {"count": 0, "paths": {}}});
+        let fake = Fake {
+            projects: Script::new([json!([project("serving", true)])]),
+            instances: studio_open(),
+            studio: Script::new([json!({"status": "Confirming", "pending": pending}), json!({"status": "Confirming"})]),
+            ..Fake::default()
+        };
+        assert_eq!(
+            json_text(&run_session(&fake, "TestGame", "status").unwrap()),
+            r#"{"instanceId":"7","rojo":{"status":"Confirming","pending":{"removed":{"count":2,"paths":["Workspace.Map","Workspace.Spawn"]},"added":{"count":1,"paths":["ServerScriptService.Main"]},"changed":{"count":0,"paths":[]}}},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort. Accepting deletes 2 instances found only in Studio (pending.removed); abort keeps them."}"#
+        );
+        // An older bridge reports Confirming without a summary.
+        assert_eq!(
+            json_text(&run_session(&fake, "TestGame", "status").unwrap()),
+            r#"{"instanceId":"7","rojo":{"status":"Confirming"},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort."}"#
         );
     }
 
