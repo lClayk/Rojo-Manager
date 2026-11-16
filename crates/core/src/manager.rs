@@ -1366,7 +1366,7 @@ impl Engine {
     /// added names; errors when nothing could be added.
     pub fn add_projects(&self, path: &Path) -> Result<Vec<String>, String> {
         let added = if !project_files(path).is_empty() {
-            vec![self.register(path, None)?]
+            vec![self.register(path, None, None)?]
         } else {
             let entries = std::fs::read_dir(path).map_err(|e| format!("Cannot read that folder: {e}"))?;
             let mut children: Vec<PathBuf> = entries
@@ -1380,7 +1380,8 @@ impl Engine {
             if children.is_empty() {
                 return Err("No Rojo projects found in that folder or its children".into());
             }
-            let added: Vec<String> = children.iter().filter_map(|child| self.register(child, None).ok()).collect();
+            let added: Vec<String> =
+                children.iter().filter_map(|child| self.register(child, None, None).ok()).collect();
             if added.is_empty() {
                 return Err("None of the Rojo projects in that folder could be added".into());
             }
@@ -1398,16 +1399,24 @@ impl Engine {
         Ok(added)
     }
 
-    /// Save the project at `path` on the first free port and return its name. A lane takes the
-    /// folder's name with a number when that name is taken, and a local place with auto-connect.
-    fn register(&self, path: &Path, lane: Option<config::Lane>) -> Result<String, String> {
+    /// Save the project at `path` on the first free port and return its name. Without a
+    /// `project_file`, default.project.json is preferred. A lane takes the folder's name with a number
+    /// when that name is taken, and a local place with auto-connect.
+    fn register(
+        &self,
+        path: &Path,
+        project_file: Option<String>,
+        lane: Option<config::Lane>,
+    ) -> Result<String, String> {
         let mut files = project_files(path);
-        if files.is_empty() {
-            return Err("No *.project.json file found in that folder".into());
-        }
-        let project_file = match files.iter().position(|f| f == "default.project.json") {
-            Some(index) => files.remove(index),
-            None => files.remove(0),
+        let project_file = match project_file {
+            Some(file) if files.contains(&file) => file,
+            Some(file) => return Err(format!("No {file} in {}", path.display())),
+            None if files.is_empty() => return Err("No *.project.json file found in that folder".into()),
+            None => match files.iter().position(|f| f == "default.project.json") {
+                Some(index) => files.remove(index),
+                None => files.remove(0),
+            },
         };
         let path_text = path.to_string_lossy().into_owned();
         let folder =
@@ -1617,10 +1626,14 @@ impl Engine {
     /// project there with a local place of its own and auto-connect on, so its Studio connects as
     /// soon as it opens. Opening it is up to the caller. Returns the lane's project name.
     pub fn create_lane(&self, parent: &str, path: &Path, holder: Option<String>) -> Result<String, String> {
-        let parent = self.lock().config.project(parent).map(|p| p.name.clone()).ok_or_else(|| missing(parent))?;
+        let (parent, project_file) = {
+            let state = self.lock();
+            let project = state.config.project(parent).ok_or_else(|| missing(parent))?;
+            (project.name.clone(), project.project_file.clone())
+        };
         let lane = config::Lane { parent: parent.clone(), holder };
         let held = lane.holder.as_deref().map(|holder| format!(" for {holder}")).unwrap_or_default();
-        let name = self.register(path, Some(lane))?;
+        let name = self.register(path, Some(project_file), Some(lane))?;
         self.changed();
         self.notice(format!("Made lane {name} from {parent}{held}"));
         Ok(name)
@@ -1629,14 +1642,24 @@ impl Engine {
     /// Stop the project's server if it runs, then drop the project. Its folder is kept, but its local
     /// place file goes with it, and a lane's Studio window is closed first.
     pub fn remove(&self, name: &str) -> Result<(), String> {
-        let lane_place = {
-            let state = self.lock();
-            state.config.project(name).filter(|p| p.lane.is_some()).and_then(local_place)
-        };
-        if let Some(path) = lane_place {
-            studio::close_place_file(&path);
+        let lane = self.lock().config.project(name).is_some_and(|p| p.lane.is_some());
+        match lane {
+            true => self.remove_lane(name).map(|_| ()),
+            false => self.remove_project(name),
         }
-        self.remove_project(name)
+    }
+
+    /// Force-close the Studio windows that have the lane's place open, then remove it as `remove`
+    /// does. Returns how many Studio windows closed; a Studio that would not close stops it.
+    pub fn remove_lane(&self, name: &str) -> Result<usize, String> {
+        let project = self.lock().config.project(name).filter(|p| p.lane.is_some()).cloned();
+        let project = project.ok_or_else(|| format!("No lane named {name}"))?;
+        let closed = match local_place(&project) {
+            Some(path) => studio::close_place_file(&path)?,
+            None => 0,
+        };
+        self.remove_project(name)?;
+        Ok(closed)
     }
 
     /// End lanes whose folder is gone, such as a deleted git worktree. Their Studio stays open.
@@ -1644,7 +1667,10 @@ impl Engine {
         let gone: Vec<String> = {
             let state = self.lock();
             let lanes = state.config.projects.iter().filter(|p| p.lane.is_some());
-            lanes.filter(|p| !Path::new(&p.path).is_dir()).map(|p| p.name.clone()).collect()
+            let gone = |p: &&config::Project| {
+                std::fs::metadata(&p.path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            };
+            lanes.filter(gone).map(|p| p.name.clone()).collect()
         };
         for name in gone {
             if self.remove_project(&name).is_ok() {
@@ -2100,11 +2126,10 @@ impl ControlHandler for Control {
     fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError> {
         let engine = &self.0;
         if let Some(name) = name {
-            let lane = engine.project(name).filter(|p| p.lane.is_some());
-            let name = lane.ok_or_else(|| ControlError::new(format!("No lane named {name}"), 404))?.name;
-            engine.remove(&name).map_err(|e| ControlError::new(e, 500))?;
+            let name = engine.project(name).map_or_else(|| name.to_string(), |p| p.name);
+            let closed = engine.remove_lane(&name).map_err(|e| ControlError::new(e, 409))?;
             engine.notice(format!("Lane {name}: removed by an agent"));
-            return Ok(json!({ "removed": name }));
+            return Ok(json!({ "removed": name, "closedStudioWindows": closed }));
         }
         let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
         let parent = text("from").ok_or_else(|| ControlError::bad("Pass from, the project to make the lane from"))?;
@@ -2388,6 +2413,11 @@ mod tests {
         let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
         engine.add_projects(&folder("main")).unwrap();
         assert!(engine.create_lane("Missing", &folder("other"), None).is_err());
+        // A copy without the parent's project file is refused, not served from another file.
+        let wrong = folders.path().join("wrong");
+        std::fs::create_dir_all(&wrong).unwrap();
+        std::fs::write(wrong.join("lobby.project.json"), "{}").unwrap();
+        assert!(engine.create_lane("MyGame", &wrong, None).unwrap_err().contains("default.project.json"));
         let lane_folder = folder("lane");
         let name = engine.create_lane("MyGame", &lane_folder, Some("lane B".into())).unwrap();
         assert_eq!(name, "MyGame 2");

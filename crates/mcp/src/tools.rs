@@ -80,10 +80,12 @@ pub fn specs(studio_tools: bool) -> Value {
         {
             "name": "lane",
             "description": "An isolated Studio for parallel work, such as an agent working in a git worktree. create \
-                adds a project at path (a copy of the project from) with a local place of its own, opens that in \
-                Studio, starts its server, connects Rojo, and accepts the first sync. A lane stays across Rojo \
-                Manager restarts until remove, which closes its Studio, stops the server, and deletes the place, \
-                or until its folder is deleted.",
+                takes path, an existing copy of the project from (make the worktree first; this does not copy \
+                anything), adds it with a local place of its own built from the same project file, opens that in \
+                Studio, starts its server, connects Rojo, and accepts the first sync. A local place has no \
+                DataStores and none of the published place's Studio-built content. A lane stays across Rojo \
+                Manager restarts until remove, which force-closes its Studio (unsaved changes there are lost), \
+                stops the server, and deletes the place, or until its folder is deleted.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
                 "action": {"type": "string", "enum": ["create", "remove"]},
                 "from": {"type": "string", "description": "Project to make the lane from, for create"},
@@ -221,6 +223,8 @@ struct Project {
     name: String,
     state: String,
     port: u16,
+    #[serde(default)]
+    project_file: String,
     #[serde(default)]
     place: Option<PlaceLink>,
     /// The linked place's experience name, once Rojo Manager looked it up.
@@ -686,7 +690,9 @@ fn open_place(
         if instance_id.is_none() {
             let hint = match place {
                 PlaceLink::Published(_) => "",
-                PlaceLink::Local(_) => " A local place also needs the bridge from Rojo Manager 1.0 or newer.",
+                PlaceLink::Local(_) => {
+                    " A local place needs bridge version 9 or newer: check and install it with the updates tool."
+                }
             };
             return Err(format!(
                 "Studio was asked to open {}, but its Rojo Manager bridge did not report in within 3 minutes. Check \
@@ -888,6 +894,9 @@ fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String>
 enum LaneResult {
     Created {
         lane: String,
+        /// The project file it serves, the same one as the project it was made from.
+        #[serde(rename = "projectFile")]
+        project_file: String,
         project: Box<Brief>,
         #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
         instance_id: Option<String>,
@@ -919,6 +928,9 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
     body["path"] = json!(path);
     let name = field::<Project>(call(backend, "POST", &["lanes"], Some(&body), CALL_TIMEOUT)?, "project")?.name;
     let opened = open_place(backend, Some(name.clone()), None, true).and_then(|mut opened| {
+        if opened.instance_id.is_none() {
+            return Err(format!("{BRIDGE_MISSING} A lane needs it to sync its Studio."));
+        }
         if let (Some(instance_id), Some("Confirming")) = (&opened.instance_id, opened.rojo.as_ref().map(Rojo::status)) {
             opened.rojo = Some(bridge(backend, instance_id, "accept", None)?);
             opened.next = None;
@@ -926,17 +938,21 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
         Ok(opened)
     });
     match opened {
-        Ok(opened) => Ok(LaneResult::Created {
-            project: Box::new(find_project(backend, &name)?.into()),
-            lane: name,
-            instance_id: opened.instance_id,
-            rojo: opened.rojo,
-            note: opened.note,
-        }),
-        Err(error) => {
-            let _ = call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT);
-            Err(format!("{error} The lane was removed again."))
+        Ok(opened) => {
+            let project = find_project(backend, &name)?;
+            Ok(LaneResult::Created {
+                project_file: project.project_file.clone(),
+                project: Box::new(project.into()),
+                lane: name,
+                instance_id: opened.instance_id,
+                rojo: opened.rojo,
+                note: opened.note,
+            })
         }
+        Err(error) => match call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT) {
+            Ok(_) => Err(format!("{error} The lane was removed again.")),
+            Err(cleanup) => Err(format!("{error} Removing lane {name} again failed too: {cleanup}")),
+        },
     }
 }
 
@@ -1369,6 +1385,7 @@ mod tests {
         made["name"] = json!("TestGame-lane");
         made["place"] = json!({"file": "TestGame-lane-1a2b3c4d.rbxl"});
         made["lane"] = json!({"parent": "TestGame", "holder": "lane B"});
+        made["projectFile"] = json!("lobby.project.json");
         let mut serving = made.clone();
         serving["state"] = json!("serving");
         let open = json!({"bridge": true, "instances": [
@@ -1393,12 +1410,27 @@ mod tests {
         let created = lane(&fake, &args(create));
         assert_eq!(
             json_text(&created.unwrap()),
-            r#"{"lane":"TestGame-lane","project":{"name":"TestGame-lane","state":"serving","port":34879,"placeFile":"TestGame-lane-1a2b3c4d.rbxl","lane":{"parent":"TestGame","holder":"lane B"}},"instanceId":"9","rojo":{"status":"Connected"}}"#
+            r#"{"lane":"TestGame-lane","projectFile":"lobby.project.json","project":{"name":"TestGame-lane","state":"serving","port":34879,"placeFile":"TestGame-lane-1a2b3c4d.rbxl","lane":{"parent":"TestGame","holder":"lane B"}},"instanceId":"9","rojo":{"status":"Connected"}}"#
         );
         let calls = fake.calls();
         assert_eq!(calls[2], r#"POST lanes {"from":"TestGame","holder":"lane B","path":"C:/Lane"}"#);
         assert!(calls.contains(&"POST projects/TestGame-lane/open-studio".to_string()));
         assert_eq!(calls[calls.len() - 2], r#"POST studio/9 {"action":"accept"}"#);
+
+        // Without the bridge, the lane's Studio could never sync, so the lane is removed again.
+        let mut made = project("off", false);
+        made["name"] = json!("TestGame-lane");
+        made["place"] = json!({"file": "TestGame-lane-1a2b3c4d.rbxl"});
+        let fake = Fake {
+            projects: Script::new([json!([project("off", true)]), json!([project("off", true)]), json!([made])]),
+            reply: |_, _| json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "serving"}}),
+            instances: Script::new([json!({"bridge": false, "instances": []})]),
+            ..Fake::default()
+        };
+        let create = json!({"action": "create", "from": "TestGame", "path": "C:/Lane"});
+        let error = lane(&fake, &args(create)).unwrap_err();
+        assert!(error.contains("not installed") && error.ends_with("The lane was removed again."), "{error}");
+        assert!(fake.calls().contains(&"POST lanes/TestGame-lane/remove".to_string()));
     }
 
     #[test]
