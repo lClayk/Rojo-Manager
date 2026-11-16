@@ -1,6 +1,6 @@
 # Rojo Manager
 
-[![Downloads](https://img.shields.io/github/downloads/lClayk/Rojo-Manager/total)](https://github.com/lClayk/Rojo-Manager/releases)
+[![Release](https://img.shields.io/github/v/release/lClayk/Rojo-Manager)](https://github.com/lClayk/Rojo-Manager/releases/latest) [![Downloads](https://img.shields.io/github/downloads/lClayk/Rojo-Manager/total)](https://github.com/lClayk/Rojo-Manager/releases) [![Build](https://img.shields.io/github/actions/workflow/status/lClayk/Rojo-Manager/check.yml?branch=main&label=build)](https://github.com/lClayk/Rojo-Manager/actions/workflows/check.yml) [![License](https://img.shields.io/github/license/lClayk/Rojo-Manager)](LICENSE)
 
 A tray app for Windows and macOS that runs the [Rojo](https://rojo.space) servers for all your Roblox projects, with an MCP server so AI agents can run them too.
 
