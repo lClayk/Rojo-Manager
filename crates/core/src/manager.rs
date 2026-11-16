@@ -1842,6 +1842,9 @@ impl Engine {
                 if !path.is_file() {
                     self.build_place(&project, &path)?;
                 }
+                // A lock left by a Studio that crashed or was closed by force keeps Studio from
+                // opening the file. A running Studio holds its lock open, so only a stale one goes.
+                let _ = std::fs::remove_file(format!("{}.lock", path.display()));
                 crate::shell::open(&path.to_string_lossy())
             }
         };

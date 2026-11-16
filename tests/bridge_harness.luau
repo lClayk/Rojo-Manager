@@ -176,18 +176,20 @@ local services = {
 }
 
 local attributes = {}
+services.ServerStorage = {
+	GetAttribute = function(_, name)
+		return attributes[name]
+	end,
+	SetAttribute = function(_, name, value)
+		attributes[name] = value
+	end,
+}
 local game = {
 	__instance = true,
 	PlaceId = placeId,
 	Name = if placeName ~= "" then placeName else "Place1",
 	GetService = function(_, name)
 		return assert(services[name], `No stand-in for {name}`)
-	end,
-	GetAttribute = function(_, name)
-		return attributes[name]
-	end,
-	SetAttribute = function(_, name, value)
-		attributes[name] = value
 	end,
 }
 

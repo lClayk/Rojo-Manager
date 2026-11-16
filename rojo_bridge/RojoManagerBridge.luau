@@ -57,16 +57,18 @@ local MAX_PENDING_PATHS = 20
 local CONNECT_WAIT = 30
 local SETTLED = { Connected = true, Confirming = true, Error = true }
 
--- Rojo renames the DataModel to the project's name on its first sync, so the file name of a local
--- place Rojo Manager built ("MyGame-1a2b3c4d.rbxl") is kept in this attribute, which playtests copy.
+-- Rojo renames the DataModel to the project's name on its first sync, and a playtest's copy of the
+-- place is named "Game" without the DataModel's attributes. So the file name of a local place Rojo
+-- Manager built ("MyGame-1a2b3c4d.rbxl") is kept in this attribute on ServerStorage, which goes into
+-- the playtest server along with its attributes.
 local PLACE_ATTRIBUTE = "RojoManagerPlace"
 
--- Remember a Rojo Manager local place's file name while game.Name still is it. Places the user
--- opened themselves are left untouched.
+-- Remember a Rojo Manager local place's file name while game.Name still is it, which is right after
+-- Studio opens the file. Places the user opened themselves are left untouched.
 local function keepPlaceName()
 	local built = string.match(game.Name, "%-%x%x%x%x%x%x%x%x%.rbxl$") ~= nil
-	if game.PlaceId == 0 and built and game:GetAttribute(PLACE_ATTRIBUTE) == nil then
-		game:SetAttribute(PLACE_ATTRIBUTE, game.Name)
+	if game.PlaceId == 0 and built then
+		game:GetService("ServerStorage"):SetAttribute(PLACE_ATTRIBUTE, game.Name)
 	end
 end
 
@@ -75,7 +77,7 @@ local function placeName(): string?
 	if game.PlaceId ~= 0 then
 		return nil
 	end
-	local kept = game:GetAttribute(PLACE_ATTRIBUTE)
+	local kept = game:GetService("ServerStorage"):GetAttribute(PLACE_ATTRIBUTE)
 	return if type(kept) == "string" then kept else game.Name
 end
 
