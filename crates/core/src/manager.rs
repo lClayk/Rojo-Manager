@@ -23,7 +23,7 @@ use crate::studio::{self, ResolveError};
 use crate::studio_link::Link;
 use crate::tooling::{self, Job, RojoState, RojoStatus};
 use crate::updates::{self, UpdateState, UpdateStatus};
-use crate::{rojo_api, startup};
+use crate::{rojo_api, scaffold, startup};
 
 pub const LOG_CAP: usize = 2000;
 /// New projects take the first free port from here; 34871 is the auto-connect port.
@@ -1438,7 +1438,7 @@ impl Engine {
     /// added names; errors when nothing could be added.
     pub fn add_projects(&self, path: &Path) -> Result<Vec<String>, String> {
         let added = if !project_files(path).is_empty() {
-            vec![self.register(path, None, None)?]
+            vec![self.register(path, None, None, false)?]
         } else {
             let entries = std::fs::read_dir(path).map_err(|e| format!("Cannot read that folder: {e}"))?;
             let mut children: Vec<PathBuf> = entries
@@ -1453,7 +1453,7 @@ impl Engine {
                 return Err("No Rojo projects found in that folder or its children".into());
             }
             let added: Vec<String> =
-                children.iter().filter_map(|child| self.register(child, None, None).ok()).collect();
+                children.iter().filter_map(|child| self.register(child, None, None, false).ok()).collect();
             if added.is_empty() {
                 return Err("None of the Rojo projects in that folder could be added".into());
             }
@@ -1473,12 +1473,13 @@ impl Engine {
 
     /// Save the project at `path` on the first free port and return its name. Without a
     /// `project_file`, default.project.json is preferred. A lane takes the folder's name with a number
-    /// when that name is taken, and a local place with auto-connect.
+    /// when that name is taken. With `local`, the project gets a local place and auto-connect.
     fn register(
         &self,
         path: &Path,
         project_file: Option<String>,
         lane: Option<config::Lane>,
+        local: bool,
     ) -> Result<String, String> {
         let mut files = project_files(path);
         let project_file = match project_file {
@@ -1515,8 +1516,8 @@ impl Engine {
             project_file,
             port,
             autostart: false,
-            auto_connect: lane.is_some(),
-            place: lane.as_ref().map(|_| PlaceLink::Local(LocalPlace::new(&name))),
+            auto_connect: local,
+            place: local.then(|| PlaceLink::Local(LocalPlace::new(&name))),
             sourcemap: false,
             lane,
         });
@@ -1709,9 +1710,44 @@ impl Engine {
         };
         let lane = config::Lane { parent: parent.clone(), holder };
         let held = lane.holder.as_deref().map(|holder| format!(" for {holder}")).unwrap_or_default();
-        let name = self.register(path, Some(project_file), Some(lane))?;
+        let name = self.register(path, Some(project_file), Some(lane), true)?;
         self.changed();
         self.notice(format!("Made lane {name} from {parent}{held}"));
+        Ok(name)
+    }
+
+    /// Make a Rojo project in `path`, a new or empty folder, with `rojo init`, and add it with a
+    /// local place. Returns its name.
+    pub fn create_project(&self, path: &Path) -> Result<String, String> {
+        let rojo = tooling::find_tool("Rojo").ok_or("Rojo is not installed. Install it in Settings.")?;
+        scaffold::create(&rojo, path)?;
+        let name = self.register(path, None, None, true)?;
+        self.changed();
+        self.notice(format!("Created {name} with a local place"));
+        Ok(name)
+    }
+
+    /// Make a Rojo project in `path`, a new or empty folder, from the place file `file`: its code
+    /// services become files, and a copy of the place, map and all, becomes the project's local place.
+    /// Returns its name.
+    pub fn convert_place(&self, file: &Path, path: &Path) -> Result<String, String> {
+        let rojo = tooling::find_tool("Rojo").ok_or("Rojo is not installed. Install it in Settings.")?;
+        if !file.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rbxl")) {
+            return Err("Choose a .rbxl place file. In Studio, File > Save to File saves one.".into());
+        }
+        scaffold::convert(&rojo, file, path)?;
+        let name = self.register(path, None, None, true)?;
+        let place = self.lock().config.project(&name).and_then(local_place).ok_or("The new project has no place")?;
+        let copied = place.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::copy(file, &place));
+        if let Err(error) = copied {
+            let _ = self.remove_project(&name);
+            return Err(format!(
+                "Could not copy the place file: {error}. The project folder at {} is kept.",
+                path.display()
+            ));
+        }
+        self.changed();
+        self.notice(format!("Converted {} into {name}", file.file_name().unwrap_or_default().to_string_lossy()));
         Ok(name)
     }
 
@@ -2141,10 +2177,26 @@ impl ControlHandler for Control {
         if action == "add" {
             let path = body.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
             let path = PathBuf::from(path.ok_or_else(|| ControlError::bad("Pass the project folder's path"))?);
-            if !path.is_absolute() || !path.is_dir() {
-                return Err(ControlError::new(format!("No folder at {}. Pass an absolute path.", path.display()), 404));
+            if !path.is_absolute() {
+                return Err(ControlError::bad(format!("{} is not an absolute path", path.display())));
             }
-            let names = engine.add_projects(&path).map_err(|e| ControlError::new(e, 409))?;
+            let from = body.get("from").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
+            let create = match body.get("create") {
+                None | Some(Value::Null) => false,
+                Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("create must be a bool"))?,
+            };
+            let names = match from.map(PathBuf::from) {
+                Some(file) if !file.is_absolute() || !file.is_file() => {
+                    return Err(ControlError::new(format!("No place file at {}", file.display()), 404));
+                }
+                Some(file) => engine.convert_place(&file, &path).map(|name| vec![name]),
+                None if create => engine.create_project(&path).map(|name| vec![name]),
+                None if !path.is_dir() => {
+                    return Err(ControlError::new(format!("No folder at {}", path.display()), 404));
+                }
+                None => engine.add_projects(&path),
+            };
+            let names = names.map_err(|e| ControlError::new(e, 409))?;
             let added: Vec<Value> = names.iter().filter_map(|name| engine.agent_view(name)).collect();
             return Ok(json!({ "added": added }));
         }

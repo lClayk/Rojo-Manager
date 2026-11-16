@@ -39,7 +39,13 @@ Requires macOS 11 or later, on Apple silicon or Intel.
 
 ## Add a project
 
-Click **Add project** and select a folder containing a `*.project.json` file. You can also select a parent folder to add projects from its immediate subfolders. Each project gets a free port automatically; click the port to change it. Click the name to rename the project (stop its server first), or the folder path to open it. Then click **Start**.
+Click **Add project** and choose one of:
+
+- **Existing folder**: select a folder containing a `*.project.json` file, or a parent folder to add projects from its immediate subfolders.
+- **New project**: name a new or empty folder, and the manager runs `rojo init` there. When Rokit is installed, a `rokit.toml` pins the Rojo version it was made with.
+- **Convert place**: select a `.rbxl` file (in Studio, **File > Save to File**), then name a new or empty folder for the project. `rojo syncback` writes the place's code services as files: ReplicatedFirst, ReplicatedStorage, ServerScriptService, ServerStorage, StarterGui, StarterPack, and the StarterPlayer script folders. Services with nothing in them are left out. A copy of the place, map and all, becomes the project's local place, so Workspace, Lighting, and everything else stay in Studio. The folder also gets a `.gitignore` and a git repository. Needs Rojo 7.7 or later.
+
+New and converted projects start with a local place and auto-connect on, so **Open Studio** opens a synced place. Each project gets a free port automatically; click the port to change it. Click the name to rename the project (stop its server first), or the folder path to open it. Then click **Start**.
 
 If Rojo is missing, use **Install Rojo** in the warning or open **Settings > Tools**. Install the Studio plugin with its separate button, then connect from that plugin in Roblox Studio.
 
@@ -91,7 +97,7 @@ AI agents can run your Rojo servers, open places in Studio, connect or disconnec
 | `lane` | Gives an agent an isolated Studio for parallel work. `create` adds a project from a copy of a project, such as a git worktree, with a local place of its own, then opens it in Studio, starts its server, connects Rojo, and accepts the first sync. `remove` closes that Studio, stops the server, and deletes the place |
 | `server_logs` | Reads a project's recent Rojo output, such as sync errors or why the server stopped |
 | `studio_output` | Reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a playtest's server, filtered by level and read on from the last line seen |
-| `manage_project` | Adds a project folder, or every project in a parent folder; changes a project's name, port, autostart, auto-connect, or linked place; or removes it from the list |
+| `manage_project` | Adds a project folder, or every project in a parent folder; makes a new project with `rojo init` (`create`) or from a `.rbxl` place (`convert`); changes a project's name, port, autostart, auto-connect, or linked place; or removes it from the list |
 | `updates` | Checks whether the app and the Studio bridge are up to date, and installs either. Installing the app restarts it |
 | `app_settings` | Reads or changes the app's own preferences. Agents are told to change these only when asked |
 | `get_connected_instances` | Lists the open Studio windows with the bridge, with each one's place, linked project, and Rojo status |

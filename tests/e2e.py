@@ -288,6 +288,23 @@ def check(app_dir: Path) -> None:
             time.sleep(3)
             assert '"late"' not in sourcemap_names(project), "the sourcemap watcher outlived its server"
 
+            # New project: rojo init in a new folder, added with a local place.
+            fresh = Path(directory) / "Fresh"
+            created = mcp.call("manage_project", action="create", path=str(fresh))
+            assert [p["name"] for p in created["added"]] == ["Fresh"], created
+            assert (fresh / "default.project.json").is_file()
+
+            # Convert: the place's code services become files, and a copy of the place its local place.
+            place_file, converted_folder = Path(directory) / "Old.rbxl", Path(directory) / "Converted"
+            subprocess.run([shutil.which("rojo"), "build", str(project), "-o", str(place_file)], check=True)
+            converted = mcp.call("manage_project", action="convert", file=str(place_file), path=str(converted_folder))
+            assert [p["name"] for p in converted["added"]] == ["Converted"], converted
+            tree = json.loads((converted_folder / "default.project.json").read_bytes().decode())["tree"]
+            assert set(tree) == {"$className", "ServerScriptService"}, tree
+            assert (converted_folder / "src" / "ServerScriptService" / "main.server.luau").is_file()
+            [copy] = (profile / "places").glob("Converted-*.rbxl")
+            assert copy.read_bytes() == place_file.read_bytes()
+
             if os.environ.get("CI"):
                 check_login_item(mcp, app_dir)
         finally:
@@ -297,7 +314,8 @@ def check(app_dir: Path) -> None:
                     process.wait()
             if mcp:
                 mcp.close()
-    print("Sourcemap, Rojo server, bridge auto-connect, local places, sync backups, Studio Output, agent Luau, and login item "
+    print("Sourcemap, Rojo server, bridge auto-connect, local places, sync backups, Studio Output, agent Luau, new and "
+          "converted projects, and login item "
           "passed.")
 
 

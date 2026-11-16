@@ -26,8 +26,10 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
   field counts what accepting adds, changes, and removes; removed instances exist only in Studio and are deleted.
   Rojo Manager backs those up first (also when Rojo removes them without asking): rojo_session backups lists
   them and restore puts one back.
-- manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or
-  linked place, or removes a project from the list (its files are kept, except a local place file).
+- manage_project adds project folders, makes new projects (create runs rojo init; convert turns a .rbxl place's
+  code services into files and keeps the place, map and all, as the project's local place), changes a project's
+  name, port, autostart, auto_connect, sourcemap, or linked place, or removes a project from the list (its files
+  are kept, except a local place file).
 - lane create gives this agent an isolated Studio for parallel work: a project from a copy of a project (such
   as a git worktree), with a local place of its own, opened in Studio and synced. It stays across restarts; lane
   remove closes it, and deleting its folder ends it. Use one instead of sharing the main project's Studio with

@@ -43,6 +43,13 @@ pub enum Call {
     AddProjects {
         path: PathBuf,
     },
+    CreateProject {
+        path: PathBuf,
+    },
+    ConvertPlace {
+        file: PathBuf,
+        path: PathBuf,
+    },
     Update {
         name: String,
         update: Update,
@@ -135,6 +142,8 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::PortOwner { name } => json(engine.port_owner(&name)),
         Call::KillPortOwner { name, pid } => json(engine.kill_port_owner(&name, pid)),
         Call::AddProjects { path } => json(engine.add_projects(&path)),
+        Call::CreateProject { path } => json(engine.create_project(&path)),
+        Call::ConvertPlace { file, path } => json(engine.convert_place(&file, &path)),
         Call::Update { name, update } => json(engine.update(&name, update)),
         Call::Remove { name } => json(engine.remove(&name)),
         Call::AnswerSync { instance, accept } => json(engine.answer_sync(&instance, accept)),
@@ -261,6 +270,12 @@ impl Client {
     }
     pub fn add_projects(&self, path: &Path) -> Result<Vec<String>, String> {
         self.call(Call::AddProjects { path: path.into() })
+    }
+    pub fn create_project(&self, path: &Path) -> Result<String, String> {
+        self.call(Call::CreateProject { path: path.into() })
+    }
+    pub fn convert_place(&self, file: &Path, path: &Path) -> Result<String, String> {
+        self.call(Call::ConvertPlace { file: file.into(), path: path.into() })
     }
     pub fn update(&self, name: &str, update: Update) -> Result<ProjectView, String> {
         self.call(Call::Update { name: name.into(), update })

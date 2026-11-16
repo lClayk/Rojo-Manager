@@ -109,8 +109,12 @@ pub fn specs(studio_tools: bool) -> Value {
         },
         {
             "name": "manage_project",
-            "description": "Add, change, or remove Rojo Manager projects. add takes an absolute folder path: a \
-                Rojo project, or a parent folder whose project subfolders are all added on free ports. update \
+            "description": "Add, make, change, or remove Rojo Manager projects. add takes an absolute folder path: \
+                a Rojo project, or a parent folder whose project subfolders are all added on free ports. create \
+                makes a new project with rojo init in path, a new or empty folder. convert makes one in path from \
+                file, a .rbxl place: its code services (ReplicatedStorage, ServerScriptService, StarterGui, \
+                StarterPlayer scripts and the like) become files with rojo syncback, and a copy of the place, map \
+                and all, becomes its local place. Both add the project with a local place and auto_connect. update \
                 changes any of name, port, autostart, auto_connect (connect Rojo when the linked place \
                 opens in Studio while the server runs), sourcemap (keep sourcemap.json current with rojo \
                 sourcemap --watch while the server runs), and place (a place ID or link, local for an unpublished \
@@ -118,9 +122,10 @@ pub fn specs(studio_tools: bool) -> Value {
                 Renaming or changing the port needs the server stopped. remove drops the project from \
                 the list, stopping its server; its files are kept, except a local place file.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
-                "action": {"type": "string", "enum": ["add", "update", "remove"]},
+                "action": {"type": "string", "enum": ["add", "create", "convert", "update", "remove"]},
                 "project": {"type": "string", "description": "Project name, for update and remove"},
-                "path": {"type": "string", "description": "Absolute folder path, for add"},
+                "path": {"type": "string", "description": "Absolute folder path, for add, create, and convert"},
+                "file": {"type": "string", "description": "Absolute .rbxl place file path, for convert"},
                 "name": {"type": "string"},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "autostart": {"type": "boolean", "description": "Start the server when Rojo Manager opens"},
@@ -882,12 +887,17 @@ enum Managed {
 }
 
 fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String> {
-    let action = choice(args, "action", &["add", "update", "remove"])?;
-    if action == "add" {
+    let action = choice(args, "action", &["add", "create", "convert", "update", "remove"])?;
+    if matches!(action, "add" | "create" | "convert") {
         let path = string(args, "path")?;
+        let (body, timeout) = match action {
+            "create" => (json!({ "create": true, "path": path }), Duration::from_secs(60)),
+            // syncback reads the whole place
+            "convert" => (json!({ "from": string(args, "file")?, "path": path }), Duration::from_secs(300)),
+            _ => (json!({ "path": path }), Duration::from_secs(30)),
+        };
         manager_projects(backend)?; // starts the manager if needed
-        let body = json!({ "path": path });
-        let reply = call(backend, "POST", &["projects"], Some(&body), Duration::from_secs(30))?;
+        let reply = call(backend, "POST", &["projects"], Some(&body), timeout)?;
         let added: Vec<Project> = field(reply, "added")?;
         return Ok(Managed::Added { added: added.into_iter().map(Brief::from).collect() });
     }
@@ -1098,6 +1108,9 @@ mod tests {
             ..Fake::default()
         };
         let added = manage_project(&fake, &args(json!({"action": "add", "path": "C:/Games/Lobby"}))).unwrap();
+        manage_project(&fake, &args(json!({"action": "create", "path": "C:/Games/Lobby"}))).unwrap();
+        let convert = json!({"action": "convert", "path": "C:/Games/Lobby", "file": "C:/Lobby.rbxl"});
+        manage_project(&fake, &args(convert)).unwrap();
         let update = json!({"action": "update", "project": "testgame", "auto_connect": true, "port": 34900});
         let updated = manage_project(&fake, &args(update)).unwrap();
         let removed = manage_project(&fake, &args(json!({"action": "remove", "project": "TestGame"}))).unwrap();
@@ -1115,6 +1128,10 @@ mod tests {
             [
                 "GET projects",
                 r#"POST projects {"path":"C:/Games/Lobby"}"#,
+                "GET projects",
+                r#"POST projects {"create":true,"path":"C:/Games/Lobby"}"#,
+                "GET projects",
+                r#"POST projects {"from":"C:/Lobby.rbxl","path":"C:/Games/Lobby"}"#,
                 "GET projects",
                 r#"POST projects/TestGame/update {"autoConnect":true,"port":34900}"#,
                 "GET projects",
