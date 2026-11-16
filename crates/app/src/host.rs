@@ -386,7 +386,9 @@ pub fn run(launch: Launch) {
         .inspect_err(|error| engine.notice(format!("Agent control is unavailable: {error}")))
         .ok();
     // Another Rojo Manager, or another program, may hold the port; auto-connect is then off here.
-    let auto_connect = AutoConnectServer::start(handler, AUTO_CONNECT_PORT).ok();
+    // ROJO_MANAGER_BRIDGE_PORT moves it, so tests/e2e.py can run beside a live install.
+    let port = std::env::var("ROJO_MANAGER_BRIDGE_PORT").ok().and_then(|port| port.parse().ok());
+    let auto_connect = AutoConnectServer::start(handler, port.unwrap_or(AUTO_CONNECT_PORT)).ok();
     engine.run();
     for name in &launch.start {
         let _ = engine.start(name);

@@ -22,7 +22,8 @@ WINDOWS = sys.platform == "win32"
 ROOT = Path(__file__).resolve().parent.parent
 PLACE_ID = 123456
 PORT = 35990
-BRIDGE_PORT = "34871"
+# Set ROJO_MANAGER_BRIDGE_PORT to run beside a live Rojo Manager, which holds 34871.
+BRIDGE_PORT = os.environ.get("ROJO_MANAGER_BRIDGE_PORT", "34871")
 
 
 def executable(folder: Path, name: str) -> Path:
