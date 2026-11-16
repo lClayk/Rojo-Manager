@@ -563,6 +563,8 @@ impl Engine {
         self.check_rojo(false);
         let auto_update = self.settings().auto_update;
         self.check_app_update(false, auto_update);
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || engine.refresh_bridge());
         self.refresh_tool_versions();
         self.look_up_experiences();
         let engine = Arc::clone(self);
@@ -1829,8 +1831,8 @@ impl Engine {
         });
     }
 
-    /// Check for a newer release when enabled or forced. With `install`, a newer release is installed
-    /// (restarting into it), and otherwise an outdated Studio bridge is rebuilt.
+    /// Check for a newer release when enabled or forced. With `install`, a newer release is installed,
+    /// restarting into it; the new version's launch then rebuilds the bridge (see `refresh_bridge`).
     pub fn check_app_update(self: &Arc<Self>, force: bool, install: bool) {
         let (revision, enabled) = {
             let mut state = self.lock();
@@ -1852,13 +1854,27 @@ impl Engine {
             engine.changed();
             if install && outdated {
                 let _ = engine.install_app_update(); // a failure shows in the update status
-            } else if install
-                && engine.bridge_update().is_some()
-                && let Err(error) = engine.run_tool_job(Job::Bridge { tool: "Rojo".into() })
-            {
-                engine.notice(error);
             }
         });
+    }
+
+    /// Rebuild an outdated Studio bridge in the background at launch, so updating Rojo Manager or
+    /// Rojo updates the bridge too. Only a bridge this profile built (bridge.json) is rebuilt, and only
+    /// when Rojo and Lune are installed; otherwise the window keeps offering Update bridge. This keeps
+    /// isolated profiles, which share Studio's Plugins folder, from replacing the real bridge.
+    fn refresh_bridge(&self) {
+        let recorded = matches!(tooling::studio_plugin(), tooling::StudioPlugin::Bridge { built: Some(_) });
+        let tools = tooling::find_tool("Rojo").is_some() && tooling::find_tool("Lune").is_some();
+        if !recorded || !tools || self.bridge_update().is_none() {
+            return;
+        }
+        match tooling::install_rojo_bridge() {
+            Ok(_) => self.notice("Studio bridge updated. Restart Studio to load it."),
+            Err(error) => {
+                self.notice(format!("Could not update the Studio bridge: {error}. Use Update bridge in Settings."))
+            }
+        }
+        self.changed();
     }
 
     /// Why the installed Studio bridge needs rebuilding, if it does.
