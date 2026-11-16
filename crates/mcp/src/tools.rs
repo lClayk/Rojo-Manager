@@ -915,7 +915,7 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
     let action = choice(args, "action", &["create", "remove"])?;
     manager_projects(backend)?; // starts the manager if needed
     if action == "remove" {
-        let name = string(args, "lane")?;
+        let name = find_project(backend, &string(args, "lane")?)?.name;
         return Ok(LaneResult::Removed(call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT)?));
     }
     let from = find_project(backend, &string(args, "from")?)?.name;
@@ -1416,6 +1416,8 @@ mod tests {
         assert_eq!(calls[2], r#"POST lanes {"from":"TestGame","holder":"lane B","path":"C:/Lane"}"#);
         assert!(calls.contains(&"POST projects/TestGame-lane/open-studio".to_string()));
         assert_eq!(calls[calls.len() - 2], r#"POST studio/9 {"action":"accept"}"#);
+        lane(&fake, &args(json!({"action": "remove", "lane": "testgame-lane"}))).unwrap();
+        assert_eq!(fake.calls().last().unwrap(), "POST lanes/TestGame-lane/remove");
 
         // Without the bridge, the lane's Studio could never sync, so the lane is removed again.
         let mut made = project("off", false);
