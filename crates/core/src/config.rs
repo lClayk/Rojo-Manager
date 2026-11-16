@@ -74,6 +74,18 @@ impl PlaceLink {
     }
 }
 
+/// A lane: a project made by `lane create` from a copy of another project (such as a git worktree),
+/// with a local place of its own, for parallel work in its own Studio. It is saved like any project
+/// and ends when removed, or once its folder is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lane {
+    /// The project it was made from.
+    pub parent: String,
+    /// A label from whoever made it, such as "lane B".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -90,9 +102,8 @@ pub struct Project {
     /// Keep sourcemap.json current with `rojo sourcemap --watch` while the server runs. Only stored when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sourcemap: bool,
-    /// Lives only in this run's memory: `save` leaves it out, so it is gone when the app exits.
-    #[serde(skip)]
-    pub temporary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
 }
 
 /// App preferences. Field names are the JSON keys agents use.
@@ -316,6 +327,16 @@ pub fn validate(value: &Value) -> Result<Config, String> {
                 }
             }
         };
+        let lane = match item.get("lane") {
+            None | Some(Value::Null) => None,
+            Some(lane) => {
+                let text = |key| lane.get(key).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+                let parent = text("parent").filter(|_| matches!(place, Some(PlaceLink::Local(_))));
+                let parent = parent.ok_or("Lanes must name their parent project and have a local place")?;
+                let holder = text("holder").map(|holder| holder.chars().take(100).collect());
+                Some(Lane { parent: parent.to_string(), holder })
+            }
+        };
         projects.push(Project {
             name: name.to_string(),
             path: path.to_string(),
@@ -325,7 +346,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
             auto_connect,
             place,
             sourcemap,
-            temporary: false,
+            lane,
         });
     }
     // Only a window preference, so a bad entry is dropped instead of refusing the file.
@@ -351,14 +372,9 @@ pub fn load() -> Result<Config, String> {
     validate(&value)
 }
 
-/// Validate, then atomically replace config.json. Temporary projects are left out.
+/// Validate, then atomically replace config.json.
 pub fn save(config: &Config) -> Result<(), String> {
-    let mut value = serde_json::to_value(config).map_err(|e| e.to_string())?;
-    if let Some(Value::Array(projects)) = value.get_mut("projects") {
-        let mut temporary = config.projects.iter().map(|p| p.temporary);
-        projects.retain(|_| !temporary.next().unwrap_or(false));
-    }
-    let clean = validate(&value)?;
+    let clean = validate(&serde_json::to_value(config).map_err(|e| e.to_string())?)?;
     let path = config_path();
     let dir = path.parent().ok_or("Invalid settings folder")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -387,7 +403,8 @@ mod tests {
                           "port": 34872, "autostart": true, "autoConnect": true,
                           "place": {"placeId": 1, "universeId": 2}, "sourcemap": true},
                          {"name": "Lobby", "path": FOLDER, "projectFile": "default.project.json",
-                          "port": 34873, "autostart": false, "place": {"file": "Lobby-0123abcd.rbxl"}}],
+                          "port": 34873, "autostart": false, "place": {"file": "Lobby-0123abcd.rbxl"},
+                          "lane": {"parent": "Game", "holder": "lane B"}}],
             "settings": {"tray": false, "unknown": 1}
         });
         let config = validate(&stored).unwrap();
@@ -417,6 +434,8 @@ mod tests {
         assert!(validate(&json!({"projects": [local("A", 1, "..\\a.rbxl")]})).is_err());
         assert!(validate(&json!({"projects": [local("A", 1, "a.txt")]})).is_err());
         assert!(validate(&json!({"projects": [local("A", 1, "a.rbxl"), local("B", 2, "A.rbxl")]})).is_err());
+        let lane = json!({"name": "A", "path": FOLDER, "port": 1, "lane": {"parent": "Game"}});
+        assert!(validate(&json!({"projects": [lane]})).is_err()); // a lane needs a local place
         assert_eq!(validate(&json!({})).unwrap(), Config::default());
     }
 }

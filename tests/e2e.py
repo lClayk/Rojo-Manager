@@ -217,17 +217,16 @@ def check(app_dir: Path) -> None:
             assert [line["text"] for line in errors] == ["e2e error"], errors
             assert mcp.call("studio_output", instance_id=instance, since=output["next"])["lines"] == []
 
-            # A temporary copy of the project with a local place: the bridge in an unpublished place names
-            # it by its file, so auto-connect finds that project's server, and its Output stays its own.
+            # A copy of the project with a local place: the bridge in an unpublished place names it by its
+            # file, so auto-connect finds that project's server, and its Output stays its own.
             lane = Path(directory) / "MyGame-lane"
             shutil.copytree(project, lane)
-            added = mcp.call("manage_project", action="add", path=str(lane), temporary=True)["added"][0]
-            assert added["temporary"] is True and added["name"] == "MyGame-lane", added
+            added = mcp.call("manage_project", action="add", path=str(lane))["added"][0]
+            assert added["name"] == "MyGame-lane", added
             linked = mcp.call("manage_project", action="update", project="MyGame-lane", place="local",
                               auto_connect=True)["project"]
             place_file = linked["placeFile"]
             assert place_file.startswith("MyGame-lane-") and place_file.endswith(".rbxl"), linked
-            assert "MyGame-lane" not in (profile / "config.json").read_text(encoding="utf-8")
             lane_port = mcp.call("rojo_server", project="MyGame-lane", action="start")["project"]["port"]
 
             # With the sync prompt left to the agent, status shows what accepting would do first.

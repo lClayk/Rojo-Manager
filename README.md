@@ -55,8 +55,7 @@ If Rojo is missing, use **Install Rojo** in the warning or open **Settings > Too
 - The **tray menu** starts or stops each project's server, opens linked places in Studio, and has **Start All Servers** and **Stop All Servers**. A dot on the tray icon shows the servers' state, in the window's colors: yellow while one runs, green while Studio is connected, red when a port is taken. Turn it off with **Show server status on the tray icon**.
 - **Notify when a server fails** shows a system notification while the window is closed, for example when a crashed server is not restarted or another application takes a project's port.
 - **Restart servers that crash** starts a server again when it exits unexpectedly, up to 3 times a minute.
-- **Remove** removes a project from the list. It keeps all project files.
-- **Temporary** projects are added by agents (`manage_project` with `temporary`) for short-lived work, such as a second copy of a project in a git worktree. They are listed last under their own header, never saved, and gone when removed or when the manager exits, with their servers stopped. They get a free port and never autostart. **Keep** turns one into a normal project.
+- **Remove** removes a project from the list. It keeps all project files, except a local place file the manager built.
 - **Existing** means a Rojo server for this project is already running outside this manager session. **Port busy** means another application, or a Rojo server for a different project, owns the port. **Kill** names that process and asks before force-closing it.
 
 ## Tools and packages
@@ -88,16 +87,16 @@ AI agents can run your Rojo servers, open places in Studio, connect or disconnec
 | `rojo_server` | Starts, stops, or restarts a project's Rojo server, and answers once the server responds or has stopped |
 | `open_place` | Opens a project's place, or any place ID or link, in Studio, building a local place first if needed. Passing both a project and a place links them. `connect_rojo` also starts the server and connects Rojo |
 | `rojo_session` | Connects or disconnects Rojo in an open place (connect answers once Rojo has connected or asks to confirm), reads its status, or accepts or aborts Rojo's initial sync confirmation. While Rojo waits for that confirmation, the status summarizes what accepting would add, change, and remove, and warns about removing instances that exist only in Studio |
-| `lane` | Gives an agent an isolated Studio for parallel work. `create` makes a temporary project from a copy of a project, such as a git worktree, with a local place of its own, then opens it in Studio, starts its server, connects Rojo, and accepts the first sync. `remove` closes that Studio, stops the server, and deletes the place |
+| `lane` | Gives an agent an isolated Studio for parallel work. `create` adds a project from a copy of a project, such as a git worktree, with a local place of its own, then opens it in Studio, starts its server, connects Rojo, and accepts the first sync. `remove` closes that Studio, stops the server, and deletes the place |
 | `server_logs` | Reads a project's recent Rojo output, such as sync errors or why the server stopped |
 | `studio_output` | Reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a playtest's server, filtered by level and read on from the last line seen |
-| `manage_project` | Adds a project folder, or every project in a parent folder, optionally as a temporary project; changes a project's name, port, autostart, auto-connect, or linked place; keeps a temporary project; or removes it from the list |
+| `manage_project` | Adds a project folder, or every project in a parent folder; changes a project's name, port, autostart, auto-connect, or linked place; or removes it from the list |
 | `updates` | Checks whether the app and the Studio bridge are up to date, and installs either. Installing the app restarts it |
 | `app_settings` | Reads or changes the app's own preferences. Agents are told to change these only when asked |
 | `get_connected_instances` | Lists the open Studio windows with the bridge, with each one's place, linked project, and Rojo status |
 | `execute_luau` | Runs Luau in a Studio window with plugin permissions and returns what it returned and printed |
 
-A **lane** lets a second agent work beside you without touching your Studio: it gets its own copy of the project (usually a git worktree), its own Rojo server, and its own Studio window with a local place that connects Rojo as soon as it opens. The window lists lanes under the project they were made from, with the agent that holds them. **Remove** on a lane closes its Studio window, stops its server, and deletes its place file. Lanes end when the manager exits. Closing a lane's Studio is Windows only for now; on macOS, close that window yourself.
+A **lane** lets a second agent work beside you without touching your Studio: it gets its own copy of the project (usually a git worktree), its own Rojo server, and its own Studio window with a local place that connects Rojo as soon as it opens. The window lists lanes under the project they were made from, with the label the agent gave it. Lanes are saved like other projects, so they survive restarts and updates. **Remove** on a lane closes its Studio window, stops its server, and deletes its place file. Deleting a lane's folder (such as removing the worktree) also ends it, but leaves its Studio window open. Closing a lane's Studio is Windows only for now; on macOS, close that window yourself.
 
 If another Studio MCP server already gives your agents `execute_luau`, turn off **Studio tools for agents** in **Settings > Agents** so they only see one. When Rojo Manager finds one set up in Claude Code or Codex, the window asks once.
 

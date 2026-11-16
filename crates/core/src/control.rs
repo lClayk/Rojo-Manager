@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const ACTIONS: [&str; 8] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove", "keep"];
+pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
 pub const MAX_BODY: usize = 16384;
 /// A bridge poll can carry a command's result, such as the output of agent Luau.
 pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
@@ -85,7 +85,7 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError>;
     /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
-    /// Makes a lane ({"from", "path", "holder"}), answering {"lane", "project"}; or removes one.
+    /// Makes a lane ({"from", "path", "holder"}), answering {"project"}; or removes one.
     fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError>;
 }
 
