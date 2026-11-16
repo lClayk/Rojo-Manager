@@ -295,6 +295,11 @@ local function answer(app, choice: string)
 		error("Rojo is not waiting for a sync confirmation", 0)
 	end
 	app.confirmationBindable:Fire(choice)
+	-- Answer with what came of it, not the prompt that was just answered. Rojo Manager waits 15 s.
+	local deadline = os.clock() + 10
+	while (app.state or {}).appStatus == "Confirming" and os.clock() < deadline do
+		task.wait(0.1)
+	end
 	return status(app)
 end
 
