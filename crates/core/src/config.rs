@@ -18,8 +18,8 @@ pub struct Place {
 }
 
 /// An unpublished place file that Rojo Manager builds from the project with `rojo build`, kept in
-/// the data folder. Studio names the open place after its file (`game.Name`, with `game.PlaceId`
-/// 0), which is how the bridge tells local places apart, so each file name is unique.
+/// the data folder. The bridge names an unpublished place (`game.PlaceId` 0) by its file name, which
+/// is how local places are told apart, so each file name is unique.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalPlace {
     pub file: String,
@@ -57,7 +57,7 @@ impl PlaceLink {
         }
     }
 
-    /// Whether this is the place a bridge reports: its `game.PlaceId`, and `game.Name` when that is 0.
+    /// Whether this is the place a bridge reports: its `game.PlaceId`, and its file name when that is 0.
     pub fn matches(&self, place_id: u64, place_name: Option<&str>) -> bool {
         match self {
             PlaceLink::Published(place) => place.place_id == place_id,

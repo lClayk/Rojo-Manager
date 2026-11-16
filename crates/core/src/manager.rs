@@ -346,7 +346,7 @@ pub struct OutputLine {
 /// What a Studio bridge last said and was told.
 struct BridgeReport {
     place_id: u64,
-    /// `game.Name` of an unpublished place (place ID 0): the file name of a local place.
+    /// The name of an unpublished place (place ID 0): the file name of a local place.
     place_name: Option<String>,
     /// The server its Rojo is connected to, or 0.
     port: u16,
@@ -1679,12 +1679,14 @@ impl Engine {
         }
     }
 
-    /// Delete place files in the places folder that no project links, left by a crash or an unlink.
+    /// Delete place files in the places folder that no project links, left by a crash or an unlink,
+    /// with the .rbxl.lock files Studio leaves beside them when it is closed by force.
     fn sweep_places(&self) {
         let linked: HashSet<PathBuf> = self.lock().config.projects.iter().filter_map(local_place).collect();
         let Ok(entries) = std::fs::read_dir(config::data_dir().join("places")) else { return };
         for path in entries.flatten().map(|entry| entry.path()) {
-            if path.extension().is_some_and(|ext| ext == "rbxl") && !linked.contains(&path) {
+            let place = path.to_string_lossy().strip_suffix(".lock").map(PathBuf::from).unwrap_or_else(|| path.clone());
+            if place.extension().is_some_and(|ext| ext == "rbxl") && !linked.contains(&place) {
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -1708,6 +1710,7 @@ impl Engine {
         state.states.remove(name);
         drop(state);
         if let Some(path) = place {
+            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
             let _ = std::fs::remove_file(path);
         }
         self.changed();
@@ -2435,11 +2438,13 @@ mod tests {
         std::fs::write(place.path(), "built").unwrap();
         let stray = place.path().with_file_name("Stray-00000000.rbxl");
         std::fs::write(&stray, "left by a crash").unwrap();
+        let lock = place.path().with_file_name("Stray-00000000.rbxl.lock");
+        std::fs::write(&lock, "left by a force-closed Studio").unwrap();
         std::fs::remove_dir_all(&lane_folder).unwrap();
         engine.end_orphaned_lanes();
         assert!(engine.project("MyGame 2").is_none() && !place.path().exists());
         engine.sweep_places();
-        assert!(!stray.exists());
+        assert!(!stray.exists() && !lock.exists());
     }
 
     #[test]

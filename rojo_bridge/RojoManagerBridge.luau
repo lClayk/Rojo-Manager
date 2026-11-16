@@ -5,8 +5,8 @@
 -- patch_rojo_plugin.luau adds this module to the official Rojo plugin on the user's machine.
 -- In Edit mode it polls Rojo Manager on a fixed local port without pause. Each poll reports the
 -- place, the server Rojo is connected to, and Rojo's status, so Rojo Manager shows Connected only for
--- real sessions. An unpublished place (PlaceId 0) is named by game.Name, which Studio sets to the
--- file name of a local place. Rojo Manager holds the poll until it has a command for this Studio, or a few seconds.
+-- real sessions. An unpublished place (PlaceId 0) is named by its file name, which Studio gives
+-- game.Name when it opens the file (see placeName). Rojo Manager holds the poll until it has a command for this Studio, or a few seconds.
 --
 -- The answer names the server of a running project with auto-connect linked to this place; the
 -- bridge connects when that offer appears, accepting Rojo's initial sync prompt unless Rojo
@@ -52,9 +52,26 @@ local MAX_PENDING_PATHS = 20
 local CONNECT_WAIT = 30
 local SETTLED = { Connected = true, Confirming = true, Error = true }
 
--- game.Name for an unpublished place, which Rojo Manager matches to a local place's file.
+-- Rojo renames the DataModel to the project's name on its first sync, so the file name of a local
+-- place Rojo Manager built ("MyGame-1a2b3c4d.rbxl") is kept in this attribute, which playtests copy.
+local PLACE_ATTRIBUTE = "RojoManagerPlace"
+
+-- Remember a Rojo Manager local place's file name while game.Name still is it. Places the user
+-- opened themselves are left untouched.
+local function keepPlaceName()
+	local built = string.match(game.Name, "%-%x%x%x%x%x%x%x%x%.rbxl$") ~= nil
+	if game.PlaceId == 0 and built and game:GetAttribute(PLACE_ATTRIBUTE) == nil then
+		game:SetAttribute(PLACE_ATTRIBUTE, game.Name)
+	end
+end
+
+-- The name of an unpublished place, which Rojo Manager matches to a local place's file.
 local function placeName(): string?
-	return if game.PlaceId == 0 then game.Name else nil
+	if game.PlaceId ~= 0 then
+		return nil
+	end
+	local kept = game:GetAttribute(PLACE_ATTRIBUTE)
+	return if type(kept) == "string" then kept else game.Name
 end
 
 -- The attached app's current poll loop, so a detached or reattached app's loop stops.
@@ -446,6 +463,7 @@ function Bridge.attach(app)
 		end
 		return
 	end
+	keepPlaceName()
 	forwardOutput(app, "edit")
 	local token = {}
 	attached[app] = token

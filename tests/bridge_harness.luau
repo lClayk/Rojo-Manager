@@ -91,6 +91,7 @@ local services = {
 	},
 }
 
+local attributes = {}
 local game = {
 	__instance = true,
 	PlaceId = placeId,
@@ -98,7 +99,18 @@ local game = {
 	GetService = function(_, name)
 		return assert(services[name], `No stand-in for {name}`)
 	end,
+	GetAttribute = function(_, name)
+		return attributes[name]
+	end,
+	SetAttribute = function(_, name, value)
+		attributes[name] = value
+	end,
 }
+
+-- Rojo's first sync renames the DataModel to the project's name, as the real one does.
+local function synced()
+	game.Name = "MyGame"
+end
 
 -- A stand-in Instance: the bridge only asks for its full name.
 local function instance(fullName: string)
@@ -211,6 +223,7 @@ app = {
 				return
 			elseif choice == "Accept" then
 				app.state = { appStatus = "Connected", address = `localhost:{app.port.current}`, projectName = "MyGame" }
+				synced()
 				event(`connect {app.port.current}`)
 			else
 				app.serveSession = nil
@@ -243,6 +256,7 @@ app = {
 			return
 		end
 		app.state = { appStatus = "Connected", address = `localhost:{app.port.current}`, projectName = "MyGame" }
+		synced()
 		event(`connect {app.port.current}`)
 	end,
 	endSession = function()

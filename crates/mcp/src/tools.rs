@@ -453,7 +453,7 @@ struct StudioPlace {
 struct Instance {
     instance_id: String,
     place_id: u64,
-    /// game.Name of an unpublished place, from bridges since version 9.
+    /// The name of an unpublished place, a local place's file name, from bridges since version 9.
     #[serde(default)]
     place_name: Option<String>,
     #[serde(default)]
