@@ -304,8 +304,12 @@ local function endSession(app)
 	if (app.state or {}).appStatus == "Confirming" then
 		app.confirmationBindable:Fire("Abort")
 	end
-	if app.serveSession ~= nil then
+	local session = app.serveSession
+	if session ~= nil then
 		app:endSession()
+		-- A stopped session's request to the server is still open, so a server stopped right after
+		-- would fail it and put Rojo in Error. Nothing should hear from this session any more.
+		session:onStatusChanged(function() end)
 	end
 end
 

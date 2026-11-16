@@ -659,7 +659,9 @@ impl Engine {
         self.wait_until(timeout, || {
             let Some(project) = self.project(name) else { return true };
             match project.state {
-                ServerState::Off | ServerState::Blocked => true,
+                ServerState::Off => true,
+                // Right after a stop, the port can read as another app's until Rojo's child exits.
+                ServerState::Blocked => !stop,
                 ServerState::Starting => false,
                 _ if stop => false,
                 _ => rojo_api::server_info(project.port, Duration::from_millis(500)).is_some(),
@@ -968,9 +970,21 @@ impl Engine {
 
     pub fn stop(&self, name: &str) {
         self.lock().restarting.remove(name);
+        self.disconnect_studio(name);
         self.stop_server(name);
         self.wake_watcher();
         self.changed();
+    }
+
+    /// Disconnect Rojo in the Studio connected to the project's server, so stopping the server does
+    /// not leave Rojo there in Error. Answers that Studio, for a restart to reconnect.
+    fn disconnect_studio(&self, name: &str) -> Option<u64> {
+        let state = self.lock();
+        let port = state.port(name).ok()?;
+        let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
+        let studio = live.clone().find(|(_, report)| report.port == port).map(|(id, _)| *id)?;
+        drop(state);
+        self.link.run(studio, "disconnect", json!({}), Duration::from_secs(5)).ok().map(|_| studio)
     }
 
     fn stop_server(&self, name: &str) {
@@ -1030,6 +1044,8 @@ impl Engine {
     /// Stop, then start again once the port is free (up to 5 seconds).
     pub fn restart(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let port = self.lock().port(name)?;
+        // A Studio that was connected is reconnected once the server is back.
+        let studio = self.disconnect_studio(name);
         self.stop(name);
         self.lock().restarting.insert(name.to_string());
         self.changed();
@@ -1043,7 +1059,13 @@ impl Engine {
                 }
                 if !port_in_use(port) {
                     engine.lock().restarting.remove(&name);
-                    let _ = engine.start(&name);
+                    if engine.start(&name).is_ok()
+                        && let Some(studio) = studio
+                    {
+                        engine.wait_for_server(&name, "start");
+                        let args = json!({ "port": port, "wait": true });
+                        let _ = engine.link.run(studio, "connect", args, Duration::from_secs(40));
+                    }
                     return;
                 }
                 if Instant::now() >= deadline {

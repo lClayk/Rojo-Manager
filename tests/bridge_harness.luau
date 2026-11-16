@@ -368,6 +368,7 @@ app = {
 		function session:hookPrecommit(hook)
 			table.insert(self.precommit, hook)
 		end
+		function session:onStatusChanged() end
 		-- As the patched App:startSession does, before the session starts.
 		Bridge.session(app, session)
 		app.serveSession = session
