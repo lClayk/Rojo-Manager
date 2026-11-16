@@ -252,6 +252,16 @@ def check(app_dir: Path) -> None:
                 listed = {p["name"]: p for p in mcp.call("list_projects")["projects"]}
                 return listed["MyGame-lane"].get("studio", {}).get("rojo", {}).get("status") == "Connected"
             wait_for(lane_connected, 30, "the lane's Rojo to report Connected")
+
+            # Accepting removed a Studio-only model, so the bridge backed it up first; Terrain could not
+            # be copied. Restore puts the model back under Workspace.
+            def backups():
+                return mcp.call("rojo_session", project="MyGame-lane", action="backups")["backups"]
+            backup = wait_for(backups, 15, "the backup to arrive")[0]
+            assert backup["paths"] == ["Workspace.Map"] and backup["skipped"] == ["Workspace.Terrain"], backup
+            assert (profile / "backups" / "MyGame-lane" / f"{backup['id']}.rbxm").is_file()
+            restored = mcp.call("rojo_session", project="MyGame-lane", action="restore")
+            assert restored == {"backup": backup["id"], "restored": ["Workspace.Map"], "missing": []}, restored
             lane_output = wait_for(lambda: mcp.call("studio_output", project="MyGame-lane")["lines"], 30, "lane Output")
             assert [line["text"] for line in lane_output].count("edit started") == 1, lane_output
             mcp.call("manage_project", action="remove", project="MyGame-lane")
@@ -287,7 +297,7 @@ def check(app_dir: Path) -> None:
                     process.wait()
             if mcp:
                 mcp.close()
-    print("Sourcemap, Rojo server, bridge auto-connect, local places, Studio Output, agent Luau, and login item "
+    print("Sourcemap, Rojo server, bridge auto-connect, local places, sync backups, Studio Output, agent Luau, and login item "
           "passed.")
 
 

@@ -21,10 +21,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
+pub const ACTIONS: [&str; 8] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove", "restore"];
 pub const MAX_BODY: usize = 16384;
 /// A bridge poll can carry a command's result, such as the output of agent Luau.
 pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
+/// The largest backup a bridge may send, base64 included.
+pub const MAX_BACKUP_BODY: usize = 64 * 1024 * 1024;
 /// Fixed so the bridge can find it; project ports start at 34872.
 pub const AUTO_CONNECT_PORT: u16 = 34871;
 
@@ -58,6 +60,7 @@ impl std::fmt::Display for ControlError {
 /// - POST /projects                  act(None, "add", body)
 /// - POST /projects/<name>/<action>  act(Some(name), action, body), action in ACTIONS
 /// - GET  /projects/<name>/logs      logs(name)
+/// - GET  /projects/<name>/backups   backups(name)
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
 /// - GET  /updates, POST /updates/<target>  updates(None) or updates(Some(target)), target app or bridge
 /// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
@@ -65,6 +68,7 @@ impl std::fmt::Display for ControlError {
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
 /// - POST /bridge/<id>               poll_bridge(id, body) (AutoConnectServer, no token)
 /// - POST /output                    report_output(body) (AutoConnectServer, no token)
+/// - POST /backup                    save_backup(body) (AutoConnectServer, no token)
 ///
 /// Bodies are JSON objects ({} when empty). Errors reply {"error": message} with their status.
 pub trait ControlHandler: Send + Sync + 'static {
@@ -73,6 +77,10 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn settings(&self, changes: Option<&Map<String, Value>>) -> Result<Value, ControlError>;
     /// {"project", "state", "lines"}: the project's recent Rojo output, oldest first.
     fn logs(&self, project: &str) -> Result<Value, ControlError>;
+    /// {"project", "backups"}: the project's backups, newest first.
+    fn backups(&self, project: &str) -> Result<Value, ControlError>;
+    /// Copies of Studio-only instances a bridge made just before Rojo removed them.
+    fn save_backup(&self, backup: BackupUpload);
     /// How many Rojo plugins the bridge found running in Studio.
     fn report_rojo_plugins(&self, count: u32);
     /// A bridge's poll. Answers {"port", "accept"}: the place's auto-connect server (null for none)
@@ -124,6 +132,26 @@ pub struct StudioOutput {
     pub place_name: Option<String>,
     pub context: OutputContext,
     pub lines: Vec<OutputReport>,
+}
+
+/// What a bridge sends when Rojo is about to remove instances that exist only in Studio: the place,
+/// the server whose patch removes them, their full names, and their copies as base64 `.rbxm`. When
+/// copying failed, `data` is missing and `error` says why.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupUpload {
+    pub place_id: u64,
+    #[serde(default)]
+    pub place_name: Option<String>,
+    pub port: u16,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<String>,
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// The DataModel a line of Output came from: Edit mode, or a playtest's server. A playtest's client
@@ -220,6 +248,18 @@ impl AutoConnectServer {
                     match output {
                         Ok(output) => {
                             handler.report_output(output);
+                            (200, json!({}))
+                        }
+                        Err(error) => (error.status, json!({ "error": error.message })),
+                    }
+                }
+                (true, "backup", None) if rest.is_empty() => {
+                    let backup = body(request, MAX_BACKUP_BODY).and_then(|body| {
+                        serde_json::from_value(Value::Object(body)).map_err(|e| ControlError::bad(e.to_string()))
+                    });
+                    match backup {
+                        Ok(backup) => {
+                            handler.save_backup(backup);
                             (200, json!({}))
                         }
                         Err(error) => (error.status, json!({ "error": error.message })),
@@ -339,6 +379,7 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
             handler.act(Some(name), action, &body(request, MAX_BODY)?)
         }
         (true, ["projects", name, "logs"]) => handler.logs(name),
+        (true, ["projects", name, "backups"]) => handler.backups(name),
         (true, ["settings"]) => handler.settings(None),
         (false, ["settings"]) => handler.settings(Some(&body(request, MAX_BODY)?)),
         (true, ["studio"]) => handler.studio(None),
@@ -506,6 +547,14 @@ mod tests {
             Ok(json!({"project": project, "lines": ["a"]}))
         }
 
+        fn backups(&self, project: &str) -> Result<Value, ControlError> {
+            Ok(json!({"project": project, "backups": []}))
+        }
+
+        fn save_backup(&self, backup: BackupUpload) {
+            self.calls.lock().unwrap().push(json!(["backup", backup.port, backup.paths, backup.data]));
+        }
+
         fn report_rojo_plugins(&self, count: u32) {
             self.calls.lock().unwrap().push(json!(["rojo-plugins", count]));
         }
@@ -643,6 +692,12 @@ mod tests {
             400
         );
         assert_eq!(fake.calls.lock().unwrap().last(), Some(&json!(["output", 42, "server", [["boom", "error"]]])));
+        // Backups are larger than polls, up to MAX_BACKUP_BODY.
+        let data = "A".repeat(MAX_BRIDGE_BODY);
+        let backup = json!({"placeId": 0, "placeName": "MyGame-00000000.rbxl", "port": 34880, "paths": ["Workspace.Map"], "data": data});
+        assert_eq!(send("POST", "/backup", Some(&backup), &[]).0, 200);
+        assert_eq!(fake.calls.lock().unwrap().last(), Some(&json!(["backup", 34880, ["Workspace.Map"], data])));
+        assert_eq!(send("POST", "/backup", Some(&json!({"paths": []})), &[]).0, 400);
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         server.close();

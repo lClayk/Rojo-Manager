@@ -3,6 +3,7 @@
 //!
 //! Errors that reach people (toasts, agent replies) are plain `String` messages written for them.
 
+pub mod backups;
 pub mod config;
 pub mod control;
 pub mod https;

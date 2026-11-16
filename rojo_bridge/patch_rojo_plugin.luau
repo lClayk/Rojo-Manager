@@ -22,17 +22,30 @@ if plugin:FindFirstChild("RojoManagerBridge") then
 	error("This Rojo plugin already contains the Rojo Manager bridge", 0)
 end
 
-local function insertAfter(source: string, anchor: string, line: string): string
+-- Where `anchor` occurs in Plugin.App, which must be exactly once.
+local function find(source: string, anchor: string): (number, number)
 	local first, last = string.find(source, anchor, 1, true)
 	if not first or string.find(source, anchor, last + 1, true) then
 		error(`Unsupported Rojo version: expected exactly one "{anchor}" in Plugin.App`, 0)
 	end
+	return first, last
+end
+
+local function insertAfter(source: string, anchor: string, line: string): string
+	local _, last = find(source, anchor)
 	return string.sub(source, 1, last) .. "\n" .. line .. string.sub(source, last + 1)
+end
+
+local function insertBefore(source: string, anchor: string, line: string): string
+	local first = find(source, anchor)
+	return string.sub(source, 1, first - 1) .. line .. "\n\t" .. string.sub(source, first)
 end
 
 local source = app.Source
 source = insertAfter(source, "function App:init()", "\trequire(script.Parent.RojoManagerBridge).attach(self)")
 source = insertAfter(source, "function App:willUnmount()", "\trequire(script.Parent.RojoManagerBridge).detach(self)")
+-- In App:startSession, before the session starts, so its first sync can be backed up too.
+source = insertBefore(source, "serveSession:start()", "require(script.Parent.RojoManagerBridge).session(self, serveSession)")
 app.Source = source
 
 local bridge = roblox.Instance.new("ModuleScript")

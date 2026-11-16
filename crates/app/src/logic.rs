@@ -153,6 +153,32 @@ pub fn lane_label(project: &ProjectView) -> Option<String> {
     })
 }
 
+/// How long ago a Unix time was, for the backups list: "just now", "5 min ago", "3 h ago", "2 days ago".
+pub fn ago(now: u64, then: u64) -> String {
+    match now.saturating_sub(then) {
+        0..60 => "just now".into(),
+        seconds @ 60..3600 => format!("{} min ago", seconds / 60),
+        seconds @ 3600..86400 => format!("{} h ago", seconds / 3600),
+        seconds if seconds < 2 * 86400 => "1 day ago".into(),
+        seconds => format!("{} days ago", seconds / 86400),
+    }
+}
+
+/// A backup's line: "2 instances: Workspace.Map, Workspace.Tree", plus what could not be copied.
+pub fn backup_paths(paths: &[String], skipped: &[String]) -> String {
+    let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
+    let more = paths.len().saturating_sub(shown.len());
+    let noun = if paths.len() == 1 { "instance" } else { "instances" };
+    let mut line = format!("{} {noun}: {}", paths.len(), shown.join(", "));
+    if more > 0 {
+        line.push_str(&format!(", +{more}"));
+    }
+    if !skipped.is_empty() {
+        line.push_str(&format!(" ({} not copied: {})", skipped.len(), skipped.join(", ")));
+    }
+    line
+}
+
 /// The parts of a pending sync's line, each with whether it is a warning: removals first, since
 /// they delete what exists only in Studio. An older bridge sends no summary.
 pub fn sync_parts(summary: Option<&SyncSummary>) -> Vec<(String, bool)> {
@@ -305,6 +331,7 @@ mod tests {
             sourcemap: false,
             lane: None,
             pending_sync: None,
+            backups: vec![],
             experience: None,
             state,
             badges: vec![],
@@ -349,6 +376,20 @@ mod tests {
         let lanes = lanes_of(&projects, "Lobby");
         assert_eq!(lanes.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Lobby-fix"]);
         assert_eq!(lane_label(lanes[0]).as_deref(), Some("Lane: lane B"));
+    }
+
+    #[test]
+    fn backups_read_as_age_and_paths() {
+        assert_eq!(
+            [ago(1000, 990), ago(1000, 700), ago(10000, 2000), ago(200000, 0)],
+            ["just now", "5 min ago", "2 h ago", "2 days ago"]
+        );
+        let paths: Vec<String> = ["Workspace.A", "Workspace.B", "Workspace.C", "Workspace.D"].map(Into::into).into();
+        assert_eq!(
+            backup_paths(&paths, &["Workspace.Terrain".into()]),
+            "4 instances: Workspace.A, Workspace.B, Workspace.C, +1 (1 not copied: Workspace.Terrain)"
+        );
+        assert_eq!(backup_paths(&paths[..1], &[]), "1 instance: Workspace.A");
     }
 
     #[test]

@@ -162,6 +162,22 @@ pub fn render(
                 .child(title)
                 .when_some(logic::lane_label(p), |d, label| {
                     d.child(div().flex_shrink_0().text_size(TEXT_SM).text_color(rgb(MUTED)).child(label))
+                })
+                .when(!p.backups.is_empty(), |d| {
+                    let tip = format!("Backups of {} removals Rojo made in Studio", p.backups.len());
+                    d.child(
+                        div()
+                            .id(format!("backups-{}", p.name))
+                            .flex_shrink_0()
+                            .text_color(rgb(MUTED))
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .tooltip(crate::widgets::tooltip(tip))
+                            .on_click(on_click(&p.name, cx, |this, name, _, cx| {
+                                this.backups = Some(name.to_string());
+                                cx.notify();
+                            }))
+                            .child(icon("history", 14., MUTED)),
+                    )
                 }),
         )
         .child(
@@ -473,7 +489,7 @@ fn set_place(engine: &Client, name: &str, text: &str) -> Result<ProjectView, Str
 }
 
 impl MainView {
-    fn project(&self, name: &str) -> Option<&ProjectView> {
+    pub(super) fn project(&self, name: &str) -> Option<&ProjectView> {
         self.snapshot.as_ref()?.projects.iter().find(|p| p.name == name)
     }
 

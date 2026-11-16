@@ -10,11 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::backups::{self, Backup};
 use crate::config::{self, Config, Lane, LocalPlace, Place, PlaceLink, Settings};
-use crate::control::{BridgePoll, ControlError, ControlHandler, OutputContext, OutputKind, StudioOutput};
+use crate::control::{BackupUpload, BridgePoll, ControlError, ControlHandler, OutputContext, OutputKind, StudioOutput};
 use crate::localnet::{self, port_in_use};
 use crate::studio::{self, ResolveError};
 use crate::studio_link::Link;
@@ -88,6 +91,9 @@ pub struct ProjectView {
     pub sourcemap: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
+    /// Copies of Studio-only instances Rojo removed while syncing this project, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backups: Vec<Backup>,
     /// A Studio with this place open waits for Rojo's initial sync to this server to be confirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_sync: Option<PendingSync>,
@@ -325,6 +331,8 @@ struct State {
     bridges: HashMap<u64, BridgeReport>,
     /// Experience names by universe ID, looked up once per run.
     experiences: HashMap<u64, String>,
+    /// Each project's backups, newest first; read from disk at launch and kept in step.
+    backups: HashMap<String, Vec<Backup>>,
     /// Another Studio MCP set up in an agent, found at launch.
     other_studio_mcp: Option<String>,
     /// Studio's recent Output by place (ID, and name when unpublished), from its Edit DataModel and playtests.
@@ -560,6 +568,17 @@ impl Engine {
         std::thread::spawn(move || engine.watch());
         self.record_first_run();
         self.sweep_places();
+        {
+            let mut state = self.lock();
+            let names: Vec<String> = state.config.projects.iter().map(|p| p.name.clone()).collect();
+            state.backups = names
+                .into_iter()
+                .map(|name| {
+                    let list = backups::list(&name);
+                    (name, list)
+                })
+                .collect();
+        }
         self.check_rojo(false);
         let auto_update = self.settings().auto_update;
         self.check_app_update(false, auto_update);
@@ -689,6 +708,7 @@ impl Engine {
             sourcemap: p.sourcemap,
             lane: p.lane.clone(),
             pending_sync: state.pending_sync(p),
+            backups: state.backups.get(&p.name).cloned().unwrap_or_default(),
             experience: p
                 .place
                 .as_ref()
@@ -1196,6 +1216,56 @@ impl Engine {
         self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
     }
 
+    /// Store a backup a bridge sent, under the project whose server's patch removed the instances.
+    /// A failed copy is stored too, so the history shows it, and announced.
+    pub fn save_backup(&self, upload: BackupUpload) {
+        let project = self.lock().config.projects.iter().find(|p| p.port == upload.port).map(|p| p.name.clone());
+        let Some(project) = project else { return };
+        let data = match (upload.data, upload.error) {
+            (Some(data), _) => BASE64.decode(data.as_bytes()).map_err(|_| "The bridge sent a damaged copy".to_string()),
+            (None, error) => Err(error.unwrap_or_else(|| "The bridge sent no copy".into())),
+        };
+        match backups::save(&project, upload.paths, upload.skipped, data) {
+            Ok(backup) => {
+                if let Some(error) = &backup.error {
+                    self.alert(format!("{project}: Rojo removed instances that existed only in Studio, and backing them up failed: {error}"));
+                }
+                let mut state = self.lock();
+                let list = state.backups.entry(project).or_default();
+                list.insert(0, backup);
+                list.truncate(backups::KEEP);
+            }
+            Err(error) => self.alert(format!("{project}: could not save a backup: {error}")),
+        }
+        self.changed();
+    }
+
+    /// The live Studio window a project syncs: connected to its server, or else with its place open.
+    fn project_instance(&self, project: &config::Project) -> Option<u64> {
+        let state = self.lock();
+        let live = || state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
+        let connected = live().find(|(_, report)| report.port == project.port).map(|(id, _)| *id);
+        connected.or_else(|| {
+            let place = project.place.as_ref()?;
+            live().find(|(_, report)| place.matches(report.place_id, report.place_name.as_deref())).map(|(id, _)| *id)
+        })
+    }
+
+    /// Put a backup's instances back under their old parents in the project's open Studio: the
+    /// newest restorable backup without an `id`. Answers {"backup", "restored", "missing"}.
+    pub fn restore_backup(&self, name: &str, id: Option<&str>) -> Result<Value, String> {
+        let project = self.lock().config.project(name).cloned().ok_or_else(|| missing(name))?;
+        let (backup, data) = backups::read(&project.name, id)?;
+        let instance = self.project_instance(&project).ok_or_else(|| {
+            format!("{name} is not open in Studio. Open its place, then restore; backups go back into the open place.")
+        })?;
+        let args = json!({ "data": BASE64.encode(data) });
+        let result = self.link.run(instance, "restore", args, Duration::from_secs(60))?;
+        // An empty Luau table arrives as {}.
+        let list = |key: &str| result.get(key).filter(|value| value.is_array()).cloned().unwrap_or_else(|| json!([]));
+        Ok(json!({ "backup": backup.id, "restored": list("restored"), "missing": list("missing") }))
+    }
+
     /// Accept or abort the initial sync Rojo waits on in one Studio window.
     pub fn answer_sync(&self, instance: &str, accept: bool) -> Result<(), String> {
         let action = if accept { "accept" } else { "abort" };
@@ -1528,7 +1598,11 @@ impl Engine {
         config::save(&config)?;
         state.config = config;
         if new_name != name {
-            // Logs and the last seen state follow the project to its new name.
+            // Logs, the last seen state, and backups follow the project to its new name.
+            backups::rename(name, &new_name);
+            if let Some(list) = state.backups.remove(name) {
+                state.backups.insert(new_name.clone(), list);
+            }
             if let Some(logs) = state.logs.remove(name) {
                 state.logs.insert(new_name.clone(), logs);
             }
@@ -2012,6 +2086,7 @@ impl Engine {
         let mut value = serde_json::to_value(view).ok()?;
         let object = value.as_object_mut()?;
         object.remove("badges");
+        object.remove("backups");
         object.insert("log".into(), json!(log));
         Some(value)
     }
@@ -2104,6 +2179,12 @@ impl ControlHandler for Control {
                 engine.notice(format!("{}: updated by an agent", updated.name));
                 reply(&updated.name)
             }
+            "restore" => {
+                let id = body.get("backup").and_then(Value::as_str);
+                let restored = engine.restore_backup(name, id).map_err(|e| ControlError::new(e, 409))?;
+                engine.notice(format!("{name}: backup restored by an agent"));
+                Ok(restored)
+            }
             "remove" => {
                 engine.remove(name).map_err(|e| ControlError::new(e, 500))?;
                 engine.notice(format!("{name}: removed by an agent"));
@@ -2161,6 +2242,15 @@ impl ControlHandler for Control {
         Ok(json!({ "project": engine.agent_view(&name) }))
     }
 
+    fn backups(&self, project: &str) -> Result<Value, ControlError> {
+        let view = self.0.project(project).ok_or_else(|| ControlError::new(missing(project), 404))?;
+        Ok(json!({ "project": view.name, "backups": view.backups }))
+    }
+
+    fn save_backup(&self, backup: BackupUpload) {
+        self.0.save_backup(backup);
+    }
+
     fn logs(&self, project: &str) -> Result<Value, ControlError> {
         let view = self.0.project(project).ok_or_else(|| ControlError::new(missing(project), 404))?;
         let lines: Vec<String> = self.0.logs(&view.name).into_iter().map(|(_, line)| line).collect();
@@ -2208,7 +2298,13 @@ impl ControlHandler for Control {
             (result.id, outcome)
         });
         let command = self.0.link.poll(id, result, BRIDGE_HOLD);
-        json!({ "port": offer.map(|(port, _)| port), "accept": offer.is_some_and(|(_, accept)| accept), "command": command })
+        let backups = self.0.settings().backups;
+        json!({
+            "port": offer.map(|(port, _)| port),
+            "accept": offer.is_some_and(|(_, accept)| accept),
+            "backups": backups,
+            "command": command,
+        })
     }
 
     fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError> {

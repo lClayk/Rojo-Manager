@@ -24,6 +24,8 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
   waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort. Its pending
   field counts what accepting adds, changes, and removes; removed instances exist only in Studio and are deleted.
+  Rojo Manager backs those up first (also when Rojo removes them without asking): rojo_session backups lists
+  them and restore puts one back.
 - manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or
   linked place, or removes a project from the list (its files are kept, except a local place file).
 - lane create gives this agent an isolated Studio for parallel work: a project from a copy of a project (such
