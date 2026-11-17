@@ -2,7 +2,8 @@
 -- end-to-end test. Studio's services and Rojo's plugin App are small stand-ins: HttpService makes
 -- real requests, so the bridge talks to a real Rojo Manager, and "connecting" Rojo only records
 -- the server it was asked to use.
--- Usage: lune run bridge_harness.luau <RojoManagerBridge.luau> <placeId> [bridge port]
+-- Usage: lune run bridge_harness.luau <RojoManagerBridge.luau> <placeId>[:<place name>] [bridge port]
+-- The place name is game.Name, which Studio sets to a local place's file name (place ID 0).
 -- Prints one line per event ("connect <port>", "disconnect") for the test to read.
 
 local fs = require("@lune/fs")
@@ -13,8 +14,10 @@ local serde = require("@lune/serde")
 local stdio = require("@lune/stdio")
 local task = require("@lune/task")
 
-local bridgePath, placeId, port = process.args[1], tonumber(process.args[2]), process.args[3]
-assert(bridgePath and placeId, "Usage: lune run bridge_harness.luau <RojoManagerBridge.luau> <placeId> [port]")
+local bridgePath, place, port = process.args[1], process.args[2] or "", process.args[3]
+local placeId, placeName = string.match(place, "^(%d+):?(.*)$")
+placeId = tonumber(placeId)
+assert(bridgePath and placeId, "Usage: lune run bridge_harness.luau <RojoManagerBridge.luau> <placeId>[:<name>] [port]")
 
 local function event(text: string)
 	stdio.write(text .. "\n")
@@ -88,6 +91,7 @@ local services = {
 
 local game = {
 	PlaceId = placeId,
+	Name = if placeName ~= "" then placeName else "Place1",
 	GetService = function(_, name)
 		return assert(services[name], `No stand-in for {name}`)
 	end,

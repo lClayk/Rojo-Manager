@@ -9,12 +9,69 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The Roblox place a project opens in Studio. Studio needs both IDs.
+/// A published Roblox place. Studio needs both IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Place {
     pub place_id: u64,
     pub universe_id: u64,
+}
+
+/// An unpublished place file that Rojo Manager builds from the project with `rojo build`, kept in
+/// the data folder. Studio names the open place after its file (`game.Name`, with `game.PlaceId`
+/// 0), which is how the bridge tells local places apart, so each file name is unique.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalPlace {
+    pub file: String,
+}
+
+impl LocalPlace {
+    /// A new, unused file name for a project's place, such as "MyGame-1a2b3c4d.rbxl".
+    pub fn new(project: &str) -> LocalPlace {
+        let stem: String =
+            project.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(40).collect();
+        let mut bytes = [0u8; 4];
+        let _ = getrandom::fill(&mut bytes);
+        let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        LocalPlace { file: format!("{stem}-{suffix}.rbxl") }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        data_dir().join("places").join(&self.file)
+    }
+}
+
+/// What a project opens in Studio: a published place, or a local place file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlaceLink {
+    Published(Place),
+    Local(LocalPlace),
+}
+
+impl PlaceLink {
+    pub fn published(&self) -> Option<Place> {
+        match self {
+            PlaceLink::Published(place) => Some(*place),
+            PlaceLink::Local(_) => None,
+        }
+    }
+
+    /// Whether this is the place a bridge reports: its `game.PlaceId`, and `game.Name` when that is 0.
+    pub fn matches(&self, place_id: u64, place_name: Option<&str>) -> bool {
+        match self {
+            PlaceLink::Published(place) => place.place_id == place_id,
+            PlaceLink::Local(local) => place_id == 0 && place_name == Some(local.file.as_str()),
+        }
+    }
+
+    /// "place 123", or "local place MyGame-1a2b3c4d.rbxl", for messages.
+    pub fn describe(&self) -> String {
+        match self {
+            PlaceLink::Published(place) => format!("place {}", place.place_id),
+            PlaceLink::Local(local) => format!("local place {}", local.file),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,10 +86,13 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_connect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub place: Option<Place>,
+    pub place: Option<PlaceLink>,
     /// Keep sourcemap.json current with `rojo sourcemap --watch` while the server runs. Only stored when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sourcemap: bool,
+    /// Lives only in this run's memory: `save` leaves it out, so it is gone when the app exits.
+    #[serde(skip)]
+    pub temporary: bool,
 }
 
 /// App preferences. Field names are the JSON keys agents use.
@@ -181,8 +241,13 @@ pub fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
+/// A plain file name, with no folder in it.
+fn is_file_name(name: &str) -> bool {
+    !name.contains(['/', '\\']) && Path::new(name).file_name() == Some(name.as_ref())
+}
+
 fn is_project_file(name: &str) -> bool {
-    name.ends_with(".project.json") && !name.contains(['/', '\\']) && Path::new(name).file_name() == Some(name.as_ref())
+    name.ends_with(".project.json") && is_file_name(name)
 }
 
 /// Check a parsed config.json and normalize it. Unknown settings are dropped; anything malformed is an error.
@@ -209,7 +274,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         Some(Value::Array(items)) => items,
         Some(_) => return Err("Settings must contain a projects list".into()),
     };
-    let (mut names, mut ports, mut projects) = (HashSet::new(), HashSet::new(), Vec::new());
+    let (mut names, mut ports, mut files, mut projects) = (HashSet::new(), HashSet::new(), HashSet::new(), Vec::new());
     for item in items {
         let item = item.as_object().ok_or("Each project must be an object")?;
         let name = item.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty());
@@ -236,10 +301,17 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         let sourcemap = flag("sourcemap", "Project sourcemap must be true or false")?;
         let place = match item.get("place") {
             None | Some(Value::Null) => None,
+            Some(place) if place.get("file").is_some() => {
+                let file =
+                    place.get("file").and_then(Value::as_str).filter(|f| f.ends_with(".rbxl") && is_file_name(f));
+                let file = file.filter(|f| files.insert(f.to_lowercase()));
+                let file = file.ok_or("Local places must be unique .rbxl file names")?;
+                Some(PlaceLink::Local(LocalPlace { file: file.to_string() }))
+            }
             Some(place) => {
                 let id = |key| place.get(key).and_then(Value::as_u64).filter(|id| *id > 0);
                 match (id("placeId"), id("universeId")) {
-                    (Some(place_id), Some(universe_id)) => Some(Place { place_id, universe_id }),
+                    (Some(place_id), Some(universe_id)) => Some(PlaceLink::Published(Place { place_id, universe_id })),
                     _ => return Err("Project places must have positive place and universe IDs".into()),
                 }
             }
@@ -253,6 +325,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
             auto_connect,
             place,
             sourcemap,
+            temporary: false,
         });
     }
     // Only a window preference, so a bad entry is dropped instead of refusing the file.
@@ -278,9 +351,14 @@ pub fn load() -> Result<Config, String> {
     validate(&value)
 }
 
-/// Validate, then atomically replace config.json.
+/// Validate, then atomically replace config.json. Temporary projects are left out.
 pub fn save(config: &Config) -> Result<(), String> {
-    let clean = validate(&serde_json::to_value(config).map_err(|e| e.to_string())?)?;
+    let mut value = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    if let Some(Value::Array(projects)) = value.get_mut("projects") {
+        let mut temporary = config.projects.iter().map(|p| p.temporary);
+        projects.retain(|_| !temporary.next().unwrap_or(false));
+    }
+    let clean = validate(&value)?;
     let path = config_path();
     let dir = path.parent().ok_or("Invalid settings folder")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -307,13 +385,15 @@ mod tests {
         let stored = json!({
             "projects": [{"name": "Game", "path": FOLDER, "projectFile": "default.project.json",
                           "port": 34872, "autostart": true, "autoConnect": true,
-                          "place": {"placeId": 1, "universeId": 2}, "sourcemap": true}],
+                          "place": {"placeId": 1, "universeId": 2}, "sourcemap": true},
+                         {"name": "Lobby", "path": FOLDER, "projectFile": "default.project.json",
+                          "port": 34873, "autostart": false, "place": {"file": "Lobby-0123abcd.rbxl"}}],
             "settings": {"tray": false, "unknown": 1}
         });
         let config = validate(&stored).unwrap();
         assert!(!config.settings.tray && config.settings.show_wally);
         let saved = serde_json::to_value(&config).unwrap();
-        assert_eq!(saved["projects"][0], stored["projects"][0]);
+        assert_eq!(saved["projects"], stored["projects"]);
         assert!(saved["settings"].get("unknown").is_none());
         assert!(saved.get("collapsed").is_none());
         let collapsed = validate(&json!({"collapsed": [2, "x", 0]})).unwrap().collapsed;
@@ -333,6 +413,10 @@ mod tests {
             .is_err()
         );
         assert!(validate(&json!({"settings": {"tray": "yes"}})).is_err());
+        let local = |name: &str, port: u16, file: &str| json!({"name": name, "path": FOLDER, "port": port, "place": {"file": file}});
+        assert!(validate(&json!({"projects": [local("A", 1, "..\\a.rbxl")]})).is_err());
+        assert!(validate(&json!({"projects": [local("A", 1, "a.txt")]})).is_err());
+        assert!(validate(&json!({"projects": [local("A", 1, "a.rbxl"), local("B", 2, "A.rbxl")]})).is_err());
         assert_eq!(validate(&json!({})).unwrap(), Config::default());
     }
 }

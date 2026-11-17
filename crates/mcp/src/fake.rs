@@ -31,8 +31,8 @@ pub struct Fake {
     pub projects: Script<Value>,
     /// Answers every other control request, given its method and path parts.
     pub reply: fn(&str, &[&str]) -> Value,
-    /// The GET /studio answer.
-    pub instances: Value,
+    /// GET /studio answers.
+    pub instances: Script<Value>,
     /// What Studio commands return.
     pub studio: Script<Value>,
     /// The studio_tools setting.
@@ -48,7 +48,7 @@ impl Default for Fake {
         Fake {
             projects: Script::new([json!([])]),
             reply: |_, _| json!({"project": project("serving", true)}),
-            instances: json!({"bridge": true, "instances": []}),
+            instances: Script::new([json!({"bridge": true, "instances": []})]),
             studio: Script::new([json!({"status": "Connected"})]),
             studio_tools: true,
             answers: Script::new([true]),
@@ -75,14 +75,16 @@ pub fn project(state: &str, place: bool) -> Value {
     json!({"name": "TestGame", "port": 34879, "state": state, "log": ["error: port in use"], "place": place})
 }
 
-/// A GET /studio answer with place 2 open in Studio.
-pub fn studio_open() -> Value {
-    json!({"bridge": true, "instances": [{"instanceId": "7", "placeId": 2, "rojo": {"status": "Connected"}}]})
+/// GET /studio answers with place 2 open in Studio.
+pub fn studio_open() -> Script<Value> {
+    Script::new([
+        json!({"bridge": true, "instances": [{"instanceId": "7", "placeId": 2, "rojo": {"status": "Connected"}}]}),
+    ])
 }
 
-/// A GET /studio answer without the bridge installed.
-pub fn no_bridge() -> Value {
-    json!({"bridge": false, "instances": []})
+/// GET /studio answers without the bridge installed.
+pub fn no_bridge() -> Script<Value> {
+    Script::new([json!({"bridge": false, "instances": []})])
 }
 
 impl Backend for Fake {
@@ -95,7 +97,7 @@ impl Backend for Fake {
     ) -> Result<Value, RequestError> {
         let path = parts.join("/");
         if method == "GET" && path == "studio" {
-            return Ok(self.instances.clone());
+            return Ok(self.instances.next());
         }
         self.record(match body {
             Some(body) => format!("{method} {path} {body}"),

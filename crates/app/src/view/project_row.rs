@@ -4,7 +4,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::component::input::Input;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::manager::{Engine, ProjectView, ServerState, Snapshot, Update};
 use rojo_manager_core::studio::ResolveError;
 use rojo_manager_core::tooling::Job;
@@ -71,7 +71,11 @@ pub fn render_experience(
                 .child(name.to_string()),
         )
         .child(
-            div().flex_shrink_0().text_size(TEXT_SM).text_color(rgb(MUTED)).child(logic::experience_summary(projects)),
+            div()
+                .flex_shrink_0()
+                .text_size(TEXT_SM)
+                .text_color(rgb(MUTED))
+                .child(logic::group_summary(projects, "place")),
         );
     div()
         .id(format!("experience-{universe_id}"))
@@ -98,6 +102,21 @@ pub fn render_experience(
         .into_any_element()
 }
 
+/// The header over temporary projects, which are gone when Rojo Manager exits unless kept.
+pub fn render_temporary(projects: &[&ProjectView]) -> AnyElement {
+    div()
+        .id("temporary")
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(16.))
+        .py(px(10.))
+        .tooltip(crate::widgets::tooltip("Removed when Rojo Manager exits. Keep one to save it."))
+        .child(div().text_size(TEXT_LG).font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)).child("Temporary"))
+        .child(div().text_size(TEXT_SM).text_color(rgb(MUTED)).child(logic::group_summary(projects, "project")))
+        .into_any_element()
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum GroupAction {
     Start,
@@ -105,12 +124,12 @@ pub(super) enum GroupAction {
     Open,
 }
 
-/// One project in the list; `nested` indents it under its experience's header.
+/// One project in the list; `depth` indents it under a header, or a lane under its project.
 pub fn render(
     view: &MainView,
     p: &ProjectView,
     snapshot: &Snapshot,
-    nested: bool,
+    depth: usize,
     _: &mut Window,
     cx: &mut Context<MainView>,
 ) -> AnyElement {
@@ -148,7 +167,18 @@ pub fn render(
         .flex()
         .items_center()
         .gap(px(12.))
-        .child(div().flex().flex_1().min_w_0().items_center().child(title))
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(px(8.))
+                .child(title)
+                .when_some(logic::lane_label(p), |d, label| {
+                    d.child(div().flex_shrink_0().text_size(TEXT_SM).text_color(rgb(MUTED)).child(label))
+                }),
+        )
         .child(
             div()
                 .id(format!("status-{}", p.name))
@@ -206,13 +236,14 @@ pub fn render(
         tip_link(
             format!("place-{}", p.name),
             match &p.place {
-                Some(place) => format!("Place {}", place.place_id),
+                Some(PlaceLink::Published(place)) => format!("Place {}", place.place_id),
+                Some(PlaceLink::Local(_)) => "Local place".to_string(),
                 None => "Set place".to_string(),
             },
-            "Roblox place this project opens in Studio. Paste a place ID or link; an experience link uses its start place. Clear it to unset.",
+            "Roblox place this project opens in Studio. Paste a place ID or link; an experience link uses its start place. Type local for an unpublished place file built from the project. Clear it to unset.",
         )
         .on_click(on_click(&p.name, cx, |this, name, window, cx| {
-            let place = this.project(name).and_then(|p| p.place).map(|p| p.place_id.to_string()).unwrap_or_default();
+            let place = this.project(name).map(|p| logic::place_text(p.place.as_ref())).unwrap_or_default();
             this.edit(name, Field::Place, place, window, cx);
         }))
         .into_any_element()
@@ -227,10 +258,12 @@ pub fn render(
         .mt(px(6.))
         .mx(px(-6.))
         .child(port)
-        .child(
-            switch_link(format!("autostart-{}", p.name), "Autostart", p.autostart, "Start this project when Rojo Manager opens")
-                .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Autostart, cx))),
-        )
+        .when(!p.temporary, |d| {
+            d.child(
+                switch_link(format!("autostart-{}", p.name), "Autostart", p.autostart, "Start this project when Rojo Manager opens")
+                    .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Autostart, cx))),
+            )
+        })
         .when(p.place.is_some(), |d| {
             d.child(
                 switch_link(
@@ -252,13 +285,13 @@ pub fn render(
             .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Sourcemap, cx))),
         )
         .child(place)
-        .when_some(p.place, |d, place| {
+        .when_some(p.place.as_ref(), |d, place| {
             d.child(
-                tip_link(format!("studio-{}", p.name), "Open Studio", format!("Open place {} in Roblox Studio", place.place_id))
+                tip_link(format!("studio-{}", p.name), "Open Studio", format!("Open {} in Roblox Studio", place.describe()))
                     .on_click(on_click(&p.name, cx, |this, name, _, cx| {
                         let name = name.to_string();
-                        this.run(cx, move |engine| engine.open_studio(&name), |this, place: Place, cx| {
-                            this.notify(format!("Opening place {} in Roblox Studio", place.place_id), cx)
+                        this.run(cx, move |engine| engine.open_studio(&name), |this, place: PlaceLink, cx| {
+                            this.notify(format!("Opening {} in Roblox Studio", place.describe()), cx)
                         });
                     })),
             )
@@ -274,6 +307,18 @@ pub fn render(
             div()
                 .flex()
                 .ml_auto()
+                .when(p.temporary && p.lane.is_none(), |d| {
+                    d.child(
+                        tip_link(format!("keep-{}", p.name), "Keep", "Save this project, so it stays after Rojo Manager exits")
+                            .on_click(on_click(&p.name, cx, |this, name, _, cx| {
+                                let name = name.to_string();
+                                let label = name.clone();
+                                this.run(cx, move |engine| engine.keep(&name), move |view, (), cx| {
+                                    view.notify(format!("Kept {label}"), cx)
+                                });
+                            })),
+                    )
+                })
                 .child(
                     tip_link(format!("logs-{}", p.name), "Logs", format!("View logs for {}", p.name))
                         .opacity(0.)
@@ -292,7 +337,7 @@ pub fn render(
     div()
         .id(format!("row-{}", p.name))
         .group(group)
-        .pl(px(if nested { 38. } else { 16. }))
+        .pl(px(16. + 22. * depth as f32))
         .pr(px(16.))
         .py(px(12.))
         .hover(|s| s.bg(rgb(CARD_HOVER)))
@@ -373,10 +418,10 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
             }
         },
         Field::Place => {
-            if text == project.place.map(|p| p.place_id.to_string()).unwrap_or_default() {
+            if text.eq_ignore_ascii_case(&logic::place_text(project.place.as_ref())) {
                 return;
             }
-            if !text.is_empty() {
+            if !text.is_empty() && !text.eq_ignore_ascii_case("local") {
                 view.notify("Looking up place...", cx);
             }
             let label = name.clone();
@@ -386,7 +431,7 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
                 move |view, project, cx| {
                     view.notify(
                         match project.place {
-                            Some(place) => format!("{label}: opens place {} in Studio", place.place_id),
+                            Some(place) => format!("{label}: opens {} in Studio", place.describe()),
                             None => format!("{label}: place cleared"),
                         },
                         cx,
@@ -397,7 +442,7 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
     }
 }
 
-/// Link a place ID or Roblox link to a project; empty text unlinks.
+/// Link a place ID or Roblox link, or "local", to a project; empty text unlinks.
 fn set_place(engine: &Client, name: &str, text: &str) -> Result<ProjectView, String> {
     let place = Engine::resolve_place(text).map_err(|error| match error {
         ResolveError::Invalid(message) => message,
@@ -431,7 +476,7 @@ impl MainView {
             match action {
                 GroupAction::Start => self.run(cx, move |engine| engine.start_server(&name), |_, (), _| {}),
                 GroupAction::Stop => self.run(cx, move |engine| engine.stop_server(&name), |_, (), _| {}),
-                GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: Place, _| {}),
+                GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: PlaceLink, _| {}),
             }
         }
     }
@@ -485,6 +530,14 @@ impl MainView {
                 move |view, (), cx| view.notify(format!("Removed {label}"), cx),
             );
         };
+        if project.lane.is_some() {
+            let message = format!(
+                "Remove lane {}? Its Studio window closes, its server stops, and its place file is deleted.",
+                project.name
+            );
+            let on_confirm = Box::new(remove);
+            return self.ask(Confirm { title: "Remove lane", message, label: "Remove", danger: true, on_confirm }, cx);
+        }
         if !logic::is_active(project.state) {
             return remove(self, cx);
         }

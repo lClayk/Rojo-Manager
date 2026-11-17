@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use rojo_manager_core::config::Settings;
+use rojo_manager_core::config::{PlaceLink, Settings};
 use rojo_manager_core::manager::{ProjectView, ServerState};
 use rojo_manager_core::tooling::{StudioPlugin, bridge_outdated};
 
@@ -83,9 +83,9 @@ pub fn summary(projects: &[ProjectView]) -> String {
     tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), "project")
 }
 
-/// An experience header's line: "2 places · 1 running".
-pub fn experience_summary(projects: &[&ProjectView]) -> String {
-    tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), "place")
+/// A group header's line: "2 places · 1 running", with `noun` "place".
+pub fn group_summary(projects: &[&ProjectView], noun: &str) -> String {
+    tally(&projects.iter().map(|p| p.state).collect::<Vec<_>>(), noun)
 }
 
 fn tally(states: &[ServerState], noun: &str) -> String {
@@ -108,13 +108,21 @@ pub enum ListItem<'a> {
         name: String,
         projects: Vec<&'a ProjectView>,
     },
+    /// The temporary projects, after all the others.
+    Temporary(Vec<&'a ProjectView>),
 }
 
 /// The list in project order; with `group`, places of the same experience gather under one header.
+/// Temporary projects come last, under their own header. Lanes are left out: they show under the
+/// project they were made from (see `lanes_of`), or with the temporary ones once it is gone.
 pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
-    let universe = |p: &ProjectView| p.place.map(|place| place.universe_id).filter(|_| group);
+    let has_parent =
+        |p: &ProjectView| p.lane.as_ref().is_some_and(|lane| projects.iter().any(|other| other.name == lane.parent));
+    let shown = projects.iter().filter(|p| !has_parent(p));
+    let (temporary, projects): (Vec<&ProjectView>, Vec<&ProjectView>) = shown.partition(|p| p.temporary);
+    let universe = |p: &ProjectView| p.place.as_ref()?.published().map(|place| place.universe_id).filter(|_| group);
     let (mut items, mut grouped) = (Vec::new(), HashSet::new());
-    for project in projects {
+    for &project in &projects {
         let Some(id) = universe(project) else {
             items.push(ListItem::Project(project));
             continue;
@@ -122,7 +130,7 @@ pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
         if grouped.contains(&id) {
             continue;
         }
-        let members: Vec<&ProjectView> = projects.iter().filter(|p| universe(p) == Some(id)).collect();
+        let members: Vec<&ProjectView> = projects.iter().copied().filter(|p| universe(p) == Some(id)).collect();
         if members.len() < 2 {
             items.push(ListItem::Project(project));
             continue;
@@ -131,7 +139,24 @@ pub fn list_items(projects: &[ProjectView], group: bool) -> Vec<ListItem<'_>> {
         let name = members.iter().find_map(|p| p.experience.clone()).unwrap_or_else(|| format!("Experience {id}"));
         items.push(ListItem::Experience { universe_id: id, name, projects: members });
     }
+    if !temporary.is_empty() {
+        items.push(ListItem::Temporary(temporary));
+    }
     items
+}
+
+/// The lanes made from this project.
+pub fn lanes_of<'a>(projects: &'a [ProjectView], parent: &str) -> Vec<&'a ProjectView> {
+    projects.iter().filter(|p| p.lane.as_ref().is_some_and(|lane| lane.parent == parent)).collect()
+}
+
+/// A lane row's label: "Lane", with who holds it.
+pub fn lane_label(project: &ProjectView) -> Option<String> {
+    let lane = project.lane.as_ref()?;
+    Some(match &lane.holder {
+        Some(holder) => format!("Lane held by {holder}"),
+        None => "Lane".into(),
+    })
 }
 
 /// The project's tool badges the person chose to show.
@@ -150,6 +175,15 @@ pub fn badge_tip(badge: &str) -> &'static str {
         "Install this project's Wally packages"
     } else {
         "Install this project's pinned tools (Rokit also supports Aftman)"
+    }
+}
+
+/// The place editor's text for a project's place: its ID, "local", or empty.
+pub fn place_text(place: Option<&PlaceLink>) -> String {
+    match place {
+        Some(PlaceLink::Published(place)) => place.place_id.to_string(),
+        Some(PlaceLink::Local(_)) => "local".into(),
+        None => String::new(),
     }
 }
 
@@ -233,6 +267,8 @@ pub fn version_number(output: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rojo_manager_core::config::{LocalPlace, Place};
+    use rojo_manager_core::manager::Lane;
     use rojo_manager_core::tooling::BRIDGE_VERSION;
 
     fn project(state: ServerState) -> ProjectView {
@@ -245,6 +281,8 @@ mod tests {
             auto_connect: false,
             place: None,
             sourcemap: false,
+            temporary: false,
+            lane: None,
             experience: None,
             state,
             badges: vec![],
@@ -255,12 +293,26 @@ mod tests {
     fn places_of_one_experience_share_a_header_where_the_first_one_was() {
         let linked = |name: &str, universe_id, experience: Option<&str>| ProjectView {
             name: name.into(),
-            place: Some(rojo_manager_core::config::Place { place_id: 1, universe_id }),
+            place: Some(PlaceLink::Published(Place { place_id: 1, universe_id })),
             experience: experience.map(Into::into),
+            ..project(ServerState::Off)
+        };
+        let lane = |name: &str, parent: &str| ProjectView {
+            name: name.into(),
+            temporary: true,
+            lane: Some(Lane {
+                name: name.into(),
+                parent: parent.into(),
+                holder: Some("codex".into()),
+                place: LocalPlace { file: format!("{name}.rbxl") },
+            }),
             ..project(ServerState::Off)
         };
         let projects = [
             project(ServerState::Off),
+            ProjectView { temporary: true, ..linked("Scratch", 7, None) },
+            lane("Lobby-fix", "Lobby"),
+            lane("Orphan", "Gone"),
             linked("Lobby", 7, None),
             linked("Solo", 8, None),
             linked("Arena", 7, Some("Game")),
@@ -273,11 +325,20 @@ mod tests {
                     ListItem::Experience { name, projects, .. } => {
                         format!("{name}: {}", projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "))
                     }
+                    ListItem::Temporary(projects) => {
+                        format!(
+                            "Temporary: {}",
+                            projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+                        )
+                    }
                 })
                 .collect()
         };
-        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo"]);
-        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena"]);
+        assert_eq!(shape(true), ["A", "Game: Lobby, Arena", "Solo", "Temporary: Scratch, Orphan"]);
+        assert_eq!(shape(false), ["A", "Lobby", "Solo", "Arena", "Temporary: Scratch, Orphan"]);
+        let lanes = lanes_of(&projects, "Lobby");
+        assert_eq!(lanes.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Lobby-fix"]);
+        assert_eq!(lane_label(lanes[0]).as_deref(), Some("Lane held by codex"));
     }
 
     #[test]

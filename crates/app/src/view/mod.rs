@@ -14,7 +14,7 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use rojo_manager_core::manager::{Event, Snapshot};
+use rojo_manager_core::manager::{Event, ProjectView, Snapshot};
 use rojo_manager_core::tooling::{self, Job};
 use rojo_manager_core::updates::UpdateState;
 
@@ -244,7 +244,7 @@ impl MainView {
 
     /// Start editing a project field in place: the input takes focus with its text selected.
     fn edit(&mut self, project: &str, field: Field, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        let placeholder = if field == Field::Place { "Place ID or Roblox link" } else { "" };
+        let placeholder = if field == Field::Place { "Place ID, Roblox link, or local" } else { "" };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(placeholder));
         let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_edit(window, cx),
@@ -617,16 +617,34 @@ impl MainView {
                 .into_any_element();
         }
         let mut rows = Vec::new();
+        // A project's row, then its lanes' rows, one step further in.
+        let row = |view: &Self,
+                   rows: &mut Vec<AnyElement>,
+                   project: &ProjectView,
+                   depth: usize,
+                   window: &mut Window,
+                   cx: &mut Context<Self>| {
+            rows.push(project_row::render(view, project, snapshot, depth, window, cx));
+            for lane in logic::lanes_of(&snapshot.projects, &project.name) {
+                rows.push(project_row::render(view, lane, snapshot, depth + 1, window, cx));
+            }
+        };
         for item in logic::list_items(&snapshot.projects, snapshot.settings.group_experiences) {
             match item {
-                logic::ListItem::Project(project) => {
-                    rows.push(project_row::render(self, project, snapshot, false, window, cx))
-                }
+                logic::ListItem::Project(project) => row(self, &mut rows, project, 0, window, cx),
                 logic::ListItem::Experience { universe_id, name, projects } => {
                     let open = !snapshot.collapsed.contains(&universe_id);
                     rows.push(project_row::render_experience(universe_id, &name, &projects, open, cx));
                     if open {
-                        rows.extend(projects.iter().map(|p| project_row::render(self, p, snapshot, true, window, cx)));
+                        for project in &projects {
+                            row(self, &mut rows, project, 1, window, cx);
+                        }
+                    }
+                }
+                logic::ListItem::Temporary(projects) => {
+                    rows.push(project_row::render_temporary(&projects));
+                    for project in &projects {
+                        row(self, &mut rows, project, 1, window, cx);
                     }
                 }
             }

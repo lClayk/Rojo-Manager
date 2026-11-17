@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::config::{self, Config, Place, Settings};
+use crate::config::{self, Config, LocalPlace, Place, PlaceLink, Settings};
 use crate::control::{BridgePoll, ControlError, ControlHandler, OutputContext, OutputKind, StudioOutput};
 use crate::localnet::{self, port_in_use};
 use crate::studio::{self, ResolveError};
@@ -39,6 +39,8 @@ const OUTPUT_CAP: usize = 2000;
 const OUTPUT_TEXT: usize = 2000;
 /// The first bridge version that sends Studio's Output.
 const OUTPUT_BRIDGE: u64 = 8;
+/// The longest unpublished place name kept from a bridge; local place files are much shorter.
+const MAX_PLACE_NAME: usize = 255;
 /// The window asks for a star on GitHub once the app has been in use this long.
 const STAR_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
@@ -74,11 +76,17 @@ pub struct ProjectView {
     pub port: u16,
     pub autostart: bool,
     pub auto_connect: bool,
-    pub place: Option<Place>,
+    pub place: Option<PlaceLink>,
     /// The linked place's experience name, once looked up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experience: Option<String>,
     pub sourcemap: bool,
+    /// Kept only until it is removed or the app exits; see `config::Project::temporary`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
+    /// The lane whose place this project syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -163,8 +171,30 @@ pub struct Update {
     pub auto_connect: Option<bool>,
     /// Missing keeps the place; `null` unlinks it.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-    pub place: Option<Option<Place>>,
+    pub place: Option<Option<PlaceChoice>>,
     pub sourcemap: Option<bool>,
+}
+
+/// An isolated Studio with a stable identity: a local place file of its own, made from a project and
+/// held by whoever asked for it, such as an agent. The Rojo server syncing it is a separate thing,
+/// the project whose place is this file, so another sync tool could drive a lane too. Lanes live in
+/// memory only, like temporary projects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lane {
+    pub name: String,
+    /// The project it was made from.
+    pub parent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    pub place: LocalPlace,
+}
+
+/// A place to link: a published place, or a local place file, which the engine names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaceChoice {
+    Published(Place),
+    Local,
 }
 
 /// A field that is present, even as `null`, is `Some`.
@@ -266,14 +296,15 @@ struct State {
     /// Recent unexpected exits per project, for the crash restart limit.
     crashes: HashMap<String, Vec<Instant>>,
     studio_rojo_plugins: Option<u32>,
+    lanes: Vec<Lane>,
     /// Each running Studio bridge's last poll, by the random id it picked when it loaded.
     bridges: HashMap<u64, BridgeReport>,
     /// Experience names by universe ID, looked up once per run.
     experiences: HashMap<u64, String>,
     /// Another Studio MCP set up in an agent, found at launch.
     other_studio_mcp: Option<String>,
-    /// Studio's recent Output by place, from its Edit DataModel and playtests.
-    output: HashMap<u64, VecDeque<OutputLine>>,
+    /// Studio's recent Output by place (ID, and name when unpublished), from its Edit DataModel and playtests.
+    output: HashMap<(u64, Option<String>), VecDeque<OutputLine>>,
     output_seq: u64,
 }
 
@@ -291,6 +322,8 @@ pub struct OutputLine {
 /// What a Studio bridge last said and was told.
 struct BridgeReport {
     place_id: u64,
+    /// `game.Name` of an unpublished place (place ID 0): the file name of a local place.
+    place_name: Option<String>,
     /// The server its Rojo is connected to, or 0.
     port: u16,
     /// The Rojo plugin's status, as the bridge describes it.
@@ -302,13 +335,19 @@ struct BridgeReport {
 
 impl State {
     /// The running server whose project auto-connects to this place: (project name, port).
-    fn auto_connect_target(&self, place_id: u64) -> Option<(String, u16)> {
+    fn auto_connect_target(&self, place_id: u64, place_name: Option<&str>) -> Option<(String, u16)> {
         let project = self.config.projects.iter().find(|p| {
             p.auto_connect
-                && p.place.is_some_and(|place| place.place_id == place_id)
+                && p.place.as_ref().is_some_and(|place| place.matches(place_id, place_name))
                 && self.states.get(&p.name).is_some_and(|s| s.running())
         })?;
         Some((project.name.clone(), project.port))
+    }
+
+    /// The lane whose place this project syncs.
+    fn lane_of(&self, project: &config::Project) -> Option<&Lane> {
+        let Some(PlaceLink::Local(place)) = &project.place else { return None };
+        self.lanes.iter().find(|lane| lane.place == *place)
     }
 
     fn view_state(&self, name: &str) -> ServerState {
@@ -450,6 +489,14 @@ fn end_server(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A temporary project's local place file, which goes with it.
+fn temporary_place(project: &config::Project) -> Option<PathBuf> {
+    match &project.place {
+        Some(PlaceLink::Local(place)) if project.temporary => Some(place.path()),
+        _ => None,
+    }
+}
+
 fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
 }
@@ -501,9 +548,18 @@ impl Engine {
         let children: Vec<_> = state.procs.drain().collect();
         let ports: Vec<u16> = children.iter().filter_map(|(name, _)| state.port(name).ok()).collect();
         let sourcemaps: Vec<_> = state.sourcemaps.drain().collect();
+        // Lanes and temporary projects end with the app: their Studios close and their places go.
+        let lanes: Vec<PathBuf> = state.lanes.drain(..).map(|lane| lane.place.path()).collect();
+        let places: Vec<PathBuf> = state.config.projects.iter().filter_map(temporary_place).collect();
         drop(state);
         for (_, mut child) in children.into_iter().chain(sourcemaps) {
             end_server(&mut child);
+        }
+        for path in &lanes {
+            studio::close_place_file(path);
+        }
+        for path in places {
+            let _ = std::fs::remove_file(path);
         }
         // As in stop_server: the real rojo behind Rokit's shim ends a moment later. Waiting lets an
         // update's restart start these servers again on the same ports.
@@ -558,9 +614,15 @@ impl Engine {
             port: p.port,
             autostart: p.autostart,
             auto_connect: p.auto_connect,
-            place: p.place,
+            place: p.place.clone(),
             sourcemap: p.sourcemap,
-            experience: p.place.and_then(|place| state.experiences.get(&place.universe_id).cloned()),
+            temporary: p.temporary,
+            lane: state.lane_of(p).cloned(),
+            experience: p
+                .place
+                .as_ref()
+                .and_then(PlaceLink::published)
+                .and_then(|place| state.experiences.get(&place.universe_id).cloned()),
             state: state.view_state(&p.name),
             badges: tooling::project_badges(Path::new(&p.path)).into_iter().map(String::from).collect(),
         })
@@ -967,12 +1029,20 @@ impl Engine {
     /// show as Connected. Answers with the place's auto-connect server and whether to accept Rojo's
     /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
     /// starting the server connects an open place.
-    pub fn report_bridge(&self, id: u64, place_id: u64, port: u16, rojo: Value) -> Option<(u16, bool)> {
+    pub fn report_bridge(
+        &self,
+        id: u64,
+        place_id: u64,
+        place_name: Option<String>,
+        port: u16,
+        rojo: Value,
+    ) -> Option<(u16, bool)> {
         let (target, previous, accept) = {
             let mut state = self.lock();
-            let target = state.auto_connect_target(place_id);
+            let place_name = place_name.filter(|name| place_id == 0 && name.len() <= MAX_PLACE_NAME);
+            let target = state.auto_connect_target(place_id, place_name.as_deref());
             let offered = target.as_ref().map(|(_, port)| *port);
-            let report = BridgeReport { place_id, port, rojo, offered, seen: Instant::now() };
+            let report = BridgeReport { place_id, place_name, port, rojo, offered, seen: Instant::now() };
             (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept)
         };
         if previous.as_ref().map(|report| report.port) != Some(port) {
@@ -1013,13 +1083,20 @@ impl Engine {
         report.seen.elapsed() < BRIDGE_TTL || self.link.busy(id)
     }
 
-    /// The Studio windows whose bridge polled recently: {instanceId, placeId, rojo}.
+    /// The Studio windows whose bridge polled recently: {instanceId, placeId, placeName, rojo}, with
+    /// placeName only for an unpublished place.
     pub fn studio_instances(&self) -> Vec<Value> {
         let state = self.lock();
         let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
         let mut instances: Vec<(u64, &BridgeReport)> = live.map(|(id, report)| (*id, report)).collect();
         instances.sort_by_key(|(id, _)| *id);
-        let instance = |(id, report): (u64, &BridgeReport)| json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
+        let instance = |(id, report): (u64, &BridgeReport)| {
+            let mut instance = json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
+            if let Some(name) = &report.place_name {
+                instance["placeName"] = json!(name);
+            }
+            instance
+        };
         instances.into_iter().map(instance).collect()
     }
 
@@ -1038,7 +1115,8 @@ impl Engine {
     pub fn report_output(&self, output: StudioOutput) {
         let mut guard = self.lock();
         let state = &mut *guard;
-        let buffer = state.output.entry(output.place_id).or_default();
+        let name = output.place_name.filter(|name| output.place_id == 0 && name.len() <= MAX_PLACE_NAME);
+        let buffer = state.output.entry((output.place_id, name)).or_default();
         for line in output.lines {
             let mut text = line.text;
             if let Some((end, _)) = text.char_indices().nth(OUTPUT_TEXT) {
@@ -1066,7 +1144,7 @@ impl Engine {
         let report = id.and_then(|id| state.bridges.get(&id).filter(|report| self.bridge_live(id, report)));
         let report =
             report.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
-        let buffer = state.output.get(&report.place_id);
+        let buffer = state.output.get(&(report.place_id, report.place_name.clone()));
         let bridge = report.rojo.get("bridge").and_then(Value::as_u64).unwrap_or(0);
         if buffer.is_none() && bridge < OUTPUT_BRIDGE {
             return Err(ControlError::new(
@@ -1194,11 +1272,12 @@ impl Engine {
 
     // ------------------------------------------------------------- projects
 
-    /// Add the Rojo project at `path`, or each new project in its immediate subfolders.
-    /// Returns the added names; errors when nothing could be added.
-    pub fn add_projects(&self, path: &Path) -> Result<Vec<String>, String> {
+    /// Add the Rojo project at `path`, or each new project in its immediate subfolders. A temporary
+    /// project is never saved, so it is gone when the app exits. Returns the added names; errors
+    /// when nothing could be added.
+    pub fn add_projects(&self, path: &Path, temporary: bool) -> Result<Vec<String>, String> {
         let added = if !project_files(path).is_empty() {
-            vec![self.register(path)?]
+            vec![self.register(path, temporary)?]
         } else {
             let entries = std::fs::read_dir(path).map_err(|e| format!("Cannot read that folder: {e}"))?;
             let mut children: Vec<PathBuf> = entries
@@ -1212,7 +1291,7 @@ impl Engine {
             if children.is_empty() {
                 return Err("No Rojo projects found in that folder or its children".into());
             }
-            let added: Vec<String> = children.iter().filter_map(|child| self.register(child).ok()).collect();
+            let added: Vec<String> = children.iter().filter_map(|child| self.register(child, temporary).ok()).collect();
             if added.is_empty() {
                 return Err("None of the Rojo projects in that folder could be added".into());
             }
@@ -1221,7 +1300,11 @@ impl Engine {
         self.changed();
         if let [name] = added.as_slice() {
             let port = self.lock().port(name).unwrap_or_default();
-            self.notice(format!("Added {name} on port {port}. Click the port to change it."));
+            if temporary {
+                self.notice(format!("Added {name} as a temporary project on port {port}"));
+            } else {
+                self.notice(format!("Added {name} on port {port}. Click the port to change it."));
+            }
         } else {
             let folder =
                 path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -1230,8 +1313,9 @@ impl Engine {
         Ok(added)
     }
 
-    /// Save the project at `path` on the first free port and return its name.
-    fn register(&self, path: &Path) -> Result<String, String> {
+    /// Save the project at `path` on the first free port and return its name. A temporary project
+    /// takes the folder's name with a number when that name is taken.
+    fn register(&self, path: &Path, temporary: bool) -> Result<String, String> {
         let mut files = project_files(path);
         if files.is_empty() {
             return Err("No *.project.json file found in that folder".into());
@@ -1241,16 +1325,18 @@ impl Engine {
             None => files.remove(0),
         };
         let path_text = path.to_string_lossy().into_owned();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Choose a folder, not a drive")?;
+        let folder =
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("Choose a folder, not a drive")?;
         let mut state = self.lock();
-        if state
-            .config
-            .projects
-            .iter()
-            .any(|p| p.name.to_lowercase() == name.to_lowercase() || same_path(&p.path, &path_text))
-        {
-            return Err(format!("A project named {name} is already registered"));
+        let taken = |name: &str| state.config.projects.iter().any(|p| p.name.to_lowercase() == name.to_lowercase());
+        if let Some(other) = state.config.projects.iter().find(|p| same_path(&p.path, &path_text)) {
+            return Err(format!("{} already has that folder", other.name));
         }
+        let name = match temporary {
+            true => (1..).map(|n| if n == 1 { folder.clone() } else { format!("{folder} {n}") }).find(|n| !taken(n)),
+            false => Some(folder.clone()).filter(|n| !taken(n)),
+        };
+        let name = name.ok_or_else(|| format!("A project named {folder} is already registered"))?;
         let used: HashSet<u16> = state.config.projects.iter().map(|p| p.port).collect();
         let listening = localnet::listeners().unwrap_or_default();
         let port = (FIRST_PORT..=u16::MAX)
@@ -1266,17 +1352,20 @@ impl Engine {
             auto_connect: false,
             place: None,
             sourcemap: false,
+            temporary,
         });
         config::save(&config)?;
         state.config = config;
         Ok(name)
     }
 
-    /// Look up a place ID or link with Roblox; empty text means "unlink". Call before `update`.
-    pub fn resolve_place(text: &str) -> Result<Option<Place>, ResolveError> {
+    /// Look up a place ID or link with Roblox; empty text means "unlink", and "local" a local place
+    /// file. Call before `update`.
+    pub fn resolve_place(text: &str) -> Result<Option<PlaceChoice>, ResolveError> {
         match text.trim() {
             "" => Ok(None),
-            text => studio::resolve_place(text).map(Some),
+            text if text.eq_ignore_ascii_case("local") => Ok(Some(PlaceChoice::Local)),
+            text => studio::resolve_place(text).map(|place| Some(PlaceChoice::Published(place))),
         }
     }
 
@@ -1284,11 +1373,23 @@ impl Engine {
     pub fn update(self: &Arc<Self>, name: &str, update: Update) -> Result<ProjectView, String> {
         let mut state = self.lock();
         let project = state.config.project(name).cloned().ok_or_else(|| missing(name))?;
-        let linked = update.place.unwrap_or(project.place);
+        let new_name = update.name.as_deref().map(str::trim).unwrap_or(name).to_string();
+        let linked = match update.place {
+            None => project.place.clone(),
+            Some(None) => None,
+            Some(Some(PlaceChoice::Published(place))) => Some(PlaceLink::Published(place)),
+            // A project that already has a local place keeps its file.
+            Some(Some(PlaceChoice::Local)) => match &project.place {
+                Some(local @ PlaceLink::Local(_)) => Some(local.clone()),
+                _ => Some(PlaceLink::Local(LocalPlace::new(&new_name))),
+            },
+        };
         if update.auto_connect == Some(true) && linked.is_none() {
             return Err("Auto-connect needs a linked place.".into());
         }
-        let new_name = update.name.as_deref().map(str::trim).unwrap_or(name).to_string();
+        if update.autostart == Some(true) && project.temporary {
+            return Err("A temporary project does not autostart. Keep it first.".into());
+        }
         if new_name != name {
             if new_name.is_empty() {
                 return Err("Project name cannot be empty".into());
@@ -1341,7 +1442,7 @@ impl Engine {
             None => {}
         }
         self.changed();
-        if view.place.is_some() && view.experience.is_none() {
+        if view.place.as_ref().is_some_and(|place| place.published().is_some()) && view.experience.is_none() {
             self.look_up_experiences();
         }
         Ok(view)
@@ -1353,7 +1454,8 @@ impl Engine {
         std::thread::spawn(move || {
             let missing: HashSet<u64> = {
                 let state = engine.lock();
-                let linked = state.config.projects.iter().filter_map(|p| p.place).map(|place| place.universe_id);
+                let linked = state.config.projects.iter().filter_map(|p| p.place.as_ref()?.published());
+                let linked = linked.map(|place| place.universe_id);
                 linked.filter(|id| !state.experiences.contains_key(id)).collect()
             };
             for universe_id in missing {
@@ -1419,8 +1521,76 @@ impl Engine {
         Ok(())
     }
 
-    /// Stop the project's server if it runs, then drop the project. Its files are kept.
+    /// Turn a temporary project into a normal one, saved with the others.
+    pub fn keep(&self, name: &str) -> Result<(), String> {
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        let project = config.project_mut(name).ok_or_else(|| missing(name))?;
+        project.temporary = false;
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        self.changed();
+        Ok(())
+    }
+
+    /// Make a lane from the project `parent`, at `path`, a copy of it such as a git worktree: a
+    /// temporary project there, with a local place of its own and auto-connect on, so its Studio
+    /// connects as soon as it opens. Opening it is up to the caller.
+    pub fn create_lane(&self, parent: &str, path: &Path, holder: Option<String>) -> Result<Lane, String> {
+        let parent = self.lock().config.project(parent).map(|p| p.name.clone()).ok_or_else(|| missing(parent))?;
+        let name = self.register(path, true)?;
+        let lane = Lane { name: name.clone(), parent, holder, place: LocalPlace::new(&name) };
+        {
+            let mut state = self.lock();
+            if let Some(project) = state.config.project_mut(&name) {
+                project.place = Some(PlaceLink::Local(lane.place.clone()));
+                project.auto_connect = true;
+            }
+            state.lanes.push(lane.clone());
+        }
+        self.changed();
+        let held = lane.holder.as_deref().map(|holder| format!(" for {holder}")).unwrap_or_default();
+        self.notice(format!("Made lane {name} from {}{held}", lane.parent));
+        Ok(lane)
+    }
+
+    /// Close a lane's Studio, remove the projects syncing it (stopping their servers), and delete its
+    /// place file.
+    pub fn remove_lane(&self, name: &str) -> Result<(), String> {
+        let (lane, projects) = {
+            let state = self.lock();
+            let lane = state.lanes.iter().find(|lane| lane.name == name).cloned();
+            let lane = lane.ok_or_else(|| format!("No lane named {name}"))?;
+            let syncing = state.config.projects.iter().filter(|p| state.lane_of(p) == Some(&lane));
+            let projects: Vec<String> = syncing.map(|p| p.name.clone()).collect();
+            (lane, projects)
+        };
+        let path = lane.place.path();
+        studio::close_place_file(&path);
+        self.lock().lanes.retain(|other| other.name != name);
+        for project in projects {
+            self.remove_project(&project)?;
+        }
+        let _ = std::fs::remove_file(path);
+        self.changed();
+        Ok(())
+    }
+
+    /// Stop the project's server if it runs, then drop the project. Its files are kept, but a
+    /// temporary project's local place goes with it, and removing a lane's project removes the lane.
     pub fn remove(&self, name: &str) -> Result<(), String> {
+        let lane = {
+            let state = self.lock();
+            state.config.project(name).and_then(|p| state.lane_of(p)).map(|lane| lane.name.clone())
+        };
+        match lane {
+            Some(lane) => self.remove_lane(&lane),
+            None => self.remove_project(name),
+        }
+    }
+
+    fn remove_project(&self, name: &str) -> Result<(), String> {
         let (busy, port) = {
             let state = self.lock();
             (state.busy(name), state.port(name)?)
@@ -1429,6 +1599,7 @@ impl Engine {
             self.stop(name);
         }
         let mut state = self.lock();
+        let place = state.config.project(name).and_then(temporary_place);
         let mut config = state.config.clone();
         config.projects.retain(|p| p.name != name);
         config::save(&config)?;
@@ -1436,15 +1607,60 @@ impl Engine {
         state.logs.remove(name);
         state.states.remove(name);
         drop(state);
+        if let Some(path) = place {
+            let _ = std::fs::remove_file(path);
+        }
         self.changed();
         Ok(())
     }
 
-    pub fn open_studio(&self, name: &str) -> Result<Place, String> {
-        let place = self.lock().config.project(name).ok_or_else(|| missing(name))?.place;
+    /// Open the project's place in Studio. A local place is built first when its file is missing,
+    /// so what Studio saves into it is kept.
+    pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
+        let project = self.lock().config.project(name).cloned().ok_or_else(|| missing(name))?;
+        let place = project.place.clone();
         let place = place.ok_or_else(|| format!("{name} has no linked place. Set one in Rojo Manager."))?;
-        studio::open_place(&place).map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
+        let opened = match &place {
+            PlaceLink::Published(place) => studio::open_place(place),
+            PlaceLink::Local(local) => {
+                let path = local.path();
+                if !path.is_file() {
+                    self.build_place(&project, &path)?;
+                }
+                crate::shell::open(&path.to_string_lossy())
+            }
+        };
+        opened.map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
         Ok(place)
+    }
+
+    /// Build the project into a place file with `rojo build`; its output goes to the project's log.
+    fn build_place(&self, project: &config::Project, path: &Path) -> Result<(), String> {
+        let rojo = tooling::find_tool("Rojo").ok_or("Rojo is not installed.")?;
+        let folder = path.parent().ok_or("Invalid place folder")?;
+        std::fs::create_dir_all(folder).map_err(|e| format!("Could not create {}: {e}", folder.display()))?;
+        let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        self.log(&project.name, &format!("$ rojo build {} --output {file}", project.project_file));
+        let mut command = Command::new(rojo);
+        command
+            .arg("build")
+            .arg(Path::new(&project.path).join(&project.project_file))
+            .arg("--output")
+            .arg(path)
+            .current_dir(&project.path)
+            .stdin(std::process::Stdio::null());
+        own_group(&mut command);
+        let output = command.output().map_err(|e| format!("Could not run Rojo: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            self.log(&project.name, line);
+        }
+        if output.status.success() && path.is_file() {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(path); // a half-written file would be opened next time
+        let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output");
+        Err(format!("Could not build {}'s place: {}", project.name, strip_ansi(last)))
     }
 
     pub fn open_folder(&self, name: &str) -> Result<(), String> {
@@ -1734,7 +1950,11 @@ impl ControlHandler for Control {
             if !path.is_absolute() || !path.is_dir() {
                 return Err(ControlError::new(format!("No folder at {}. Pass an absolute path.", path.display()), 404));
             }
-            let names = engine.add_projects(&path).map_err(|e| ControlError::new(e, 409))?;
+            let temporary = match body.get("temporary") {
+                None | Some(Value::Null) => false,
+                Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("temporary must be a bool"))?,
+            };
+            let names = engine.add_projects(&path, temporary).map_err(|e| ControlError::new(e, 409))?;
             let added: Vec<Value> = names.iter().filter_map(|name| engine.agent_view(name)).collect();
             return Ok(json!({ "added": added }));
         }
@@ -1762,6 +1982,11 @@ impl ControlHandler for Control {
                 engine.remove(name).map_err(|e| ControlError::new(e, 500))?;
                 engine.notice(format!("{name}: removed by an agent"));
                 Ok(json!({ "removed": name }))
+            }
+            "keep" => {
+                engine.keep(name).map_err(|e| ControlError::new(e, 500))?;
+                engine.notice(format!("{name}: kept by an agent"));
+                reply(name)
             }
             "start" | "restart" if view.state == ServerState::Blocked => {
                 Err(ControlError::new(format!("Port {} is used by another application", view.port), 409))
@@ -1794,6 +2019,24 @@ impl ControlHandler for Control {
             }
             _ => Err(ControlError::new(format!("Unknown action {action}"), 404)),
         }
+    }
+
+    fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError> {
+        let engine = &self.0;
+        if let Some(name) = name {
+            engine.remove_lane(name).map_err(|e| ControlError::new(e, 404))?;
+            engine.notice(format!("Lane {name}: removed by an agent"));
+            return Ok(json!({ "removed": name }));
+        }
+        let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
+        let parent = text("from").ok_or_else(|| ControlError::bad("Pass from, the project to make the lane from"))?;
+        let path = PathBuf::from(text("path").ok_or_else(|| ControlError::bad("Pass the lane folder's path"))?);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(ControlError::new(format!("No folder at {}. Pass an absolute path.", path.display()), 404));
+        }
+        let holder = text("holder").map(|holder| holder.chars().take(100).collect::<String>());
+        let lane = engine.create_lane(parent, &path, holder).map_err(|e| ControlError::new(e, 409))?;
+        Ok(json!({ "lane": lane, "project": engine.agent_view(&lane.name) }))
     }
 
     fn logs(&self, project: &str) -> Result<Value, ControlError> {
@@ -1834,7 +2077,7 @@ impl ControlHandler for Control {
     }
 
     fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value {
-        let offer = self.0.report_bridge(id, poll.place_id, poll.port, poll.rojo);
+        let offer = self.0.report_bridge(id, poll.place_id, poll.place_name, poll.port, poll.rojo);
         let result = poll.result.map(|result| {
             let outcome = match result.ok {
                 true => Ok(result.value),
@@ -1915,7 +2158,7 @@ fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Opti
     const FIELDS: &str = "name, port, autostart, autoConnect, place, sourcemap";
     if action == "link-place" {
         let place = body.get("place").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
-        let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link"))?;
+        let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link, or local"))?;
         return Ok((Update::default(), Some(place.to_string())));
     }
     if body.is_empty() {
@@ -1967,11 +2210,25 @@ mod tests {
     #[test]
     fn studio_output_is_read_after_a_cursor_by_level_and_needs_a_new_bridge() {
         let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
-        engine.report_bridge(1, 100, 0, json!({"bridge": OUTPUT_BRIDGE}));
-        engine.report_bridge(2, 200, 0, json!({"bridge": OUTPUT_BRIDGE - 1}));
+        engine.report_bridge(1, 100, None, 0, json!({"bridge": OUTPUT_BRIDGE}));
+        engine.report_bridge(2, 200, None, 0, json!({"bridge": OUTPUT_BRIDGE - 1}));
+        engine.report_bridge(3, 0, Some("Lane-1.rbxl".into()), 0, json!({"bridge": OUTPUT_BRIDGE}));
         let line = |text: &str, kind| crate::control::OutputReport { text: text.into(), kind };
         engine.report_output(StudioOutput {
+            place_id: 0,
+            place_name: Some("Lane-2.rbxl".into()),
+            context: OutputContext::Edit,
+            lines: vec![line("other lane", OutputKind::Output)],
+        });
+        engine.report_output(StudioOutput {
+            place_id: 0,
+            place_name: Some("Lane-1.rbxl".into()),
+            context: OutputContext::Edit,
+            lines: vec![line("lane", OutputKind::Output)],
+        });
+        engine.report_output(StudioOutput {
             place_id: 100,
+            place_name: None,
             context: OutputContext::Server,
             lines: vec![
                 line("hi", OutputKind::Output),
@@ -1984,11 +2241,12 @@ mod tests {
             value["lines"].as_array().unwrap().iter().map(|line| line["text"].as_str().unwrap().into()).collect()
         };
         let all = read(0, OutputKind::Output, 100);
-        assert_eq!(all["next"], 3);
+        assert_eq!(all["next"], 5);
         assert_eq!(all["lines"][0], json!({"context": "server", "kind": "output", "text": "hi"}));
         assert_eq!(texts(read(0, OutputKind::Warning, 100)), ["careful", "boom"]);
-        assert_eq!(texts(read(1, OutputKind::Output, 1)), ["boom"]);
-        assert_eq!(read(3, OutputKind::Output, 100), json!({"lines": [], "next": 3}));
+        assert_eq!(texts(read(3, OutputKind::Output, 1)), ["boom"]);
+        assert_eq!(read(5, OutputKind::Output, 100), json!({"lines": [], "next": 5}));
+        assert_eq!(texts(engine.studio_output("3", 0, OutputKind::Output, 100).unwrap()), ["lane"]);
         assert_eq!(engine.studio_output("2", 0, OutputKind::Output, 100).unwrap_err().status, 409);
         assert_eq!(engine.studio_output("9", 0, OutputKind::Output, 100).unwrap_err().status, 404);
     }
@@ -2004,6 +2262,7 @@ mod tests {
             auto_connect: false,
             place: None,
             sourcemap: false,
+            temporary: false,
         };
         let day = 24 * 60 * 60;
         let mut config = Config { projects: vec![project], first_run: 10 * day, ..Config::default() };
@@ -2013,6 +2272,78 @@ mod tests {
         assert!(!star_due(&config, 13 * day));
         let empty = Config { first_run: 10 * day, ..Config::default() };
         assert!(!star_due(&empty, 13 * day));
+    }
+
+    #[test]
+    fn temporary_projects_are_never_saved_until_kept() {
+        let _guard = crate::isolated();
+        let folders = tempfile::tempdir().unwrap();
+        let folder = |parent: &str| {
+            let path = folders.path().join(parent).join("MyGame");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("default.project.json"), "{}").unwrap();
+            path
+        };
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        assert_eq!(engine.add_projects(&folder("main"), false).unwrap(), ["MyGame"]);
+        assert_eq!(engine.add_projects(&folder("lane"), true).unwrap(), ["MyGame 2"]);
+        assert!(engine.project("MyGame 2").unwrap().temporary);
+        let saved = || config::load().unwrap().projects.into_iter().map(|p| p.name).collect::<Vec<_>>();
+        assert_eq!(saved(), ["MyGame"]);
+        let autostart = Update { autostart: Some(true), ..Update::default() };
+        assert!(engine.update("MyGame 2", autostart).is_err());
+        engine.keep("MyGame 2").unwrap();
+        assert_eq!(saved(), ["MyGame", "MyGame 2"]);
+        assert!(!engine.project("MyGame 2").unwrap().temporary);
+    }
+
+    #[test]
+    fn auto_connect_finds_a_local_place_by_its_file_name() {
+        let local = config::Project {
+            name: "Lane".into(),
+            path: "C:\\Games\\Lane".into(),
+            project_file: "default.project.json".into(),
+            port: FIRST_PORT,
+            autostart: false,
+            auto_connect: true,
+            place: Some(PlaceLink::Local(LocalPlace { file: "Lane-1.rbxl".into() })),
+            sourcemap: false,
+            temporary: true,
+        };
+        let engine = Engine::new(Config { projects: vec![local], ..Config::default() }, PathBuf::new(), |_| {});
+        engine.lock().states.insert("Lane".into(), ServerState::Serving);
+        let offer =
+            |place_id, name: Option<&str>| engine.report_bridge(1, place_id, name.map(Into::into), 0, json!({}));
+        assert_eq!(offer(0, Some("Lane-1.rbxl")), Some((FIRST_PORT, true)));
+        assert_eq!(offer(0, Some("Lane-2.rbxl")), None);
+        assert_eq!(offer(0, None), None); // an older bridge does not name the place
+        assert_eq!(offer(7, Some("Lane-1.rbxl")), None);
+    }
+
+    #[test]
+    fn a_lane_is_a_temporary_project_with_its_own_place_and_goes_with_it() {
+        let _guard = crate::isolated();
+        let folders = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let path = folders.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("default.project.json"), "{}").unwrap();
+            path
+        };
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        engine.add_projects(&folder("MyGame"), false).unwrap();
+        assert!(engine.create_lane("Missing", &folder("Lane"), None).is_err());
+        let lane = engine.create_lane("MyGame", &folder("MyGame-feature"), Some("agent".into())).unwrap();
+        assert_eq!((lane.name.as_str(), lane.parent.as_str()), ("MyGame-feature", "MyGame"));
+        let view = engine.project("MyGame-feature").unwrap();
+        assert!(view.temporary && view.auto_connect && view.lane.as_ref() == Some(&lane));
+        assert_eq!(view.place, Some(PlaceLink::Local(lane.place.clone())));
+        // Removing the lane's project removes the lane and its built place.
+        std::fs::create_dir_all(lane.place.path().parent().unwrap()).unwrap();
+        std::fs::write(lane.place.path(), "built").unwrap();
+        engine.remove("MyGame-feature").unwrap();
+        assert!(engine.project("MyGame-feature").is_none() && !lane.place.path().exists());
+        assert!(engine.remove_lane("MyGame-feature").is_err());
     }
 
     #[test]

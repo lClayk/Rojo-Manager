@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::control::{ControlError, RequestError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,8 @@ const LUAU_CALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// control.request's default, used for GET /projects.
 const PROJECTS_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Opening a local place may build it first.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The tools/list entries, in the order agents see them; `studio_tools` adds the Studio ones.
 pub fn specs(studio_tools: bool) -> Value {
@@ -53,7 +55,7 @@ pub fn specs(studio_tools: bool) -> Value {
                 project. connect_rojo also starts the project's server and connects the Rojo plugin.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "project": {"type": "string", "description": "Project name"},
-                "place": {"type": "string", "description": "Place ID, game link, or Creator Hub link"},
+                "place": {"type": "string", "description": "Place ID, game link, Creator Hub link, or local"},
                 "connect_rojo": {"type": "boolean", "default": false}}},
         },
         {
@@ -66,6 +68,19 @@ pub fn specs(studio_tools: bool) -> Value {
                     "action": {"type": "string", "enum": ["connect", "disconnect", "status", "accept", "abort"]}}},
         },
         {
+            "name": "lane",
+            "description": "An isolated Studio for parallel work, such as an agent working in a git worktree. create \
+                makes a temporary project at path (a copy of the project from), gives it a local place of its own, \
+                opens that in Studio, starts its server, connects Rojo, and accepts the first sync. remove closes \
+                that Studio, stops the server, and deletes the place. Lanes are gone when Rojo Manager exits.",
+            "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
+                "action": {"type": "string", "enum": ["create", "remove"]},
+                "from": {"type": "string", "description": "Project to make the lane from, for create"},
+                "path": {"type": "string", "description": "Absolute folder of the lane's copy, for create"},
+                "lane": {"type": "string", "description": "Lane name, for remove"},
+                "holder": {"type": "string", "description": "Who holds it, shown in Rojo Manager; this agent by default"}}},
+        },
+        {
             "name": "server_logs",
             "description": "Read a project's recent Rojo server output, oldest first: sync errors, a broken \
                 project file, or why the server stopped.",
@@ -76,17 +91,21 @@ pub fn specs(studio_tools: bool) -> Value {
         },
         {
             "name": "manage_project",
-            "description": "Add, change, or remove Rojo Manager projects. add takes an absolute folder path: a Rojo \
-                project, or a parent folder whose project subfolders are all added on free ports. update \
+            "description": "Add, change, keep, or remove Rojo Manager projects. add takes an absolute folder path: a \
+                Rojo project, or a parent folder whose project subfolders are all added on free ports. With \
+                temporary, the project is never saved: it is gone when removed or when Rojo Manager exits, and its \
+                server stops with it; keep saves it like any other project. update \
                 changes any of name, port, autostart, auto_connect (connect Rojo when the linked place \
                 opens in Studio while the server runs), sourcemap (keep sourcemap.json current with rojo \
-                sourcemap --watch while the server runs), and place (a place ID or link; \"\" unlinks). \
+                sourcemap --watch while the server runs), and place (a place ID or link, local for an unpublished \
+                place file built from the project, or \"\" to unlink). \
                 Renaming or changing the port needs the server stopped. remove drops the project from \
                 the list, stopping its server; its files are kept.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
-                "action": {"type": "string", "enum": ["add", "update", "remove"]},
-                "project": {"type": "string", "description": "Project name, for update and remove"},
+                "action": {"type": "string", "enum": ["add", "update", "keep", "remove"]},
+                "project": {"type": "string", "description": "Project name, for update, keep, and remove"},
                 "path": {"type": "string", "description": "Absolute folder path, for add"},
+                "temporary": {"type": "boolean", "default": false, "description": "For add"},
                 "name": {"type": "string"},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "autostart": {"type": "boolean", "description": "Start the server when Rojo Manager opens"},
@@ -171,6 +190,7 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         }
         "server_logs" => text(&server_logs(backend, args)?),
         "manage_project" => text(&manage_project(backend, args)?),
+        "lane" => text(&lane(backend, args)?),
         "updates" => text(&updates(backend, args)?),
         "app_settings" => text(&app_settings(backend, args)?),
         "get_connected_instances" => text(&connected_instances(backend)?),
@@ -194,7 +214,7 @@ struct Project {
     state: String,
     port: u16,
     #[serde(default)]
-    place: Option<Place>,
+    place: Option<PlaceLink>,
     /// The linked place's experience name, once Rojo Manager looked it up.
     #[serde(default)]
     experience: Option<String>,
@@ -204,6 +224,8 @@ struct Project {
     auto_connect: bool,
     #[serde(default)]
     sourcemap: bool,
+    #[serde(default)]
+    temporary: bool,
     /// Its last output lines.
     #[serde(default)]
     log: Vec<String>,
@@ -227,6 +249,9 @@ struct Brief {
     port: u16,
     #[serde(rename = "placeId", skip_serializing_if = "Option::is_none")]
     place_id: Option<u64>,
+    /// A local place's file, which Studio shows as the place's name.
+    #[serde(rename = "placeFile", skip_serializing_if = "Option::is_none")]
+    place_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     experience: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -235,6 +260,8 @@ struct Brief {
     auto_connect: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sourcemap: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    temporary: bool,
     /// Only in list_projects, when the linked place is open in Studio.
     #[serde(skip_serializing_if = "Option::is_none")]
     studio: Option<StudioPlace>,
@@ -246,11 +273,16 @@ impl From<Project> for Brief {
             name: project.name,
             state: project.state,
             port: project.port,
-            place_id: project.place.map(|place| place.place_id),
+            place_id: project.place.as_ref().and_then(PlaceLink::published).map(|place| place.place_id),
+            place_file: match &project.place {
+                Some(PlaceLink::Local(local)) => Some(local.file.clone()),
+                _ => None,
+            },
             experience: project.experience,
             autostart: project.autostart,
             auto_connect: project.auto_connect,
             sourcemap: project.sourcemap,
+            temporary: project.temporary,
             studio: None,
         }
     }
@@ -397,8 +429,25 @@ struct StudioPlace {
 struct Instance {
     instance_id: String,
     place_id: u64,
+    /// game.Name of an unpublished place, from bridges since version 9.
+    #[serde(default)]
+    place_name: Option<String>,
     #[serde(default)]
     rojo: Rojo,
+}
+
+impl Instance {
+    fn has(&self, place: &PlaceLink) -> bool {
+        place.matches(self.place_id, self.place_name.as_deref())
+    }
+
+    /// "place 123", or the name of an unpublished place.
+    fn describe(&self) -> String {
+        match &self.place_name {
+            Some(name) if self.place_id == 0 => name.clone(),
+            _ => format!("place {}", self.place_id),
+        }
+    }
 }
 
 /// The Studio windows the bridge reports from, or None when the bridge is not installed.
@@ -410,8 +459,8 @@ fn studio_instances(backend: &dyn Backend) -> Result<Option<Vec<Instance>>, Stri
 }
 
 /// The open Studio window with this place, if any.
-fn find_instance(instances: &[Instance], place_id: u64) -> Option<String> {
-    instances.iter().find(|instance| instance.place_id == place_id).map(|instance| instance.instance_id.clone())
+fn find_instance(instances: &[Instance], place: &PlaceLink) -> Option<String> {
+    instances.iter().find(|instance| instance.has(place)).map(|instance| instance.instance_id.clone())
 }
 
 /// Run a Rojo plugin action through the bridge in one Studio window.
@@ -426,15 +475,14 @@ fn bridge(backend: &dyn Backend, instance_id: &str, action: &str, port: Option<u
 
 /// The Studio instance that has the project's linked place open.
 fn place_instance(backend: &dyn Backend, project: &Project) -> Result<String, String> {
-    let Some(place) = project.place else {
+    let Some(place) = &project.place else {
         return Err(format!("{} has no linked place. Link one with open_place (project and place).", project.name));
     };
     let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
-    find_instance(&instances, place.place_id).ok_or_else(|| {
-        format!(
-            "Place {} is not open in Studio, or its Rojo Manager bridge is not loaded. Use open_place first.",
-            place.place_id
-        )
+    find_instance(&instances, place).ok_or_else(|| {
+        let mut message = place.describe();
+        message[..1].make_ascii_uppercase();
+        format!("{message} is not open in Studio, or its Rojo Manager bridge is not loaded. Use open_place first.")
     })
 }
 
@@ -513,8 +561,10 @@ fn server_tool(backend: &dyn Backend, name: &str, action: &str) -> Result<Projec
 
 #[derive(Debug, Serialize)]
 struct Opened {
-    #[serde(rename = "placeId")]
-    place_id: u64,
+    #[serde(rename = "placeId", skip_serializing_if = "Option::is_none")]
+    place_id: Option<u64>,
+    #[serde(rename = "placeFile", skip_serializing_if = "Option::is_none")]
+    place_file: Option<String>,
     #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
     instance_id: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -528,7 +578,8 @@ struct Opened {
 }
 
 /// open_place: reuses a Studio that already has the place open, otherwise opens it and waits up to
-/// 3 minutes for its bridge to report in.
+/// 3 minutes for its bridge to report in. Rojo Manager opens a local place itself, building it first
+/// when its file is missing.
 fn open_place(
     backend: &dyn Backend,
     project_name: Option<String>,
@@ -541,11 +592,19 @@ fn open_place(
         project = Some(linked);
     }
     let place = match (&project, &place_text) {
-        (Some(project), _) => {
-            project.place.ok_or_else(|| format!("{} has no linked place. Pass place to link one.", project.name))?
+        (Some(project), _) => project
+            .place
+            .clone()
+            .ok_or_else(|| format!("{} has no linked place. Pass place to link one.", project.name))?,
+        (None, Some(text)) if text.eq_ignore_ascii_case("local") => {
+            return Err("A local place is built from a project. Pass the project too.".into());
         }
-        (None, Some(text)) => backend.resolve_place(text).map_err(|error| error.to_string())?,
+        (None, Some(text)) => PlaceLink::Published(backend.resolve_place(text).map_err(|error| error.to_string())?),
         (None, None) => return Err("Pass a project name or a place ID or link.".into()),
+    };
+    let (place_id, place_file) = match &place {
+        PlaceLink::Published(published) => (Some(published.place_id), None),
+        PlaceLink::Local(local) => (None, Some(local.file.clone())),
     };
     if connect_rojo && project.is_none() {
         return Err("connect_rojo needs a project, so Rojo Manager knows which server to use.".into());
@@ -555,10 +614,18 @@ fn open_place(
     }
 
     let instances = studio_instances(backend)?;
-    let mut instance_id = instances.as_deref().and_then(|instances| find_instance(instances, place.place_id));
+    let mut instance_id = instances.as_deref().and_then(|instances| find_instance(instances, &place));
     let opened = instance_id.is_none();
     if opened {
-        backend.open_place(&place).map_err(|error| format!("Could not open Roblox Studio: {error}"))?;
+        match (&place, &project) {
+            (PlaceLink::Published(published), _) => {
+                backend.open_place(published).map_err(|error| format!("Could not open Roblox Studio: {error}"))?
+            }
+            (PlaceLink::Local(_), project) => {
+                let name = project.as_ref().map(|project| project.name.as_str()).unwrap_or_default();
+                call(backend, "POST", &["projects", name, "open-studio"], None, BUILD_TIMEOUT)?;
+            }
+        }
         if instances.is_none() {
             let mut note = "The Rojo Manager bridge is not installed, so the opened place cannot be confirmed.";
             if let Some(project) = project.filter(|_| connect_rojo) {
@@ -567,7 +634,8 @@ fn open_place(
                         Rojo was not connected. The Rojo server is running; connect it from the Rojo plugin in Studio.";
             }
             return Ok(Opened {
-                place_id: place.place_id,
+                place_id,
+                place_file,
                 instance_id: None,
                 opened,
                 note: Some(note),
@@ -579,17 +647,21 @@ fn open_place(
         while instance_id.is_none() && Instant::now() < deadline {
             backend.sleep(Duration::from_secs(2));
             let instances = studio_instances(backend)?.unwrap_or_default();
-            instance_id = find_instance(&instances, place.place_id);
+            instance_id = find_instance(&instances, &place);
         }
         if instance_id.is_none() {
+            let hint = match place {
+                PlaceLink::Published(_) => "",
+                PlaceLink::Local(_) => " A local place also needs the bridge from Rojo Manager 1.0 or newer.",
+            };
             return Err(format!(
-                "Studio was asked to open place {}, but its Rojo Manager bridge did not report in within 3 \
-                 minutes. Check that the Creator Store Rojo is off, so the bridge's Rojo loads.",
-                place.place_id
+                "Studio was asked to open {}, but its Rojo Manager bridge did not report in within 3 minutes. Check \
+                 that the Creator Store Rojo is off, so the bridge's Rojo loads.{hint}",
+                place.describe()
             ));
         }
     }
-    let mut result = Opened { place_id: place.place_id, instance_id, opened, note: None, rojo: None, next: None };
+    let mut result = Opened { place_id, place_file, instance_id, opened, note: None, rojo: None, next: None };
     if let Some(project) = project.filter(|_| connect_rojo) {
         let session = run_session(backend, &project.name, "connect")?;
         result.instance_id = Some(session.instance_id);
@@ -612,10 +684,11 @@ fn list_projects(backend: &dyn Backend) -> Result<ProjectList, String> {
     let projects = projects
         .into_iter()
         .map(|project| {
+            let place = project.place.clone();
             let mut item = Brief::from(project);
-            let open = item.place_id.and_then(|place_id| {
+            let open = place.and_then(|place| {
                 let instances = instances.as_mut()?;
-                let index = instances.iter().position(|instance| instance.place_id == place_id)?;
+                let index = instances.iter().position(|instance| instance.has(&place))?;
                 Some(instances.swap_remove(index))
             });
             item.studio = open.map(|instance| StudioPlace { instance_id: instance.instance_id, rojo: instance.rojo });
@@ -632,6 +705,8 @@ struct ConnectedInstance {
     instance_id: String,
     #[serde(rename = "placeId")]
     place_id: u64,
+    #[serde(rename = "placeName", skip_serializing_if = "Option::is_none")]
+    place_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<String>,
     rojo: Rojo,
@@ -641,13 +716,15 @@ struct ConnectedInstance {
 fn connected_instances(backend: &dyn Backend) -> Result<Value, String> {
     let projects = manager_projects(backend)?;
     let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
-    let linked = |place_id| projects.iter().find(|p| p.place.is_some_and(|place| place.place_id == place_id));
+    let linked =
+        |instance: &Instance| projects.iter().find(|p| p.place.as_ref().is_some_and(|place| instance.has(place)));
     let instances: Vec<ConnectedInstance> = instances
         .into_iter()
         .map(|instance| ConnectedInstance {
-            project: linked(instance.place_id).map(|project| project.name.clone()),
+            project: linked(&instance).map(|project| project.name.clone()),
             instance_id: instance.instance_id,
             place_id: instance.place_id,
+            place_name: instance.place_name,
             rojo: instance.rojo,
         })
         .collect();
@@ -676,8 +753,7 @@ fn only_instance(backend: &dyn Backend) -> Result<String, String> {
         [only] => Ok(only.instance_id.clone()),
         [] => Err("No Studio window with the Rojo Manager bridge is open.".into()),
         several => {
-            let ids: Vec<String> =
-                several.iter().map(|i| format!("{} (place {})", i.instance_id, i.place_id)).collect();
+            let ids: Vec<String> = several.iter().map(|i| format!("{} ({})", i.instance_id, i.describe())).collect();
             Err(format!("Several Studio windows are open; pass instance_id or project: {}", ids.join(", ")))
         }
     }
@@ -750,11 +826,15 @@ enum Managed {
 }
 
 fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String> {
-    let action = choice(args, "action", &["add", "update", "remove"])?;
+    let action = choice(args, "action", &["add", "update", "keep", "remove"])?;
     if action == "add" {
         let path = string(args, "path")?;
+        let temporary = match args.get("temporary") {
+            None | Some(Value::Null) => false,
+            Some(value) => value.as_bool().ok_or("temporary must be true or false")?,
+        };
         manager_projects(backend)?; // starts the manager if needed
-        let body = json!({ "path": path });
+        let body = if temporary { json!({ "path": path, "temporary": true }) } else { json!({ "path": path }) };
         let reply = call(backend, "POST", &["projects"], Some(&body), Duration::from_secs(30))?;
         let added: Vec<Project> = field(reply, "added")?;
         return Ok(Managed::Added { added: added.into_iter().map(Brief::from).collect() });
@@ -762,6 +842,10 @@ fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String>
     let name = find_project(backend, &string(args, "project")?)?.name;
     if action == "remove" {
         return Ok(Managed::Removed(call(backend, "POST", &["projects", &name, "remove"], None, CALL_TIMEOUT)?));
+    }
+    if action == "keep" {
+        let project = act(backend, &name, "keep", None)?;
+        return Ok(Managed::Updated(Box::new(ProjectResult { project: project.into(), rojo: None })));
     }
     let changes: Map<String, Value> =
         PROJECT_FIELDS.iter().filter_map(|(key, stored)| Some((stored.to_string(), args.get(*key)?.clone()))).collect();
@@ -771,6 +855,68 @@ fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String>
     }
     let project = act(backend, &name, "update", Some(&Value::Object(changes)))?;
     Ok(Managed::Updated(Box::new(ProjectResult { project: project.into(), rojo: None })))
+}
+
+/// A lane as Rojo Manager reports it; only its name matters here.
+#[derive(Debug, Deserialize)]
+struct LaneInfo {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum LaneResult {
+    Created {
+        lane: String,
+        project: Box<Brief>,
+        #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rojo: Option<Rojo>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'static str>,
+    },
+    /// The manager's reply, passed on.
+    Removed(Value),
+}
+
+/// lane: create makes the lane in Rojo Manager, then opens, connects, and accepts it like open_place
+/// with connect_rojo; when that fails, the lane is removed again. remove closes it.
+fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
+    let action = choice(args, "action", &["create", "remove"])?;
+    manager_projects(backend)?; // starts the manager if needed
+    if action == "remove" {
+        let name = string(args, "lane")?;
+        return Ok(LaneResult::Removed(call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT)?));
+    }
+    let from = find_project(backend, &string(args, "from")?)?.name;
+    // Keys in sorted order, as in PROJECT_FIELDS.
+    let path = string(args, "path")?;
+    let mut body = json!({ "from": from });
+    if let Some(holder) = optional_string(args, "holder")?.or_else(crate::rpc::client_name) {
+        body["holder"] = json!(holder);
+    }
+    body["path"] = json!(path);
+    let name = field::<LaneInfo>(call(backend, "POST", &["lanes"], Some(&body), CALL_TIMEOUT)?, "lane")?.name;
+    let opened = open_place(backend, Some(name.clone()), None, true).and_then(|mut opened| {
+        if let (Some(instance_id), Some("Confirming")) = (&opened.instance_id, opened.rojo.as_ref().map(Rojo::status)) {
+            opened.rojo = Some(bridge(backend, instance_id, "accept", None)?);
+        }
+        Ok(opened)
+    });
+    match opened {
+        Ok(opened) => Ok(LaneResult::Created {
+            project: Box::new(find_project(backend, &name)?.into()),
+            lane: name,
+            instance_id: opened.instance_id,
+            rojo: opened.rojo,
+            note: opened.note,
+        }),
+        Err(error) => {
+            let _ = call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT);
+            Err(format!("{error} The lane was removed again."))
+        }
+    }
 }
 
 fn app_settings(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
@@ -886,11 +1032,15 @@ mod tests {
                     updated["autoConnect"] = json!(true);
                     json!({"project": updated})
                 }
+                [.., "keep"] => json!({"project": project("off", true)}),
                 _ => json!({"removed": parts[1]}),
             },
             ..Fake::default()
         };
         let added = manage_project(&fake, &args(json!({"action": "add", "path": "C:/Games/Lobby"}))).unwrap();
+        let temporary = json!({"action": "add", "path": "C:/Games/Lobby", "temporary": true});
+        manage_project(&fake, &args(temporary)).unwrap();
+        manage_project(&fake, &args(json!({"action": "keep", "project": "TestGame"}))).unwrap();
         let update = json!({"action": "update", "project": "testgame", "auto_connect": true, "port": 34900});
         let updated = manage_project(&fake, &args(update)).unwrap();
         let removed = manage_project(&fake, &args(json!({"action": "remove", "project": "TestGame"}))).unwrap();
@@ -908,6 +1058,10 @@ mod tests {
             [
                 "GET projects",
                 r#"POST projects {"path":"C:/Games/Lobby"}"#,
+                "GET projects",
+                r#"POST projects {"path":"C:/Games/Lobby","temporary":true}"#,
+                "GET projects",
+                "POST projects/TestGame/keep",
                 "GET projects",
                 r#"POST projects/TestGame/update {"autoConnect":true,"port":34900}"#,
                 "GET projects",
@@ -1051,7 +1205,9 @@ mod tests {
         let rojo = json!({"status": "Connected", "address": "localhost:34879", "host": "localhost", "bridge": 7});
         let fake = Fake {
             projects: Script::new([json!([test_game, lobby])]),
-            instances: json!({"bridge": true, "instances": [{"instanceId": "7", "placeId": 2, "rojo": rojo}]}),
+            instances: Script::new([
+                json!({"bridge": true, "instances": [{"instanceId": "7", "placeId": 2, "rojo": rojo}]}),
+            ]),
             ..Fake::default()
         };
         assert_eq!(
@@ -1134,6 +1290,63 @@ mod tests {
         let opened = open_place(&fake, Some("TestGame".into()), None, false).unwrap();
         assert_eq!(json_text(&opened), r#"{"placeId":2,"instanceId":"7"}"#);
         assert_eq!(fake.calls(), ["GET projects"]);
+    }
+
+    #[test]
+    fn open_place_has_rojo_manager_build_and_open_a_local_place_then_finds_it_by_name() {
+        let mut lane = project("off", false);
+        lane["place"] = json!({"file": "TestGame-1a2b3c4d.rbxl"});
+        let open = json!({"bridge": true, "instances": [
+            {"instanceId": "8", "placeId": 0, "placeName": "Other-00000000.rbxl", "rojo": {}},
+            {"instanceId": "9", "placeId": 0, "placeName": "TestGame-1a2b3c4d.rbxl", "rojo": {}}]});
+        let fake = Fake {
+            projects: Script::new([json!([lane])]),
+            instances: Script::new([json!({"bridge": true, "instances": []}), open]),
+            ..Fake::default()
+        };
+        let opened = open_place(&fake, Some("TestGame".into()), None, false).unwrap();
+        assert_eq!(json_text(&opened), r#"{"placeFile":"TestGame-1a2b3c4d.rbxl","instanceId":"9","opened":true}"#);
+        assert_eq!(fake.calls(), ["GET projects", "POST projects/TestGame/open-studio"]);
+        let error = open_place(&fake, None, Some("local".into()), false).unwrap_err();
+        assert_eq!(error, "A local place is built from a project. Pass the project too.");
+    }
+
+    #[test]
+    fn lane_create_makes_the_lane_then_opens_connects_and_accepts_it() {
+        let mut made = project("off", false);
+        made["name"] = json!("TestGame-lane");
+        made["place"] = json!({"file": "TestGame-lane-1a2b3c4d.rbxl"});
+        made["temporary"] = json!(true);
+        let mut serving = made.clone();
+        serving["state"] = json!("serving");
+        let open = json!({"bridge": true, "instances": [
+            {"instanceId": "9", "placeId": 0, "placeName": "TestGame-lane-1a2b3c4d.rbxl", "rojo": {}}]});
+        let fake = Fake {
+            projects: Script::new([
+                json!([project("off", true)]),
+                json!([project("off", true)]),
+                json!([project("off", true), made.clone()]),
+                json!([project("off", true), made]),
+                json!([project("off", true), serving]),
+            ]),
+            reply: |_, parts| match parts {
+                ["lanes"] => json!({"lane": {"name": "TestGame-lane"}}),
+                _ => json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "starting"}}),
+            },
+            instances: Script::new([json!({"bridge": true, "instances": []}), open]),
+            studio: Script::new([json!({"status": "Confirming"}), json!({"status": "Connected"})]),
+            ..Fake::default()
+        };
+        let create = json!({"action": "create", "from": "testgame", "path": "C:/Lane", "holder": "me"});
+        let created = lane(&fake, &args(create));
+        assert_eq!(
+            json_text(&created.unwrap()),
+            r#"{"lane":"TestGame-lane","project":{"name":"TestGame-lane","state":"serving","port":34879,"placeFile":"TestGame-lane-1a2b3c4d.rbxl","temporary":true},"instanceId":"9","rojo":{"status":"Connected"}}"#
+        );
+        let calls = fake.calls();
+        assert_eq!(calls[2], r#"POST lanes {"from":"TestGame","holder":"me","path":"C:/Lane"}"#);
+        assert!(calls.contains(&"POST projects/TestGame-lane/open-studio".to_string()));
+        assert_eq!(calls[calls.len() - 2], r#"POST studio/9 {"action":"accept"}"#);
     }
 
     #[test]

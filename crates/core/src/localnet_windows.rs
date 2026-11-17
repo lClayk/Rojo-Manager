@@ -106,6 +106,41 @@ pub fn process_name(pid: u32) -> Option<String> {
     Path::new(&path).file_name().map(|name| name.to_string_lossy().into_owned())
 }
 
+/// The processes owning a visible top-level window whose title starts with `prefix`, ignoring case.
+pub fn window_owners(prefix: &str) -> Vec<u32> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId};
+    use windows::core::BOOL;
+
+    unsafe extern "system" fn each(window: HWND, found: LPARAM) -> BOOL {
+        // SAFETY: `found` is the Vec passed to EnumWindows below, alive for the whole call.
+        unsafe { (*(found.0 as *mut Vec<HWND>)).push(window) };
+        BOOL(1)
+    }
+    let mut windows: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only pushes to `windows`, which outlives the call.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM(&mut windows as *mut Vec<HWND> as isize)) };
+    let prefix = prefix.to_lowercase();
+    let mut owners: Vec<u32> = windows
+        .into_iter()
+        .filter_map(|window| {
+            let mut text = [0u16; 2048];
+            // SAFETY: `text` is a writable buffer of its own length.
+            let length = unsafe { GetWindowTextW(window, &mut text) };
+            let title = String::from_utf16_lossy(&text[..length.max(0) as usize]);
+            if !title.to_lowercase().starts_with(&prefix) {
+                return None;
+            }
+            let mut pid = 0u32;
+            // SAFETY: `pid` is a valid out pointer.
+            unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+            (pid != 0).then_some(pid)
+        })
+        .collect();
+    owners.dedup();
+    owners
+}
+
 /// Force-end a process (TerminateProcess).
 pub fn kill_process(pid: u32) -> io::Result<()> {
     // SAFETY: plain Win32 calls; the handle is closed below.

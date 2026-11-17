@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::io::{BufRead, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 
 use rojo_manager_core::VERSION;
@@ -18,11 +18,16 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - list_projects shows each project's server state, linked place, and whether that place is open in Studio.
 - rojo_server starts, stops, or restarts a project's Rojo server.
 - open_place opens a project's place in Roblox Studio; connect_rojo=true also starts the server and connects Rojo.
-  Passing both project and place links that place to the project first.
+  Passing both project and place links that place to the project first. place=local gives a project a local
+  place: an unpublished file Rojo Manager builds from the project with rojo build, named by its placeFile.
 - rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
   waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort.
 - manage_project adds project folders, changes a project's name, port, autostart, auto_connect, sourcemap, or
-  linked place, or removes a project from the list (its files are kept).
+  linked place, or removes a project from the list (its files are kept). temporary=true adds a project that is
+  never saved and is gone when removed or when Rojo Manager exits; keep saves it.
+- lane create gives this agent an isolated Studio for parallel work: a temporary project from a copy of a
+  project (such as a git worktree), with a local place of its own, opened in Studio and synced. lane remove closes
+  it. Use one instead of sharing the main project's Studio with another agent.
 - server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
 - studio_output reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a
   playtest's server.
@@ -33,6 +38,14 @@ Server states: off; starting; serving (running, no Studio connected); connected 
 external (running but started outside Rojo Manager, still controllable); blocked (another app owns the port).
 Studio is reached through the Rojo Manager bridge, installed from Settings > Agents. instanceId values are Rojo
 Manager's; to use another Studio MCP's tools, match its Studio windows by placeId.";
+
+/// The agent's name from its initialize request (clientInfo.name), such as "claude-code".
+static CLIENT: OnceLock<String> = OnceLock::new();
+
+/// The connected agent's name, once it introduced itself.
+pub fn client_name() -> Option<String> {
+    CLIENT.get().cloned()
+}
 
 /// Read requests until `input` closes. Tool calls run on their own threads so pings stay responsive;
 /// finished ones are dropped, and those still running at the end are waited for.
@@ -81,6 +94,10 @@ fn handle(backend: &dyn Backend, message: &Map<String, Value>) -> Option<Value> 
     let params = message.get("params").and_then(Value::as_object).unwrap_or(&no_params);
     let result = match method {
         "initialize" => {
+            let client = params.get("clientInfo").and_then(|info| info.get("name")?.as_str());
+            if let Some(name) = client.map(str::trim).filter(|name| !name.is_empty()) {
+                let _ = CLIENT.set(name.chars().take(100).collect());
+            }
             let requested = params.get("protocolVersion").and_then(Value::as_str);
             let version = PROTOCOL_VERSIONS.into_iter().find(|version| Some(*version) == requested);
             json!({
@@ -174,6 +191,7 @@ mod tests {
             "server_logs",
             "studio_output",
             "manage_project",
+            "lane",
             "updates",
             "app_settings",
             "get_connected_instances",

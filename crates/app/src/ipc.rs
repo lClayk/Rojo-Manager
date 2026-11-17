@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::manager::{Engine, Event, ProjectView, Snapshot, Update};
 use rojo_manager_core::tooling::Job;
 use serde::de::DeserializeOwned;
@@ -48,6 +48,9 @@ pub enum Call {
         update: Update,
     },
     Remove {
+        name: String,
+    },
+    Keep {
         name: String,
     },
     OpenStudio {
@@ -126,9 +129,10 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         }
         Call::PortOwner { name } => json(engine.port_owner(&name)),
         Call::KillPortOwner { name, pid } => json(engine.kill_port_owner(&name, pid)),
-        Call::AddProjects { path } => json(engine.add_projects(&path)),
+        Call::AddProjects { path } => json(engine.add_projects(&path, false)),
         Call::Update { name, update } => json(engine.update(&name, update)),
         Call::Remove { name } => json(engine.remove(&name)),
+        Call::Keep { name } => json(engine.keep(&name)),
         Call::OpenStudio { name } => json(engine.open_studio(&name)),
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
@@ -252,7 +256,10 @@ impl Client {
     pub fn remove(&self, name: &str) -> Result<(), String> {
         self.call(Call::Remove { name: name.into() })
     }
-    pub fn open_studio(&self, name: &str) -> Result<Place, String> {
+    pub fn keep(&self, name: &str) -> Result<(), String> {
+        self.call(Call::Keep { name: name.into() })
+    }
+    pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
         self.call(Call::OpenStudio { name: name.into() })
     }
     pub fn open_folder(&self, name: &str) -> Result<(), String> {
@@ -297,6 +304,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rojo_manager_core::config::Place;
+    use rojo_manager_core::manager::PlaceChoice;
 
     #[test]
     fn updates_keep_the_difference_between_unchanged_and_unlinked_places() {
@@ -309,7 +318,9 @@ mod tests {
         };
         assert_eq!(round_trip(Update { port: Some(1), ..Update::default() }).place, None);
         assert_eq!(round_trip(Update { place: Some(None), ..Update::default() }).place, Some(None));
-        let place = Place { place_id: 2, universe_id: 3 };
+        let place = PlaceChoice::Published(Place { place_id: 2, universe_id: 3 });
         assert_eq!(round_trip(Update { place: Some(Some(place)), ..Update::default() }).place, Some(Some(place)));
+        let local = Some(Some(PlaceChoice::Local));
+        assert_eq!(round_trip(Update { place: local, ..Update::default() }).place, local);
     }
 }
