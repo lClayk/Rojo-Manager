@@ -605,7 +605,7 @@ pub fn creator_store_rojo_installed() -> bool {
 
 /// Download the official Rojo plugin matching the installed Rojo, add the Rojo Manager bridge with
 /// Lune, and install it as a local Studio plugin. Rojo is never redistributed.
-fn install_rojo_bridge() -> Result<String, String> {
+pub fn install_rojo_bridge() -> Result<String, String> {
     if find_tool("Rojo").is_none() {
         install_global("Rojo")?;
     }
