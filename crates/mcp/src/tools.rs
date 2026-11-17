@@ -49,7 +49,7 @@ pub fn specs(studio_tools: bool) -> Value {
             "name": "rojo_server",
             "description": "Start, stop, or restart a project's Rojo server and wait for the result. A Studio \
                 connected to the project is disconnected cleanly on stop and reconnected on restart. With wait \
-                false, it returns right after the request, without reconnecting Studio.",
+                false, it returns right after the request.",
             "inputSchema": {"type": "object", "required": ["project", "action"], "additionalProperties": false,
                 "properties": {"project": {"type": "string", "description": "Project name"},
                     "action": {"type": "string", "enum": ["start", "stop", "restart"]},
@@ -598,22 +598,25 @@ struct ProjectResult {
     rojo: Option<Rojo>,
 }
 
-/// rojo_server: keeps a connected Studio in step. Stopping disconnects Rojo cleanly first, and
-/// restarting reconnects it, instead of leaving the plugin in an error state.
+/// rojo_server. Rojo Manager disconnects a connected Studio before stopping its server and reconnects
+/// it after a restart; with `wait`, a restart also answers with that Studio's Rojo once it settles.
 fn server_tool(backend: &dyn Backend, name: &str, action: &str, wait: bool) -> Result<ProjectResult, String> {
     let instance_id = match action {
-        "stop" | "restart" => connected_instance(backend, &find_project(backend, name)?),
+        "restart" if wait => connected_instance(backend, &find_project(backend, name)?),
         _ => None,
     };
-    if let Some(instance_id) = &instance_id
-        && action == "stop"
-    {
-        bridge(backend, instance_id, "disconnect", None)?;
-    }
     let project = run_server(backend, name, action, wait)?.into();
     let rojo = match instance_id {
-        Some(_) if action == "restart" && wait => Some(run_session(backend, name, "connect", true)?.rojo),
-        _ => None,
+        Some(instance_id) => {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut rojo = bridge(backend, &instance_id, "status", None)?;
+            while !rojo.settled() && Instant::now() < deadline {
+                backend.sleep(Duration::from_millis(250));
+                rojo = bridge(backend, &instance_id, "status", None)?;
+            }
+            Some(rojo)
+        }
+        None => None,
     };
     Ok(ProjectResult { project, rojo })
 }
@@ -1255,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_disconnects_and_restart_reconnects_a_connected_studio() {
+    fn restart_answers_with_the_reconnected_studio() {
         let fake = Fake {
             projects: Script::new([json!([project("serving", true)])]),
             reply: |_, _| json!({"project": project("off", true)}),
@@ -1264,15 +1267,7 @@ mod tests {
         };
         let stopped = server_tool(&fake, "TestGame", "stop", true).unwrap();
         assert_eq!(json_text(&stopped), r#"{"project":{"name":"TestGame","state":"off","port":34879,"placeId":2}}"#);
-        assert_eq!(
-            fake.calls(),
-            [
-                "GET projects",
-                r#"POST studio/7 {"action":"status"}"#,
-                r#"POST studio/7 {"action":"disconnect"}"#,
-                r#"POST projects/TestGame/stop {"wait":true}"#,
-            ]
-        );
+        assert_eq!(fake.calls(), [r#"POST projects/TestGame/stop {"wait":true}"#]);
 
         let fake = Fake {
             projects: Script::new([json!([project("serving", true)])]),
@@ -1290,8 +1285,7 @@ mod tests {
                 "GET projects",
                 r#"POST studio/7 {"action":"status"}"#,
                 r#"POST projects/TestGame/restart {"wait":true}"#,
-                "GET projects",
-                r#"POST studio/7 {"action":"connect","port":34879,"wait":true}"#,
+                r#"POST studio/7 {"action":"status"}"#,
             ]
         );
     }

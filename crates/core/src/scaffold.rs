@@ -55,7 +55,8 @@ pub fn convert(rojo: &Path, file: &Path, path: &Path) -> Result<(), String> {
         return Err(format!("Converting a place needs Rojo 7.7 or later, and {version} is installed."));
     }
     let staging = parent.join(format!(".{name}.converting"));
-    let _ = fs::remove_dir_all(&staging);
+    // Created here, never taken over: only a folder this conversion made is deleted on failure.
+    fs::create_dir(&staging).map_err(|e| format!("Could not create {}: {e}", staging.display()))?;
     let built = syncback(rojo, file, &staging, &name).and_then(|_| {
         if existed {
             fs::remove_dir(path).map_err(|e| format!("Could not use {}: {e}", path.display()))?;

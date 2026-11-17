@@ -60,13 +60,15 @@ pub fn render(view: &MainView, name: &str, cx: &mut Context<MainView>) -> Div {
         .min_h_0()
         .p(px(12.))
         .child(
+            // Scrolls, since the kept backups (backups::KEEP) outgrow a short window.
             div()
+                .id("backup-list")
                 .size_full()
                 .rounded(px(8.))
                 .border_1()
                 .border_color(rgb(BORDER))
                 .bg(rgb(CARD))
-                .overflow_hidden()
+                .overflow_y_scroll()
                 .children(rows),
         )
         .child(

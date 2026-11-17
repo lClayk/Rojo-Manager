@@ -659,7 +659,9 @@ impl Engine {
         self.wait_until(timeout, || {
             let Some(project) = self.project(name) else { return true };
             match project.state {
-                ServerState::Off | ServerState::Blocked => true,
+                ServerState::Off => true,
+                // Right after a stop, the port can read as another app's until Rojo's child exits.
+                ServerState::Blocked => !stop,
                 ServerState::Starting => false,
                 _ if stop => false,
                 _ => rojo_api::server_info(project.port, Duration::from_millis(500)).is_some(),
@@ -968,9 +970,21 @@ impl Engine {
 
     pub fn stop(&self, name: &str) {
         self.lock().restarting.remove(name);
+        self.disconnect_studio(name);
         self.stop_server(name);
         self.wake_watcher();
         self.changed();
+    }
+
+    /// Disconnect Rojo in the Studio connected to the project's server, so stopping the server does
+    /// not leave Rojo there in Error. Answers that Studio, for a restart to reconnect.
+    fn disconnect_studio(&self, name: &str) -> Option<u64> {
+        let state = self.lock();
+        let port = state.port(name).ok()?;
+        let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
+        let studio = live.clone().find(|(_, report)| report.port == port).map(|(id, _)| *id)?;
+        drop(state);
+        self.link.run(studio, "disconnect", json!({}), Duration::from_secs(5)).ok().map(|_| studio)
     }
 
     fn stop_server(&self, name: &str) {
@@ -1030,6 +1044,8 @@ impl Engine {
     /// Stop, then start again once the port is free (up to 5 seconds).
     pub fn restart(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let port = self.lock().port(name)?;
+        // A Studio that was connected is reconnected once the server is back.
+        let studio = self.disconnect_studio(name);
         self.stop(name);
         self.lock().restarting.insert(name.to_string());
         self.changed();
@@ -1043,7 +1059,13 @@ impl Engine {
                 }
                 if !port_in_use(port) {
                     engine.lock().restarting.remove(&name);
-                    let _ = engine.start(&name);
+                    if engine.start(&name).is_ok()
+                        && let Some(studio) = studio
+                    {
+                        engine.wait_for_server(&name, "start");
+                        let args = json!({ "port": port, "wait": true });
+                        let _ = engine.link.run(studio, "connect", args, Duration::from_secs(40));
+                    }
                     return;
                 }
                 if Instant::now() >= deadline {
@@ -1584,6 +1606,19 @@ impl Engine {
                 return Err("Stop the server before changing its port".into());
             }
         }
+        // Unlinking a local place keeps a copy beside the project, since Studio saves into it and a
+        // converted place's map is only there. The sweep at the next launch removes the original.
+        let kept = match local_place(&project) {
+            Some(old) if old.is_file() && !matches!(linked, Some(PlaceLink::Local(_))) => {
+                let kept = Path::new(&project.path).join(old.file_name().unwrap_or_default());
+                if !kept.exists() {
+                    std::fs::copy(&old, &kept)
+                        .map_err(|e| format!("Could not keep the local place at {}: {e}", kept.display()))?;
+                }
+                Some(kept)
+            }
+            _ => None,
+        };
         let mut config = state.config.clone();
         let p = config.project_mut(name).ok_or_else(|| missing(name))?;
         p.port = update.port.unwrap_or(p.port);
@@ -1620,6 +1655,9 @@ impl Engine {
             None => {}
         }
         self.changed();
+        if let Some(kept) = kept {
+            self.notice(format!("Kept {new_name}'s local place at {}", kept.display()));
+        }
         if view.place.as_ref().is_some_and(|place| place.published().is_some()) && view.experience.is_none() {
             self.look_up_experiences();
         }
@@ -1716,9 +1754,23 @@ impl Engine {
         Ok(name)
     }
 
+    /// Refuse a new project's folder before anything is written in it, when `register` would refuse
+    /// its name (a project is named after its folder).
+    fn check_name_free(&self, path: &Path) -> Result<(), String> {
+        let folder =
+            path.file_name().map(|n| n.to_string_lossy().to_lowercase()).ok_or("Choose a folder, not a drive")?;
+        match self.lock().config.projects.iter().find(|p| p.name.to_lowercase() == folder) {
+            Some(other) => {
+                Err(format!("A project named {} is already registered. Choose another folder name.", other.name))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Make a Rojo project in `path`, a new or empty folder, with `rojo init`, and add it with a
     /// local place. Returns its name.
     pub fn create_project(&self, path: &Path) -> Result<String, String> {
+        self.check_name_free(path)?;
         let rojo = tooling::find_tool("Rojo").ok_or("Rojo is not installed. Install it in Settings.")?;
         scaffold::create(&rojo, path)?;
         let name = self.register(path, None, None, true)?;
@@ -1731,6 +1783,7 @@ impl Engine {
     /// services become files, and a copy of the place, map and all, becomes the project's local place.
     /// Returns its name.
     pub fn convert_place(&self, file: &Path, path: &Path) -> Result<String, String> {
+        self.check_name_free(path)?;
         let rojo = tooling::find_tool("Rojo").ok_or("Rojo is not installed. Install it in Settings.")?;
         if !file.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rbxl")) {
             return Err("Choose a .rbxl place file. In Studio, File > Save to File saves one.".into());
@@ -1842,6 +1895,9 @@ impl Engine {
                 if !path.is_file() {
                     self.build_place(&project, &path)?;
                 }
+                // A lock left by a Studio that crashed or was closed by force keeps Studio from
+                // opening the file. A running Studio holds its lock open, so only a stale one goes.
+                let _ = std::fs::remove_file(format!("{}.lock", path.display()));
                 crate::shell::open(&path.to_string_lossy())
             }
         };
@@ -2578,8 +2634,12 @@ mod tests {
             path
         };
         let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
-        engine.add_projects(&folder("main")).unwrap();
+        let main = folder("main");
+        engine.add_projects(&main).unwrap();
         assert!(engine.create_lane("Missing", &folder("other"), None).is_err());
+        // A new project named like one already listed is refused before anything is written.
+        let taken = folders.path().join("new").join("mygame");
+        assert!(engine.create_project(&taken).unwrap_err().contains("already registered") && !taken.exists());
         // A copy without the parent's project file is refused, not served from another file.
         let wrong = folders.path().join("wrong");
         std::fs::create_dir_all(&wrong).unwrap();
@@ -2597,6 +2657,14 @@ mod tests {
         // Renaming the parent keeps the lane under it.
         engine.update("MyGame", Update { name: Some("Game".into()), ..Update::default() }).unwrap();
         assert_eq!(engine.project("MyGame 2").unwrap().lane.unwrap().parent, "Game");
+        // Unlinking a local place keeps a copy beside the project.
+        let local = Update { place: Some(Some(PlaceChoice::Local)), ..Update::default() };
+        let Some(PlaceLink::Local(own)) = engine.update("Game", local).unwrap().place else { panic!("local") };
+        std::fs::create_dir_all(own.path().parent().unwrap()).unwrap();
+        std::fs::write(own.path(), "map").unwrap();
+        engine.update("Game", Update { place: Some(None), ..Update::default() }).unwrap();
+        let kept = main.join(&own.file);
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "map");
         // Deleting the lane's folder ends it, with its place; a place nothing links is swept.
         std::fs::create_dir_all(place.path().parent().unwrap()).unwrap();
         std::fs::write(place.path(), "built").unwrap();
