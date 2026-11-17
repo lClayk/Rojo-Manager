@@ -37,8 +37,6 @@ pub struct Fake {
     pub studio: Script<Value>,
     /// The studio_tools setting.
     pub studio_tools: bool,
-    /// Whether Rojo answers on the project's port.
-    pub answers: Script<bool>,
     /// Read with [`Fake::calls`].
     pub calls: Mutex<Vec<String>>,
 }
@@ -51,7 +49,6 @@ impl Default for Fake {
             instances: Script::new([json!({"bridge": true, "instances": []})]),
             studio: Script::new([json!({"status": "Connected"})]),
             studio_tools: true,
-            answers: Script::new([true]),
             calls: Mutex::default(),
         }
     }
@@ -119,10 +116,6 @@ impl Backend for Fake {
     fn launch_manager(&self) -> io::Result<()> {
         self.record("launch".into());
         Ok(())
-    }
-
-    fn rojo_answers(&self, _port: u16) -> bool {
-        self.answers.next()
     }
 
     fn studio_tools(&self) -> bool {

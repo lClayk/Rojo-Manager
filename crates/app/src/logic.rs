@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use rojo_manager_core::config::{PlaceLink, Settings};
-use rojo_manager_core::manager::{ProjectView, ServerState};
+use rojo_manager_core::manager::{ProjectView, ServerState, SyncSummary};
 use rojo_manager_core::tooling::{StudioPlugin, bridge_outdated};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +159,35 @@ pub fn lane_label(project: &ProjectView) -> Option<String> {
     })
 }
 
+/// The parts of a pending sync's line, each with whether it is a warning: removals first, since
+/// they delete what exists only in Studio. An older bridge sends no summary.
+pub fn sync_parts(summary: Option<&SyncSummary>) -> Vec<(String, bool)> {
+    let Some(summary) = summary else {
+        return vec![("update the bridge to see what it changes".into(), false)];
+    };
+    let mut parts = Vec::new();
+    if summary.removed.count > 0 {
+        parts.push((format!("{} removed, found only in Studio", summary.removed.count), true));
+    }
+    for (count, verb) in [(summary.added.count, "added"), (summary.changed.count, "changed")] {
+        if count > 0 {
+            parts.push((format!("{count} {verb}"), false));
+        }
+    }
+    parts
+}
+
+/// A pending sync's paths, for its tooltip: one line per kind of change.
+pub fn sync_paths(summary: &SyncSummary) -> String {
+    let kinds = [("Removed", &summary.removed), ("Added", &summary.added), ("Changed", &summary.changed)];
+    let lines = kinds.iter().filter(|(_, changes)| changes.count > 0).map(|(label, changes)| {
+        let more = changes.count.saturating_sub(changes.paths.len() as u64);
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        format!("{label}: {}{more}", changes.paths.join(", "))
+    });
+    lines.collect::<Vec<_>>().join("\n")
+}
+
 /// The project's tool badges the person chose to show.
 pub fn visible_badges<'a>(badges: &'a [String], settings: &Settings) -> Vec<&'a str> {
     let shown = |badge: &str| match badge {
@@ -283,6 +312,7 @@ mod tests {
             sourcemap: false,
             temporary: false,
             lane: None,
+            pending_sync: None,
             experience: None,
             state,
             badges: vec![],
@@ -406,6 +436,24 @@ mod tests {
         assert_eq!(plugin_row(&bridge("7.7.0", BRIDGE_VERSION - 1), Some("Rojo 7.7.0"), false).button, "Update");
         assert_eq!(plugin_row(&bridge("7.7.0", BRIDGE_VERSION), Some("Rojo 7.7.0"), false).button, "Reinstall");
         assert_eq!(plugin_row(&bridge("7.7.0", BRIDGE_VERSION), None, false).button, "Reinstall");
+    }
+
+    #[test]
+    fn a_pending_sync_lists_removals_first_and_counts_what_is_not_listed() {
+        use rojo_manager_core::manager::Changes;
+        let changes = |count, paths: &[&str]| Changes { count, paths: paths.iter().map(|p| p.to_string()).collect() };
+        let summary = SyncSummary {
+            removed: changes(3, &["Workspace.Map", "Workspace.Spawn"]),
+            added: changes(12, &["ServerScriptService.Main"]),
+            changed: changes(0, &[]),
+        };
+        let parts = sync_parts(Some(&summary));
+        assert_eq!(parts, [("3 removed, found only in Studio".to_string(), true), ("12 added".to_string(), false)]);
+        assert_eq!(
+            sync_paths(&summary),
+            "Removed: Workspace.Map, Workspace.Spawn and 1 more\nAdded: ServerScriptService.Main and 11 more"
+        );
+        assert_eq!(sync_parts(None)[0].0, "update the bridge to see what it changes");
     }
 
     #[test]

@@ -13,6 +13,8 @@
 -- Manager's settings say to ask. A command is one of the actions below; its result goes back with
 -- the next poll. Commands only come from Rojo Manager, which takes them from agents through its
 -- token-protected API.
+-- While Rojo waits for its initial sync to be confirmed, the status carries a summary of what
+-- accepting would do, so agents and the window see it before anyone accepts.
 -- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
 --
 -- In Edit mode and in a playtest's server it also sends Studio's Output to Rojo Manager in small
@@ -23,7 +25,7 @@ local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 9
+local VERSION = 11
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
@@ -44,6 +46,11 @@ local RETRY_SECONDS = 5
 local MAX_POLL_BYTES = 1024 * 1024
 -- Rojo's port when its port field is empty.
 local DEFAULT_PORT = 34872
+-- Paths a pending sync summary lists per kind of change.
+local MAX_PENDING_PATHS = 20
+-- How long connect with wait waits for Rojo to connect, ask to confirm, or fail.
+local CONNECT_WAIT = 30
+local SETTLED = { Connected = true, Confirming = true, Error = true }
 
 -- game.Name for an unpublished place, which Rojo Manager matches to a local place's file.
 local function placeName(): string?
@@ -58,6 +65,105 @@ local outputs: { [any]: RBXScriptConnection } = {}
 -- Rojo's live session, if any.
 local function connected(app): boolean
 	return app.serveSession ~= nil and app.serveSession:getStatus() == "Connected"
+end
+
+-- An instance's path as Rojo Manager shows it: "Workspace.Map", or "game" for the DataModel.
+local function fullName(instance: Instance): string
+	return if instance == game then "game" else instance:GetFullName()
+end
+
+local function count(changes, path: string?)
+	changes.count += 1
+	if path and #changes.paths < MAX_PENDING_PATHS then
+		table.insert(changes.paths, path)
+	end
+end
+
+-- Rojo 7.6 and later: the PatchTree Rojo builds for its diff view, walked as plain tables. Only the
+-- top of an added subtree is listed; everything under it is counted.
+local function summarizeTree(children, parentPath: string?, parentAdded: boolean, summary)
+	for _, node in children do
+		if type(node) ~= "table" then
+			continue
+		end
+		local path = if typeof(node.instance) == "Instance"
+			then fullName(node.instance)
+			elseif parentPath and parentPath ~= "game" then `{parentPath}.{node.name}`
+			else tostring(node.name)
+		if node.patchType == "Add" then
+			count(summary.added, if parentAdded then nil else path)
+		elseif node.patchType == "Edit" then
+			count(summary.changed, path)
+		elseif node.patchType == "Remove" then
+			count(summary.removed, path)
+		end
+		if type(node.children) == "table" then
+			summarizeTree(node.children, path, node.patchType == "Add", summary)
+		end
+	end
+end
+
+-- Rojo 7.5 and earlier: the PatchSet itself, with the instance map it refers to.
+local function summarizePatch(patch, instanceMap, summary)
+	local function addedPath(id): string
+		local added = patch.added[id]
+		local parent = instanceMap.fromIds[added.Parent]
+		local parentPath = if patch.added[added.Parent]
+			then addedPath(added.Parent)
+			elseif parent then fullName(parent)
+			else nil
+		return if parentPath and parentPath ~= "game" then `{parentPath}.{added.Name}` else tostring(added.Name)
+	end
+	for id, added in patch.added do
+		count(summary.added, if patch.added[added.Parent] then nil else addedPath(id))
+	end
+	for _, change in patch.updated do
+		local instance = instanceMap.fromIds[change.id]
+		count(summary.changed, if instance then fullName(instance) else nil)
+	end
+	for _, removed in patch.removed do
+		local instance = if typeof(removed) == "Instance" then removed else instanceMap.fromIds[removed]
+		count(summary.removed, if instance then fullName(instance) else nil)
+	end
+end
+
+-- The summary of the patch Rojo is waiting on, kept while that patch is the same.
+local pendingCache: { source: any, summary: any }? = nil
+
+-- What accepting Rojo's initial sync would do in Studio: instances added, changed, and removed, each
+-- counted with its first paths. Rojo's initial diff only removes children of synced instances that
+-- the project does not have, so every removal is an instance that exists only in Studio.
+-- nil when Rojo is not confirming, or its state has a shape this bridge does not know.
+local function pendingSync(app)
+	local state = app.state or {}
+	local confirm = if type(state.confirmData) == "table" then state.confirmData else {}
+	local tree = if type(state.patchTree) == "table" then state.patchTree else nil
+	local source = tree or confirm.patch
+	if state.appStatus ~= "Confirming" or type(source) ~= "table" then
+		return nil
+	end
+	if pendingCache and pendingCache.source == source then
+		return pendingCache.summary
+	end
+	local function changes()
+		return { count = 0, paths = {} }
+	end
+	local summary = { removed = changes(), added = changes(), changed = changes() }
+	local ok = pcall(function()
+		if tree then
+			summarizeTree(tree.ROOT.children, nil, false, summary)
+		else
+			summarizePatch(confirm.patch, confirm.instanceMap, summary)
+		end
+	end)
+	if not ok then
+		return nil
+	end
+	for _, kind in summary do
+		table.sort(kind.paths)
+	end
+	pendingCache = { source = source, summary = summary }
+	return summary
 end
 
 local function status(app)
@@ -76,6 +182,7 @@ local function status(app)
 		address = state.address,
 		-- Rojo keeps the last error message after reconnecting; only report a current one.
 		error = if state.appStatus == "Error" then state.errorMessage else nil,
+		pending = pendingSync(app),
 	}
 end
 
@@ -112,13 +219,22 @@ end
 
 local actions = {
 	status = status,
-	-- Connect Rojo to the Rojo server on this computer at args.port.
+	-- Connect Rojo to the Rojo server on this computer at args.port. With args.wait, return once Rojo
+	-- connects, asks to confirm the initial sync, or fails, instead of at once.
 	connect = function(app, args)
 		endSession(app)
+		-- A stale error would read as this attempt's outcome; clear it as Rojo's Okay button does.
+		if (app.state or {}).appStatus == "Error" then
+			app:setState({ appStatus = "NotConnected" })
+		end
 		app.setHost("localhost")
 		app.setPort(tostring(args.port))
-		-- Starting can yield on the sync lock; return so the caller can poll status.
+		-- Starting can yield on the sync lock, so it runs on its own thread.
 		task.spawn(app.startSession, app)
+		local deadline = os.clock() + CONNECT_WAIT
+		while args.wait == true and not SETTLED[status(app).status] and os.clock() < deadline do
+			task.wait(0.1)
+		end
 		return status(app)
 	end,
 	disconnect = function(app)

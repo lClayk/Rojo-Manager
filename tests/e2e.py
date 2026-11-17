@@ -127,10 +127,11 @@ def shim_rojo(folder: Path) -> Path:
     return folder
 
 
-def run_bridge(place: str) -> tuple[subprocess.Popen, Lines]:
-    """The real bridge under Lune, in a stand-in Studio with this place ("<id>" or "0:<file name>")."""
+def run_bridge(place: str, mode: str = "") -> tuple[subprocess.Popen, Lines]:
+    """The real bridge under Lune, in a stand-in Studio with this place ("<id>" or "0:<file name>").
+    With mode "confirm", Rojo waits for its initial sync to be confirmed."""
     bridge = subprocess.Popen(["lune", "run", str(ROOT / "tests" / "bridge_harness.luau"),
-                               str(ROOT / "rojo_bridge" / "RojoManagerBridge.luau"), place, BRIDGE_PORT],
+                               str(ROOT / "rojo_bridge" / "RojoManagerBridge.luau"), place, BRIDGE_PORT, mode],
                               stdout=subprocess.PIPE, text=True, encoding="utf-8")
     events = Lines(bridge)
     events.expect("attached")
@@ -227,7 +228,25 @@ def check(app_dir: Path) -> None:
             assert place_file.startswith("MyGame-lane-") and place_file.endswith(".rbxl"), linked
             assert "MyGame-lane" not in (profile / "config.json").read_text(encoding="utf-8")
             lane_port = mcp.call("rojo_server", project="MyGame-lane", action="start")["project"]["port"]
-            lane_bridge, lane_events = run_bridge(f"0:{place_file}")
+
+            # With the sync prompt left to the agent, status shows what accepting would do first.
+            mcp.call("app_settings", changes={"auto_connect_accept": False})
+            lane_bridge, lane_events = run_bridge(f"0:{place_file}", "confirm")
+            lane_events.expect(f"confirming {lane_port}")
+            session = mcp.call("rojo_session", project="MyGame-lane", action="status")
+            assert session["rojo"]["pending"] == {
+                "removed": {"count": 1, "paths": ["Workspace.Map"]},
+                "added": {"count": 2, "paths": ["ServerScriptService.Tools"]},
+                "changed": {"count": 1, "paths": ["ServerScriptService.main"]},
+            }, session
+            assert "deletes 1 instance found only in Studio" in session["next"], session
+
+            def reported():
+                listed = {p["name"]: p for p in mcp.call("list_projects")["projects"]}
+                return listed["MyGame-lane"].get("studio", {}).get("rojo", {}).get("pending")
+            assert wait_for(reported, 30, "the poll to report the pending sync") == session["rojo"]["pending"]
+            mcp.call("rojo_session", project="MyGame-lane", action="accept")
+            lane_events.expect("confirm Accept")
             lane_events.expect(f"connect {lane_port}")
             def lane_connected():
                 listed = {p["name"]: p for p in mcp.call("list_projects")["projects"]}
@@ -237,6 +256,13 @@ def check(app_dir: Path) -> None:
             assert [line["text"] for line in lane_output].count("edit started") == 1, lane_output
             mcp.call("manage_project", action="remove", project="MyGame-lane")
             assert "MyGame-lane" not in [p["name"] for p in mcp.call("list_projects")["projects"]]
+
+            # Connect waits in Studio until Rojo has connected, and answers with that.
+            mcp.call("rojo_session", project="MyGame", action="disconnect")
+            events.expect("disconnect")
+            reconnected = mcp.call("rojo_session", project="MyGame", action="connect")
+            assert reconnected["rojo"]["status"] == "Connected", reconnected
+            events.expect(f"connect {PORT}")
 
             # Agent Luau runs in the bridge and comes back with what it printed and returned.
             ran = mcp.call("execute_luau", instance_id=instance, code="print('from agent') return 40 + 2")

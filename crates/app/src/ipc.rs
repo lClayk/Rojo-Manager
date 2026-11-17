@@ -53,6 +53,10 @@ pub enum Call {
     Keep {
         name: String,
     },
+    AnswerSync {
+        instance: String,
+        accept: bool,
+    },
     OpenStudio {
         name: String,
     },
@@ -133,6 +137,7 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::Update { name, update } => json(engine.update(&name, update)),
         Call::Remove { name } => json(engine.remove(&name)),
         Call::Keep { name } => json(engine.keep(&name)),
+        Call::AnswerSync { instance, accept } => json(engine.answer_sync(&instance, accept)),
         Call::OpenStudio { name } => json(engine.open_studio(&name)),
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
@@ -258,6 +263,9 @@ impl Client {
     }
     pub fn keep(&self, name: &str) -> Result<(), String> {
         self.call(Call::Keep { name: name.into() })
+    }
+    pub fn answer_sync(&self, instance: &str, accept: bool) -> Result<(), String> {
+        self.call(Call::AnswerSync { instance: instance.into(), accept })
     }
     pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
         self.call(Call::OpenStudio { name: name.into() })

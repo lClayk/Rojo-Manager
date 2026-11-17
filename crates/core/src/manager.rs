@@ -41,6 +41,11 @@ const OUTPUT_TEXT: usize = 2000;
 const OUTPUT_BRIDGE: u64 = 8;
 /// The longest unpublished place name kept from a bridge; local place files are much shorter.
 const MAX_PLACE_NAME: usize = 255;
+/// Rojo's port when its port field in Studio is empty.
+const ROJO_DEFAULT_PORT: u16 = 34872;
+/// Paths kept per kind of change in a pending sync, and characters kept per path.
+const PENDING_PATHS: usize = 20;
+const PENDING_PATH_TEXT: usize = 200;
 /// The window asks for a star on GitHub once the app has been in use this long.
 const STAR_AFTER: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
@@ -87,6 +92,9 @@ pub struct ProjectView {
     /// The lane whose place this project syncs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
+    /// A Studio with this place open waits for Rojo's initial sync to this server to be confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_sync: Option<PendingSync>,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -187,6 +195,41 @@ pub struct Lane {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
     pub place: LocalPlace,
+}
+
+/// Rojo in one Studio waiting for its initial sync to be confirmed, with what that sync would do
+/// when the bridge says (bridge 10 and later).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSync {
+    /// The Studio window's instanceId.
+    pub instance: String,
+    pub summary: Option<SyncSummary>,
+}
+
+/// What accepting Rojo's initial sync would do in Studio. Every removal is an instance that exists
+/// only in Studio, since the initial sync removes what the project does not have.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSummary {
+    pub removed: Changes,
+    pub added: Changes,
+    pub changed: Changes,
+}
+
+/// How many instances one kind of change touches, and the first of their paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changes {
+    pub count: u64,
+    #[serde(default, deserialize_with = "paths")]
+    pub paths: Vec<String>,
+}
+
+/// Paths from a bridge, which is untrusted: strings only, PENDING_PATHS of them, each cut to
+/// PENDING_PATH_TEXT characters. An empty Luau table may arrive as {}.
+fn paths<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    let items = value.as_array().map(Vec::as_slice).unwrap_or_default();
+    let paths = items.iter().filter_map(Value::as_str).take(PENDING_PATHS);
+    Ok(paths.map(|path| path.chars().take(PENDING_PATH_TEXT).collect()).collect())
 }
 
 /// A place to link: a published place, or a local place file, which the engine names.
@@ -344,6 +387,25 @@ impl State {
         Some((project.name.clone(), project.port))
     }
 
+    /// The Studio waiting for Rojo's initial sync to this project's server to be confirmed.
+    fn pending_sync(&self, project: &config::Project) -> Option<PendingSync> {
+        let place = project.place.as_ref()?;
+        self.bridges.iter().find_map(|(id, report)| {
+            let rojo = &report.rojo;
+            let port = rojo.get("port").and_then(|port| match port {
+                Value::String(text) if text.trim().is_empty() => Some(ROJO_DEFAULT_PORT),
+                Value::String(text) => text.trim().parse().ok(),
+                other => other.as_u64().and_then(|port| u16::try_from(port).ok()),
+            });
+            let waiting = rojo.get("status").and_then(Value::as_str) == Some("Confirming")
+                && port == Some(project.port)
+                && place.matches(report.place_id, report.place_name.as_deref())
+                && report.seen.elapsed() < BRIDGE_TTL;
+            let summary = || rojo.get("pending").and_then(|pending| SyncSummary::deserialize(pending).ok());
+            waiting.then(|| PendingSync { instance: id.to_string(), summary: summary() })
+        })
+    }
+
     /// The lane whose place this project syncs.
     fn lane_of(&self, project: &config::Project) -> Option<&Lane> {
         let Some(PlaceLink::Local(place)) = &project.place else { return None };
@@ -389,6 +451,8 @@ pub struct Engine {
     app_dir: PathBuf,
     closing: AtomicBool,
     wake: (Mutex<bool>, Condvar),
+    /// Counts snapshot changes, so `wait_until` can sleep until the next one.
+    changes: (Mutex<u64>, Condvar),
     /// Commands on their way to the bridges in Studio.
     link: Link,
 }
@@ -510,6 +574,7 @@ impl Engine {
             app_dir,
             closing: AtomicBool::new(false),
             wake: (Mutex::new(false), Condvar::new()),
+            changes: (Mutex::new(0), Condvar::new()),
             link: Link::default(),
         })
     }
@@ -574,7 +639,44 @@ impl Engine {
     }
 
     fn changed(&self) {
+        *self.changes.0.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        self.changes.1.notify_all();
         (self.emit)(Event::Changed);
+    }
+
+    /// Block until `done` holds or `timeout` passes; false on timeout. Checks after each change, and
+    /// at least every 250 ms, since a server can begin answering without one. Costs nothing while
+    /// no one waits.
+    fn wait_until(&self, timeout: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = *self.changes.0.lock().unwrap_or_else(|p| p.into_inner());
+            if done() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let guard = self.changes.0.lock().unwrap_or_else(|p| p.into_inner());
+            let slice = (deadline - now).min(Duration::from_millis(250));
+            let _ = self.changes.1.wait_timeout_while(guard, slice, |count| *count == seen);
+        }
+    }
+
+    /// Wait for a start, restart, or stop to finish: a server that answers, or none.
+    fn wait_for_server(&self, name: &str, action: &str) {
+        let stop = action == "stop";
+        let timeout = Duration::from_secs(if stop { 10 } else { 30 });
+        self.wait_until(timeout, || {
+            let Some(project) = self.project(name) else { return true };
+            match project.state {
+                ServerState::Off | ServerState::Blocked => true,
+                ServerState::Starting => false,
+                _ if stop => false,
+                _ => rojo_api::server_info(project.port, Duration::from_millis(500)).is_some(),
+            }
+        });
     }
 
     pub fn notice(&self, message: impl Into<String>) {
@@ -618,6 +720,7 @@ impl Engine {
             sourcemap: p.sourcemap,
             temporary: p.temporary,
             lane: state.lane_of(p).cloned(),
+            pending_sync: state.pending_sync(p),
             experience: p
                 .place
                 .as_ref()
@@ -1048,8 +1151,17 @@ impl Engine {
         if previous.as_ref().map(|report| report.port) != Some(port) {
             self.wake_watcher();
         }
+        let offered_before = previous.as_ref().and_then(|report| report.offered);
+        // The window shows a sync waiting for confirmation, and what it would do.
+        let waiting = |rojo: &Value| {
+            (rojo.get("status").and_then(Value::as_str) == Some("Confirming")).then(|| rojo.get("pending").cloned())
+        };
+        let now = self.lock().bridges.get(&id).map(|report| waiting(&report.rojo));
+        if previous.map(|report| waiting(&report.rojo)) != now {
+            self.changed();
+        }
         let (name, offer) = target?;
-        if port == 0 && previous.and_then(|report| report.offered) != Some(offer) {
+        if port == 0 && offered_before != Some(offer) {
             self.notice(format!("{name}: connecting Rojo in Studio"));
         }
         Some((offer, accept))
@@ -1107,8 +1219,19 @@ impl Engine {
             .ok()
             .filter(|id| self.lock().bridges.get(id).is_some_and(|report| self.bridge_live(*id, report)));
         let id = id.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
-        let timeout = if action == "luau" { LUAU_TIMEOUT } else { Duration::from_secs(15) };
+        let timeout = match action {
+            "luau" => LUAU_TIMEOUT,
+            // The bridge waits up to 30 seconds for Rojo to connect.
+            "connect" if args.get("wait") == Some(&Value::Bool(true)) => Duration::from_secs(40),
+            _ => Duration::from_secs(15),
+        };
         self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
+    }
+
+    /// Accept or abort the initial sync Rojo waits on in one Studio window.
+    pub fn answer_sync(&self, instance: &str, accept: bool) -> Result<(), String> {
+        let action = if accept { "accept" } else { "abort" };
+        self.studio_command(instance, action, json!({})).map(|_| ()).map_err(|error| error.message)
     }
 
     /// Keep new lines of a place's Output; the oldest go past OUTPUT_CAP.
@@ -1963,6 +2086,17 @@ impl ControlHandler for Control {
             return Err(ControlError::new(missing(name), 404));
         };
         let reply = |name: &str| Ok(json!({ "project": engine.agent_view(name) }));
+        // With "wait", start, restart, and stop answer once the server is up or gone.
+        let wait = match body.get("wait") {
+            None | Some(Value::Null) => false,
+            Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("wait must be a bool"))?,
+        };
+        let waited = |name: &str| {
+            if wait {
+                engine.wait_for_server(name, action);
+            }
+            reply(name)
+        };
         match action {
             "update" | "link-place" => {
                 let (mut update, place) = parse_update(action, body)?;
@@ -1999,17 +2133,17 @@ impl ControlHandler for Control {
                         .map_err(|e| ControlError::new(format!("Rojo could not be started. {e}"), 409))?;
                 }
                 engine.notice(format!("{name}: start requested by an agent"));
-                reply(name)
+                waited(name)
             }
             "stop" => {
                 engine.stop(name);
                 engine.notice(format!("{name}: stop requested by an agent"));
-                reply(name)
+                waited(name)
             }
             "restart" => {
                 engine.restart(name).map_err(|e| ControlError::new(e, 409))?;
                 engine.notice(format!("{name}: restart requested by an agent"));
-                reply(name)
+                waited(name)
             }
             "open-studio" => {
                 let status = if view.place.is_none() { 409 } else { 500 };
@@ -2344,6 +2478,59 @@ mod tests {
         engine.remove("MyGame-feature").unwrap();
         assert!(engine.project("MyGame-feature").is_none() && !lane.place.path().exists());
         assert!(engine.remove_lane("MyGame-feature").is_err());
+    }
+
+    #[test]
+    fn a_studio_waiting_to_sync_shows_on_the_project_it_connects_to() {
+        let project = config::Project {
+            name: "MyGame".into(),
+            path: "C:\\Games\\MyGame".into(),
+            project_file: "default.project.json".into(),
+            port: 34880,
+            autostart: false,
+            auto_connect: false,
+            place: Some(PlaceLink::Published(Place { place_id: 100, universe_id: 1 })),
+            sourcemap: false,
+            temporary: false,
+        };
+        let engine = Engine::new(Config { projects: vec![project], ..Config::default() }, PathBuf::new(), |_| {});
+        let pending = || engine.project("MyGame").unwrap().pending_sync;
+        engine.report_bridge(7, 100, None, 0, json!({"status": "Confirming", "port": "34999"}));
+        assert_eq!(pending(), None); // connecting to another server
+        let paths: Vec<String> = (0..30).map(|n| format!("Workspace.Part{n}")).collect();
+        let summary = json!({"removed": {"count": 30, "paths": paths}, "added": {"count": 0, "paths": {}},
+                             "changed": {"count": 1, "paths": ["ServerScriptService.Main", 5]}});
+        engine.report_bridge(7, 100, None, 0, json!({"status": "Confirming", "port": "34880", "pending": summary}));
+        let shown = pending().unwrap();
+        let summary = shown.summary.unwrap();
+        assert_eq!(shown.instance, "7");
+        assert_eq!((summary.removed.count, summary.removed.paths.len()), (30, PENDING_PATHS));
+        assert_eq!(summary.changed.paths, ["ServerScriptService.Main"]);
+        assert!(summary.added.paths.is_empty());
+        // An older bridge: waiting, with nothing to show about it.
+        engine.report_bridge(7, 100, None, 0, json!({"status": "Confirming", "port": "34880"}));
+        assert_eq!(pending().unwrap().summary, None);
+        engine.report_bridge(7, 100, None, 0, json!({"status": "Connected", "port": "34880"}));
+        assert_eq!(pending(), None);
+    }
+
+    #[test]
+    fn waiting_wakes_on_a_change_and_gives_up_at_the_timeout() {
+        let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let (engine, flag) = (Arc::clone(&engine), Arc::clone(&flag));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+                engine.changed();
+            })
+        };
+        let started = Instant::now();
+        assert!(engine.wait_until(Duration::from_secs(5), || flag.load(Ordering::SeqCst)));
+        assert!(started.elapsed() < Duration::from_millis(240)); // woken by the change, not the slice
+        setter.join().unwrap();
+        assert!(!engine.wait_until(Duration::from_millis(100), || false));
     }
 
     #[test]

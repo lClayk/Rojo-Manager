@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::control::{ControlError, RequestError};
+use rojo_manager_core::manager::SyncSummary;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -28,6 +29,10 @@ const LUAU_CALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// control.request's default, used for GET /projects.
 const PROJECTS_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longer than Rojo Manager waits for a server to start (30 s) or the bridge for Rojo to connect.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(45);
+/// The first bridge version that waits for Rojo to connect; older ones are polled.
+const WAIT_BRIDGE: u64 = 11;
 /// Opening a local place may build it first.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -43,10 +48,13 @@ pub fn specs(studio_tools: bool) -> Value {
         {
             "name": "rojo_server",
             "description": "Start, stop, or restart a project's Rojo server and wait for the result. A Studio \
-                connected to the project is disconnected cleanly on stop and reconnected on restart.",
+                connected to the project is disconnected cleanly on stop and reconnected on restart. With wait \
+                false, it returns right after the request, without reconnecting Studio.",
             "inputSchema": {"type": "object", "required": ["project", "action"], "additionalProperties": false,
                 "properties": {"project": {"type": "string", "description": "Project name"},
-                    "action": {"type": "string", "enum": ["start", "stop", "restart"]}}},
+                    "action": {"type": "string", "enum": ["start", "stop", "restart"]},
+                    "wait": {"type": "boolean", "default": true,
+                        "description": "Return once the server answers or is gone, up to 30 seconds"}}},
         },
         {
             "name": "open_place",
@@ -65,7 +73,9 @@ pub fn specs(studio_tools: bool) -> Value {
                 Rojo's initial sync confirmation.",
             "inputSchema": {"type": "object", "required": ["project", "action"], "additionalProperties": false,
                 "properties": {"project": {"type": "string", "description": "Project name"},
-                    "action": {"type": "string", "enum": ["connect", "disconnect", "status", "accept", "abort"]}}},
+                    "action": {"type": "string", "enum": ["connect", "disconnect", "status", "accept", "abort"]},
+                    "wait": {"type": "boolean", "default": true, "description": "For connect: return once Rojo \
+                        connects, asks to confirm the initial sync, or fails, up to 30 seconds"}}},
         },
         {
             "name": "lane",
@@ -176,7 +186,7 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         "list_projects" => text(&list_projects(backend)?),
         "rojo_server" => {
             let (project, action) = project_action(backend, args, &["start", "stop", "restart"])?;
-            text(&server_tool(backend, &project, action)?)
+            text(&server_tool(backend, &project, action, wait(args)?)?)
         }
         "open_place" => {
             let project = optional_string(args, "project")?;
@@ -186,7 +196,7 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         "rojo_session" => {
             let choices = ["connect", "disconnect", "status", "accept", "abort"];
             let (project, action) = project_action(backend, args, &choices)?;
-            text(&run_session(backend, &project, action)?)
+            text(&run_session(backend, &project, action, wait(args)?)?)
         }
         "server_logs" => text(&server_logs(backend, args)?),
         "manage_project" => text(&manage_project(backend, args)?),
@@ -234,10 +244,6 @@ struct Project {
 impl Project {
     fn running(&self) -> bool {
         RUNNING.contains(&self.state.as_str())
-    }
-
-    fn stopped(&self) -> bool {
-        matches!(self.state.as_str(), "off" | "blocked")
     }
 }
 
@@ -357,34 +363,17 @@ fn act(backend: &dyn Backend, name: &str, action: &str, body: Option<&Value>) ->
     field(call(backend, "POST", &["projects", name, action], body, CALL_TIMEOUT)?, "project")
 }
 
-/// Poll the project every 0.1 s until `done` or the timeout; returns the last state seen.
-fn wait_for_state(
-    backend: &dyn Backend,
-    name: &str,
-    done: impl Fn(&Project) -> bool,
-    timeout: Duration,
-) -> Result<Project, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let project = find_project(backend, name)?;
-        if done(&project) || Instant::now() >= deadline {
-            return Ok(project);
-        }
-        backend.sleep(Duration::from_millis(100));
-    }
-}
-
-/// Start, stop, or restart, then wait for the result the agent asked for.
-fn run_server(backend: &dyn Backend, name: &str, action: &str) -> Result<Project, String> {
-    act(backend, name, action, None)?;
-    let stop = action == "stop";
-    let project = if stop {
-        wait_for_state(backend, name, Project::stopped, Duration::from_secs(10))?
-    } else {
-        let ready = |project: &Project| project.stopped() || (project.running() && backend.rojo_answers(project.port));
-        wait_for_state(backend, name, ready, Duration::from_secs(30))?
+/// Start, stop, or restart. With `wait`, Rojo Manager answers once the server answers or is gone,
+/// and anything but what the agent asked for is an error with the server's recent output.
+fn run_server(backend: &dyn Backend, name: &str, action: &str, wait: bool) -> Result<Project, String> {
+    let body = wait.then(|| json!({ "wait": true }));
+    let reply = call(backend, "POST", &["projects", name, action], body.as_ref(), WAIT_TIMEOUT)?;
+    let project: Project = field(reply, "project")?;
+    let expected = match action {
+        _ if !wait => true,
+        "stop" => project.state == "off",
+        _ => project.running(),
     };
-    let expected = if stop { project.state == "off" } else { project.running() };
     if !expected {
         return Err(format!("{name} is {} after {action}. Recent output:\n{}", project.state, project.log.join("\n")));
     }
@@ -403,11 +392,44 @@ struct Rojo {
     address: Option<String>,
     #[serde(skip_serializing_if = "blank")]
     error: Option<String>,
+    /// The bridge's version.
+    #[serde(default, skip_serializing)]
+    bridge: u64,
+    /// While Confirming: what accepting would do (bridge 10 and later).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "summary")]
+    pending: Option<SyncSummary>,
+}
+
+/// A pending sync summary, or None when the bridge sent something else.
+fn summary<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<SyncSummary>, D::Error> {
+    Ok(SyncSummary::deserialize(Value::deserialize(deserializer)?).ok())
 }
 
 impl Rojo {
     fn status(&self) -> &str {
         self.status.as_deref().unwrap_or_default()
+    }
+
+    /// Rojo connected, asks to confirm the initial sync, or failed.
+    fn settled(&self) -> bool {
+        matches!(self.status(), "Connected" | "Confirming" | "Error")
+    }
+
+    /// What to do next while Rojo waits for the initial sync to be confirmed, warning first about
+    /// instances accepting would delete.
+    fn next(&self) -> Option<String> {
+        if self.status() != "Confirming" {
+            return None;
+        }
+        let ask = "Rojo is waiting for the initial sync to be approved. Use action accept or abort.";
+        Some(match self.pending.as_ref().map(|pending| pending.removed.count) {
+            Some(removed) if removed > 0 => format!(
+                "{ask} Accepting deletes {removed} instance{} found only in Studio (pending.removed); abort \
+                 keeps them.",
+                if removed == 1 { "" } else { "s" }
+            ),
+            _ => ask.to_string(),
+        })
     }
 }
 
@@ -473,6 +495,23 @@ fn bridge(backend: &dyn Backend, instance_id: &str, action: &str, port: Option<u
     Rojo::deserialize(&result).map_err(|_| format!("Unexpected bridge response: {result}"))
 }
 
+/// Connect Rojo in one Studio window to the server on `port`. With `wait`, the bridge answers once Rojo
+/// has settled; bridges before WAIT_BRIDGE answer at once, so they are polled here for 30 seconds.
+fn connect(backend: &dyn Backend, instance_id: &str, port: u16, wait: bool) -> Result<Rojo, String> {
+    let body = match wait {
+        true => json!({ "action": "connect", "port": port, "wait": true }),
+        false => json!({ "action": "connect", "port": port }),
+    };
+    let result = call(backend, "POST", &["studio", instance_id], Some(&body), WAIT_TIMEOUT)?;
+    let mut rojo = Rojo::deserialize(&result).map_err(|_| format!("Unexpected bridge response: {result}"))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while wait && rojo.bridge < WAIT_BRIDGE && !rojo.settled() && Instant::now() < deadline {
+        backend.sleep(Duration::from_millis(250));
+        rojo = bridge(backend, instance_id, "status", None)?;
+    }
+    Ok(rojo)
+}
+
 /// The Studio instance that has the project's linked place open.
 fn place_instance(backend: &dyn Backend, project: &Project) -> Result<String, String> {
     let Some(place) = &project.place else {
@@ -492,30 +531,27 @@ struct Session {
     instance_id: String,
     rojo: Rojo,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next: Option<&'static str>,
+    next: Option<String>,
 }
 
-/// rojo_session: connect (starting the server if needed and waiting for the plugin), or pass any
-/// other action straight to the bridge.
-fn run_session(backend: &dyn Backend, name: &str, action: &str) -> Result<Session, String> {
+/// rojo_session: connect (starting the server if needed, and with `wait` waiting for the plugin), or
+/// pass any other action straight to the bridge.
+fn run_session(backend: &dyn Backend, name: &str, action: &str, wait: bool) -> Result<Session, String> {
     let mut project = find_project(backend, name)?;
     let instance_id = place_instance(backend, &project)?;
     if action != "connect" {
         let rojo = bridge(backend, &instance_id, action, None)?;
-        return Ok(Session { instance_id, rojo, next: None });
+        return Ok(Session { instance_id, next: rojo.next(), rojo });
     }
     if !project.running() {
-        project = run_server(backend, name, "start")?;
+        project = run_server(backend, name, "start", true)?;
     }
-    let mut rojo = bridge(backend, &instance_id, "connect", Some(project.port))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !matches!(rojo.status(), "Connected" | "Confirming" | "Error") && Instant::now() < deadline {
-        backend.sleep(Duration::from_millis(250));
-        rojo = bridge(backend, &instance_id, "status", None)?;
+    let rojo = connect(backend, &instance_id, project.port, wait)?;
+    if !wait {
+        return Ok(Session { instance_id, rojo, next: None });
     }
     let next = match rojo.status() {
-        "Confirming" => Some("Rojo is waiting for the initial sync to be approved. Use action accept or abort."),
-        "Connected" => None,
+        "Confirming" | "Connected" => rojo.next(),
         status => {
             let reason = rojo.error.as_deref().filter(|error| !error.is_empty()).unwrap_or(status);
             return Err(format!("Rojo did not connect: {reason}"));
@@ -541,7 +577,7 @@ struct ProjectResult {
 
 /// rojo_server: keeps a connected Studio in step. Stopping disconnects Rojo cleanly first, and
 /// restarting reconnects it, instead of leaving the plugin in an error state.
-fn server_tool(backend: &dyn Backend, name: &str, action: &str) -> Result<ProjectResult, String> {
+fn server_tool(backend: &dyn Backend, name: &str, action: &str, wait: bool) -> Result<ProjectResult, String> {
     let instance_id = match action {
         "stop" | "restart" => connected_instance(backend, &find_project(backend, name)?),
         _ => None,
@@ -551,9 +587,9 @@ fn server_tool(backend: &dyn Backend, name: &str, action: &str) -> Result<Projec
     {
         bridge(backend, instance_id, "disconnect", None)?;
     }
-    let project = run_server(backend, name, action)?.into();
+    let project = run_server(backend, name, action, wait)?.into();
     let rojo = match instance_id {
-        Some(_) if action == "restart" => Some(run_session(backend, name, "connect")?.rojo),
+        Some(_) if action == "restart" && wait => Some(run_session(backend, name, "connect", true)?.rojo),
         _ => None,
     };
     Ok(ProjectResult { project, rojo })
@@ -574,7 +610,7 @@ struct Opened {
     #[serde(skip_serializing_if = "Option::is_none")]
     rojo: Option<Rojo>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next: Option<&'static str>,
+    next: Option<String>,
 }
 
 /// open_place: reuses a Studio that already has the place open, otherwise opens it and waits up to
@@ -629,7 +665,7 @@ fn open_place(
         if instances.is_none() {
             let mut note = "The Rojo Manager bridge is not installed, so the opened place cannot be confirmed.";
             if let Some(project) = project.filter(|_| connect_rojo) {
-                run_server(backend, &project.name, "start")?;
+                run_server(backend, &project.name, "start", true)?;
                 note = "The Rojo Manager bridge is not installed, so the opened place cannot be confirmed and \
                         Rojo was not connected. The Rojo server is running; connect it from the Rojo plugin in Studio.";
             }
@@ -663,7 +699,7 @@ fn open_place(
     }
     let mut result = Opened { place_id, place_file, instance_id, opened, note: None, rojo: None, next: None };
     if let Some(project) = project.filter(|_| connect_rojo) {
-        let session = run_session(backend, &project.name, "connect")?;
+        let session = run_session(backend, &project.name, "connect", true)?;
         result.instance_id = Some(session.instance_id);
         result.rojo = Some(session.rojo);
         result.next = session.next;
@@ -901,6 +937,7 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
     let opened = open_place(backend, Some(name.clone()), None, true).and_then(|mut opened| {
         if let (Some(instance_id), Some("Confirming")) = (&opened.instance_id, opened.rojo.as_ref().map(Rojo::status)) {
             opened.rojo = Some(bridge(backend, instance_id, "accept", None)?);
+            opened.next = None;
         }
         Ok(opened)
     });
@@ -949,6 +986,14 @@ fn updates(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
 }
 
 // --------------------------------------------------------------- arguments
+
+/// The wait argument: true unless the agent passed false.
+fn wait(args: &Args) -> Result<bool, String> {
+    match args.get("wait") {
+        None | Some(Value::Null) => Ok(true),
+        Some(value) => value.as_bool().ok_or_else(|| "wait must be true or false".to_string()),
+    }
+}
 
 /// A required nonempty string argument, trimmed.
 fn string(args: &Args, key: &str) -> Result<String, String> {
@@ -1108,17 +1153,14 @@ mod tests {
     }
 
     #[test]
-    fn start_waits_for_rojo_to_answer_and_reports_failures_with_logs() {
-        let fake = Fake {
-            projects: Script::new([json!([project("starting", true)]), json!([project("serving", true)])]),
-            answers: Script::new([false, true]),
-            ..Fake::default()
-        };
-        assert_eq!(run_server(&fake, "TestGame", "start").unwrap().state, "serving");
-        assert_eq!(fake.calls(), ["POST projects/TestGame/start", "GET projects", "GET projects", "GET projects"]);
+    fn start_has_rojo_manager_wait_and_reports_failures_with_logs() {
+        let fake = Fake::default();
+        assert_eq!(run_server(&fake, "TestGame", "start", true).unwrap().state, "serving");
+        assert_eq!(run_server(&fake, "TestGame", "stop", false).unwrap().state, "serving"); // not waited for
+        assert_eq!(fake.calls(), [r#"POST projects/TestGame/start {"wait":true}"#, "POST projects/TestGame/stop"]);
 
-        let fake = Fake { projects: Script::new([json!([project("off", true)])]), ..Fake::default() };
-        let error = run_server(&fake, "TestGame", "start").unwrap_err();
+        let fake = Fake { reply: |_, _| json!({"project": project("off", true)}), ..Fake::default() };
+        let error = run_server(&fake, "TestGame", "start", true).unwrap_err();
         assert_eq!(error, "TestGame is off after start. Recent output:\nerror: port in use");
     }
 
@@ -1134,32 +1176,68 @@ mod tests {
             ]),
             ..Fake::default()
         };
-        let session = run_session(&fake, "TestGame", "connect").unwrap();
+        let session = run_session(&fake, "TestGame", "connect", true).unwrap();
         assert_eq!(
             json_text(&session),
             r#"{"instanceId":"7","rojo":{"status":"Confirming"},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort."}"#
         );
+        // This bridge is older than WAIT_BRIDGE, so it is polled.
         assert_eq!(
             fake.calls(),
             [
                 "GET projects",
-                "POST projects/TestGame/start",
-                "GET projects",
-                r#"POST studio/7 {"action":"connect","port":34879}"#,
+                r#"POST projects/TestGame/start {"wait":true}"#,
+                r#"POST studio/7 {"action":"connect","port":34879,"wait":true}"#,
                 r#"POST studio/7 {"action":"status"}"#,
                 r#"POST studio/7 {"action":"status"}"#,
             ]
+        );
+
+        // A newer bridge waits itself.
+        let fake = Fake {
+            projects: Script::new([json!([project("serving", true)])]),
+            instances: studio_open(),
+            studio: Script::new([json!({"status": "Connected", "bridge": WAIT_BRIDGE})]),
+            ..Fake::default()
+        };
+        assert_eq!(
+            json_text(&run_session(&fake, "TestGame", "connect", true).unwrap()),
+            r#"{"instanceId":"7","rojo":{"status":"Connected"}}"#
+        );
+        assert_eq!(fake.calls(), ["GET projects", r#"POST studio/7 {"action":"connect","port":34879,"wait":true}"#]);
+    }
+
+    #[test]
+    fn status_shows_a_pending_sync_and_warns_about_studio_only_removals() {
+        let pending = json!({"removed": {"count": 2, "paths": ["Workspace.Map", "Workspace.Spawn"]},
+                             "added": {"count": 1, "paths": ["ServerScriptService.Main"]},
+                             "changed": {"count": 0, "paths": {}}});
+        let fake = Fake {
+            projects: Script::new([json!([project("serving", true)])]),
+            instances: studio_open(),
+            studio: Script::new([json!({"status": "Confirming", "pending": pending}), json!({"status": "Confirming"})]),
+            ..Fake::default()
+        };
+        assert_eq!(
+            json_text(&run_session(&fake, "TestGame", "status", true).unwrap()),
+            r#"{"instanceId":"7","rojo":{"status":"Confirming","pending":{"removed":{"count":2,"paths":["Workspace.Map","Workspace.Spawn"]},"added":{"count":1,"paths":["ServerScriptService.Main"]},"changed":{"count":0,"paths":[]}}},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort. Accepting deletes 2 instances found only in Studio (pending.removed); abort keeps them."}"#
+        );
+        // An older bridge reports Confirming without a summary.
+        assert_eq!(
+            json_text(&run_session(&fake, "TestGame", "status", true).unwrap()),
+            r#"{"instanceId":"7","rojo":{"status":"Confirming"},"next":"Rojo is waiting for the initial sync to be approved. Use action accept or abort."}"#
         );
     }
 
     #[test]
     fn stop_disconnects_and_restart_reconnects_a_connected_studio() {
         let fake = Fake {
-            projects: Script::new([json!([project("serving", true)]), json!([project("off", true)])]),
+            projects: Script::new([json!([project("serving", true)])]),
+            reply: |_, _| json!({"project": project("off", true)}),
             instances: studio_open(),
             ..Fake::default()
         };
-        let stopped = server_tool(&fake, "TestGame", "stop").unwrap();
+        let stopped = server_tool(&fake, "TestGame", "stop", true).unwrap();
         assert_eq!(json_text(&stopped), r#"{"project":{"name":"TestGame","state":"off","port":34879,"placeId":2}}"#);
         assert_eq!(
             fake.calls(),
@@ -1167,8 +1245,7 @@ mod tests {
                 "GET projects",
                 r#"POST studio/7 {"action":"status"}"#,
                 r#"POST studio/7 {"action":"disconnect"}"#,
-                "POST projects/TestGame/stop",
-                "GET projects",
+                r#"POST projects/TestGame/stop {"wait":true}"#,
             ]
         );
 
@@ -1177,7 +1254,7 @@ mod tests {
             instances: studio_open(),
             ..Fake::default()
         };
-        let restarted = server_tool(&fake, "TestGame", "restart").unwrap();
+        let restarted = server_tool(&fake, "TestGame", "restart", true).unwrap();
         assert_eq!(
             json_text(&restarted),
             r#"{"project":{"name":"TestGame","state":"serving","port":34879,"placeId":2},"rojo":{"status":"Connected"}}"#
@@ -1187,10 +1264,9 @@ mod tests {
             [
                 "GET projects",
                 r#"POST studio/7 {"action":"status"}"#,
-                "POST projects/TestGame/restart",
+                r#"POST projects/TestGame/restart {"wait":true}"#,
                 "GET projects",
-                "GET projects",
-                r#"POST studio/7 {"action":"connect","port":34879}"#,
+                r#"POST studio/7 {"action":"connect","port":34879,"wait":true}"#,
             ]
         );
     }
@@ -1259,17 +1335,17 @@ mod tests {
         };
         let opened = open_place(&fake, Some("TestGame".into()), None, true).unwrap();
         assert!(opened.opened && opened.note.unwrap().contains("Rojo was not connected"));
-        assert!(fake.calls().contains(&"POST projects/TestGame/start".to_string()));
+        assert!(fake.calls().contains(&r#"POST projects/TestGame/start {"wait":true}"#.to_string()));
     }
 
     #[test]
     fn sessions_need_a_linked_place_open_with_the_bridge() {
         let fake = Fake { projects: Script::new([json!([project("off", false)])]), ..Fake::default() };
-        let error = run_session(&fake, "TestGame", "status").unwrap_err();
+        let error = run_session(&fake, "TestGame", "status", true).unwrap_err();
         assert_eq!(error, "TestGame has no linked place. Link one with open_place (project and place).");
 
         let fake = Fake { projects: Script::new([json!([project("off", true)])]), ..Fake::default() };
-        let error = run_session(&fake, "TestGame", "status").unwrap_err();
+        let error = run_session(&fake, "TestGame", "status", true).unwrap_err();
         assert_eq!(
             error,
             "Place 2 is not open in Studio, or its Rojo Manager bridge is not loaded. Use open_place first."
@@ -1277,7 +1353,7 @@ mod tests {
 
         let fake =
             Fake { projects: Script::new([json!([project("off", true)])]), instances: no_bridge(), ..Fake::default() };
-        assert_eq!(run_session(&fake, "TestGame", "status").unwrap_err(), BRIDGE_MISSING);
+        assert_eq!(run_session(&fake, "TestGame", "status", true).unwrap_err(), BRIDGE_MISSING);
     }
 
     #[test]
@@ -1331,7 +1407,7 @@ mod tests {
             ]),
             reply: |_, parts| match parts {
                 ["lanes"] => json!({"lane": {"name": "TestGame-lane"}}),
-                _ => json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "starting"}}),
+                _ => json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "serving"}}),
             },
             instances: Script::new([json!({"bridge": true, "instances": []}), open]),
             studio: Script::new([json!({"status": "Confirming"}), json!({"status": "Connected"})]),
