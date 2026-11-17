@@ -237,12 +237,14 @@ local pendingCache: { source: any, summary: any }? = nil
 -- What accepting Rojo's initial sync would do in Studio: instances added, changed, and removed, each
 -- counted with its first paths. Rojo's initial diff only removes children of synced instances that
 -- the project does not have, so every removal is an instance that exists only in Studio.
+-- Rojo 7.5 and earlier keep that patch in confirmData and may still hold the last session's
+-- patchTree; 7.6 and later build the patchTree when they ask.
 -- nil when Rojo is not confirming, or its state has a shape this bridge does not know.
 local function pendingSync(app)
 	local state = app.state or {}
 	local confirm = if type(state.confirmData) == "table" then state.confirmData else {}
-	local tree = if type(state.patchTree) == "table" then state.patchTree else nil
-	local source = tree or confirm.patch
+	local tree = if confirm.patch == nil and type(state.patchTree) == "table" then state.patchTree else nil
+	local source = confirm.patch or tree
 	if state.appStatus ~= "Confirming" or type(source) ~= "table" then
 		return nil
 	end

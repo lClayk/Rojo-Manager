@@ -37,9 +37,13 @@ impl Backup {
     }
 }
 
+/// The project's backup folder. Letters, digits, spaces, and dashes stay; any other character becomes
+/// `_` and its code, so "Game.v2" and "Game_v2" never share a folder.
 fn folder(project: &str) -> PathBuf {
-    let name: String =
-        project.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+    let name: String = project
+        .chars()
+        .map(|c| if c.is_alphanumeric() || " -".contains(c) { c.to_string() } else { format!("_{:06x}", c as u32) })
+        .collect();
     crate::config::data_dir().join("backups").join(name)
 }
 
@@ -147,5 +151,6 @@ mod tests {
         assert!(!listed.iter().any(|backup| backup.id == first.id));
         rename("MyGame", "Game");
         assert_eq!((list("MyGame").len(), list("Game").len()), (0, KEEP));
+        assert_ne!(folder("Game.v2"), folder("Game_v2"));
     }
 }
