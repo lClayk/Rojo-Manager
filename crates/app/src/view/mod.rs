@@ -24,6 +24,7 @@ use crate::theme::*;
 use crate::widgets::{Button, Callback, Dialog, TITLE_BAR, TITLE_BAR_INSET, Variant, tabbable};
 
 pub use logs::Logs;
+mod backups;
 use settings::AgentHelp;
 
 const NOTICE: Duration = Duration::from_secs(6);
@@ -68,6 +69,8 @@ pub struct MainView {
     settings_open: bool,
     tools_open: bool,
     logs: Option<Logs>,
+    /// The project whose backups are open.
+    backups: Option<String>,
     confirm: Option<Confirm>,
     editing: Option<Editing>,
     /// The button that briefly shows an outcome ("Copied", "Added") instead of its label.
@@ -96,6 +99,7 @@ impl MainView {
             settings_open: false,
             tools_open: false,
             logs: None,
+            backups: None,
             confirm: None,
             editing: None,
             flash: None,
@@ -281,6 +285,7 @@ impl MainView {
             && self.agent_help.take().is_none()
             && !std::mem::take(&mut self.tools_open)
             && self.logs.take().is_none()
+            && self.backups.take().is_none()
         {
             self.settings_open = false;
         }
@@ -758,7 +763,7 @@ impl Render for MainView {
         // Only the topmost layer's controls are Tab stops: the list, or the dialog on top of it.
         let top: u8 = if self.confirm.is_some() || self.agent_help.is_some() {
             4
-        } else if self.logs.is_some() {
+        } else if self.logs.is_some() || self.backups.is_some() {
             3
         } else if self.tools_open {
             2
@@ -788,6 +793,10 @@ impl Render for MainView {
             .when_some(
                 self.logs.as_ref().map(|logs| tabbable(top == 3, || logs::render(self, logs, cx))),
                 |root, logs| root.child(logs),
+            )
+            .when_some(
+                self.backups.as_ref().map(|name| tabbable(top == 3, || backups::render(self, name, cx))),
+                |root, backups| root.child(backups),
             )
             .when_some(
                 self.agent_help.as_ref().map(|help| settings::render_agent_help(self, help, cx)),

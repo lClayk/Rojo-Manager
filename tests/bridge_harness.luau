@@ -5,7 +5,8 @@
 -- Usage: lune run bridge_harness.luau <RojoManagerBridge.luau> <placeId>[:<place name>] [bridge port] [confirm]
 -- The place name is game.Name, which Studio sets to a local place's file name (place ID 0). With
 -- confirm, connecting waits for the initial sync to be confirmed, with a pending patch as Rojo 7.6
--- and later keep it (state.patchTree).
+-- and later keep it (state.patchTree). Accepting it runs the precommit hooks the bridge registered,
+-- with a patch that removes a Studio-only Workspace.Map and Workspace.Terrain, which cannot be copied.
 -- Prints one line per event ("connect <port>", "disconnect") for the test to read.
 
 local fs = require("@lune/fs")
@@ -73,8 +74,91 @@ local HttpService = {
 	end,
 }
 
+-- Standard base64, for the EncodingService stand-in.
+local ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function base64Encode(text: string): string
+	return (
+		string.gsub(text .. "\0\0", "(...)", function(chunk)
+			local a, b, c = string.byte(chunk, 1, 3)
+			local n = a * 65536 + b * 256 + c
+			local out = ""
+			for shift = 18, 0, -6 do
+				local index = bit32.band(bit32.rshift(n, shift), 63) + 1
+				out ..= string.sub(ALPHABET, index, index)
+			end
+			return out
+		end)
+	)
+end
+
+local function encode(text: string): string
+	local padding = (3 - #text % 3) % 3
+	local encoded = string.sub(base64Encode(text), 1, math.ceil(#text / 3) * 4)
+	return string.sub(encoded, 1, #encoded - padding) .. string.rep("=", padding)
+end
+
+local function decode(text: string): string
+	text = string.gsub(text, "=", "")
+	local bits, count, out = 0, 0, {}
+	for index = 1, #text do
+		bits = bits * 64 + (string.find(ALPHABET, string.sub(text, index, index), 1, true) - 1)
+		count += 6
+		if count >= 8 then
+			count -= 8
+			table.insert(out, string.char(bit32.band(bit32.rshift(bits, count), 255)))
+			bits = bit32.band(bits, bit32.lshift(1, count) - 1)
+		end
+	end
+	return table.concat(out)
+end
+
+-- A copy of a Studio instance, as Clone and DeserializeInstancesAsync make them.
+local function copyOf(name: string, attributes: { [string]: any })
+	local copy = { __instance = true, Name = name, attributes = attributes }
+	function copy:SetAttribute(key, value)
+		self.attributes[key] = value
+	end
+	function copy:GetAttribute(key)
+		return self.attributes[key]
+	end
+	function copy:Destroy() end
+	return copy
+end
+
 local services = {
 	HttpService = HttpService,
+	-- "Serializes" copies as JSON, which is all the round trip through Rojo Manager needs.
+	SerializationService = {
+		SerializeInstancesAsync = function(_, copies)
+			local list = {}
+			for _, copy in copies do
+				table.insert(list, { name = copy.Name, attributes = copy.attributes })
+			end
+			return buffer.fromstring(serde.encode("json", list))
+		end,
+		DeserializeInstancesAsync = function(_, data)
+			local copies = {}
+			for _, item in serde.decode("json", buffer.tostring(data)) do
+				table.insert(copies, copyOf(item.name, item.attributes))
+			end
+			return copies
+		end,
+	},
+	EncodingService = {
+		Base64Encode = function(_, data)
+			return buffer.fromstring(encode(buffer.tostring(data)))
+		end,
+		Base64Decode = function(_, data)
+			return buffer.fromstring(decode(buffer.tostring(data)))
+		end,
+	},
+	ChangeHistoryService = {
+		TryBeginRecording = function()
+			return "recording"
+		end,
+		FinishRecording = function() end,
+	},
 	LogService = LogService,
 	RunService = {
 		IsEdit = function()
@@ -106,6 +190,29 @@ local game = {
 		attributes[name] = value
 	end,
 }
+
+-- Workspace, for restore to find a backup's parent.
+local workspace = { __instance = true, Name = "Workspace" }
+function workspace:FindFirstChild()
+	return nil
+end
+function game:FindFirstChild(name)
+	return if name == "Workspace" then workspace else nil
+end
+
+-- What the confirmed sync removes: a Studio-only model, and Terrain, which cannot be copied.
+local function studioOnly(name: string, copyable: boolean)
+	local removed = { __instance = true, Name = name, ClassName = "Model" }
+	function removed:GetFullName()
+		return `Workspace.{name}`
+	end
+	function removed:Clone()
+		assert(copyable, "Terrain cannot be cloned")
+		return copyOf(name, {})
+	end
+	return removed
+end
+local REMOVED = { studioOnly("Map", true), studioOnly("Terrain", false) }
 
 -- Rojo's first sync renames the DataModel to the project's name, as the real one does.
 local function synced()
@@ -185,7 +292,7 @@ local Bridge = luau.load(source, {
 	environment = {
 		game = game,
 		typeof = studioTypeof,
-		Enum = { MessageType = MessageType },
+		Enum = { MessageType = MessageType, FinishRecordingOperation = { Commit = "Commit" } },
 		task = task,
 		Random = {
 			new = function()
@@ -222,6 +329,11 @@ app = {
 			if app.state.appStatus ~= "Confirming" then
 				return
 			elseif choice == "Accept" then
+				for _, hook in app.serveSession.precommit do
+					-- Rojo's own hook, registered first, has given the removals ids for its diff view.
+					local map = { fromInstances = { [REMOVED[1]] = "id-1", [REMOVED[2]] = "id-2" }, fromIds = {} }
+					hook({ removed = REMOVED, added = {}, updated = {} }, map)
+				end
 				app.state = { appStatus = "Connected", address = `localhost:{app.port.current}`, projectName = "MyGame" }
 				synced()
 				event(`connect {app.port.current}`)
@@ -245,11 +357,18 @@ app = {
 		self.state = state
 	end,
 	startSession = function()
-		app.serveSession = {
+		local session = {
+			precommit = {},
 			getStatus = function()
 				return if app.state.appStatus == "Connected" then "Connected" else "Connecting"
 			end,
 		}
+		function session:hookPrecommit(hook)
+			table.insert(self.precommit, hook)
+		end
+		-- As the patched App:startSession does, before the session starts.
+		Bridge.session(app, session)
+		app.serveSession = session
 		if confirm then
 			app.state = { appStatus = "Confirming", patchTree = PATCH_TREE, confirmData = {} }
 			event(`confirming {app.port.current}`)

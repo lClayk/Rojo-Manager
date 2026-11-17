@@ -70,10 +70,15 @@ pub fn specs(studio_tools: bool) -> Value {
             "name": "rojo_session",
             "description": "Control the Rojo plugin in the Studio window that has a project's place open: \
                 connect (starts the server if needed), disconnect, status, or accept/abort \
-                Rojo's initial sync confirmation.",
+                Rojo's initial sync confirmation. Before Rojo removes instances that exist only in Studio, \
+                Rojo Manager backs them up: backups lists them, newest first, and restore puts one back \
+                (the newest, or backup) under its old parents in the open place. Rojo removes restored \
+                instances again on its next sync unless the project ignores them.",
             "inputSchema": {"type": "object", "required": ["project", "action"], "additionalProperties": false,
                 "properties": {"project": {"type": "string", "description": "Project name"},
-                    "action": {"type": "string", "enum": ["connect", "disconnect", "status", "accept", "abort"]},
+                    "action": {"type": "string",
+                        "enum": ["connect", "disconnect", "status", "accept", "abort", "backups", "restore"]},
+                    "backup": {"type": "string", "description": "For restore: a backup id from backups"},
                     "wait": {"type": "boolean", "default": true, "description": "For connect: return once Rojo \
                         connects, asks to confirm the initial sync, or fails, up to 30 seconds"}}},
         },
@@ -194,9 +199,20 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
             text(&open_place(backend, project, place, args.get("connect_rojo") == Some(&Value::Bool(true)))?)
         }
         "rojo_session" => {
-            let choices = ["connect", "disconnect", "status", "accept", "abort"];
+            let choices = ["connect", "disconnect", "status", "accept", "abort", "backups", "restore"];
             let (project, action) = project_action(backend, args, &choices)?;
-            text(&run_session(backend, &project, action, wait(args)?)?)
+            match action {
+                "backups" => text(&call(backend, "GET", &["projects", &project, "backups"], None, CALL_TIMEOUT)?),
+                "restore" => {
+                    let body = match optional_string(args, "backup")? {
+                        Some(id) => json!({ "backup": id }),
+                        None => json!({}),
+                    };
+                    let timeout = Duration::from_secs(90);
+                    text(&call(backend, "POST", &["projects", &project, "restore"], Some(&body), timeout)?)
+                }
+                _ => text(&run_session(backend, &project, action, wait(args)?)?),
+            }
         }
         "server_logs" => text(&server_logs(backend, args)?),
         "manage_project" => text(&manage_project(backend, args)?),

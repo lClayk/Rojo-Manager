@@ -54,6 +54,10 @@ pub enum Call {
         instance: String,
         accept: bool,
     },
+    RestoreBackup {
+        name: String,
+        id: String,
+    },
     OpenStudio {
         name: String,
     },
@@ -134,6 +138,13 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::Update { name, update } => json(engine.update(&name, update)),
         Call::Remove { name } => json(engine.remove(&name)),
         Call::AnswerSync { instance, accept } => json(engine.answer_sync(&instance, accept)),
+        Call::RestoreBackup { name, id } => json(engine.restore_backup(&name, Some(&id)).map(|result| {
+            let count = |key: &str| result.get(key).and_then(serde_json::Value::as_array).map_or(0, Vec::len);
+            match count("missing") {
+                0 => format!("restored {} instances", count("restored")),
+                missing => format!("restored {}, {missing} had no parent left", count("restored")),
+            }
+        })),
         Call::OpenStudio { name } => json(engine.open_studio(&name)),
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
@@ -259,6 +270,10 @@ impl Client {
     }
     pub fn answer_sync(&self, instance: &str, accept: bool) -> Result<(), String> {
         self.call(Call::AnswerSync { instance: instance.into(), accept })
+    }
+    /// Restore a backup into the project's open place; answers a short summary.
+    pub fn restore_backup(&self, name: &str, id: &str) -> Result<String, String> {
+        self.call(Call::RestoreBackup { name: name.into(), id: id.into() })
     }
     pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
         self.call(Call::OpenStudio { name: name.into() })

@@ -29,6 +29,11 @@ local VERSION = 11
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
+local BACKUP_URL = "http://localhost:34871/backup"
+-- The largest backup Rojo Manager accepts, base64 included.
+local MAX_BACKUP_BYTES = 64 * 1024 * 1024
+-- Marks each copy in a backup with the full name it had, so restore finds its parent.
+local BACKUP_PATH_ATTRIBUTE = "RojoManagerPath"
 -- How long new Output lines wait to be sent together, and how many wait at most.
 local OUTPUT_DELAY = 0.5
 local MAX_OUTPUT_LINES = 500
@@ -72,6 +77,86 @@ local function placeName(): string?
 	end
 	local kept = game:GetAttribute(PLACE_ATTRIBUTE)
 	return if type(kept) == "string" then kept else game.Name
+end
+
+-- Whether to back up Studio-only instances before Rojo removes them: Rojo Manager's setting, from
+-- its last poll answer.
+local backupsEnabled = true
+
+-- The instance at a full name from GetFullName ("Workspace.Map"), or nil. Names that contain dots
+-- cannot be told apart from nesting, so those are not found.
+local function findPath(path: string): Instance?
+	local current: Instance = game
+	for _, name in string.split(path, ".") do
+		local child = current:FindFirstChild(name)
+		if not child then
+			return nil
+		end
+		current = child
+	end
+	return current
+end
+
+-- Send copies of instances Rojo is about to remove to Rojo Manager, which keeps them as a backup.
+local function sendBackup(app, copies: { Instance }, paths: { string }, skipped: { string })
+	local ok, data = pcall(function()
+		local serialized = game:GetService("SerializationService"):SerializeInstancesAsync(copies)
+		return buffer.tostring(game:GetService("EncodingService"):Base64Encode(serialized))
+	end)
+	for _, copy in copies do
+		copy:Destroy()
+	end
+	local report = {
+		placeId = game.PlaceId,
+		placeName = placeName(),
+		port = tonumber(app.port:getValue()) or DEFAULT_PORT,
+		paths = paths,
+		skipped = skipped,
+		data = if ok then data else nil,
+		error = if ok then nil else tostring(data),
+	}
+	if ok and #data > MAX_BACKUP_BYTES then
+		report.data = nil
+		report.error = `The copy is too large to send ({#data} bytes)`
+	end
+	local encoded, json = pcall(HttpService.JSONEncode, HttpService, report)
+	if encoded then
+		pcall(HttpService.RequestAsync, HttpService, {
+			Url = BACKUP_URL,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = json,
+		})
+	end
+end
+
+-- Before Rojo applies a patch, copy what it removes that exists only in Studio: instances Rojo does
+-- not track, which arrive as Instances rather than ids. The instance map cannot tell them apart:
+-- Rojo's own precommit hook runs first and gives them ids for its diff view (PatchTree.build).
+-- Copying is instant; sending runs afterwards.
+local function backUpRemovals(app, patch)
+	if not backupsEnabled then
+		return
+	end
+	local copies, paths, skipped = {}, {}, {}
+	for _, removed in patch.removed do
+		if typeof(removed) ~= "Instance" then
+			continue
+		end
+		local path = removed:GetFullName()
+		local ok, copy = pcall(removed.Clone, removed)
+		if ok and copy then
+			copy:SetAttribute(BACKUP_PATH_ATTRIBUTE, path)
+			table.insert(copies, copy)
+			table.insert(paths, path)
+		else
+			-- Terrain, or anything not Archivable.
+			table.insert(skipped, path)
+		end
+	end
+	if #paths > 0 or #skipped > 0 then
+		task.spawn(sendBackup, app, copies, paths, skipped)
+	end
 end
 
 -- The attached app's current poll loop, so a detached or reattached app's loop stops.
@@ -264,6 +349,32 @@ local actions = {
 	abort = function(app)
 		return answer(app, "Abort")
 	end,
+	-- Put a backup's copies (args.data, base64 .rbxm) back under their old parents, as one undoable
+	-- step. Copies whose parent is gone are left out and listed as missing.
+	restore = function(_app, args)
+		local data = game:GetService("EncodingService"):Base64Decode(buffer.fromstring(args.data))
+		local copies = game:GetService("SerializationService"):DeserializeInstancesAsync(data)
+		local history = game:GetService("ChangeHistoryService")
+		local recording = history:TryBeginRecording("Rojo Manager: Restore backup")
+		local restored, missing = {}, {}
+		for _, copy in copies do
+			local path = copy:GetAttribute(BACKUP_PATH_ATTRIBUTE)
+			copy:SetAttribute(BACKUP_PATH_ATTRIBUTE, nil)
+			local parentPath = if type(path) == "string" then string.match(path, "^(.*)%.[^%.]+$") else nil
+			local parent = if parentPath then findPath(parentPath) else nil
+			if parent then
+				copy.Parent = parent
+				table.insert(restored, path)
+			else
+				copy:Destroy()
+				table.insert(missing, if type(path) == "string" then path else copy.Name)
+			end
+		end
+		if recording then
+			history:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+		end
+		return { restored = restored, missing = missing }
+	end,
 	-- Run args.code with plugin permissions. Returns what it printed and returned.
 	luau = function(_app, args)
 		local chunk, compileError = loadstring(args.code, "=execute_luau")
@@ -375,6 +486,9 @@ local function poll(app, token: {})
 			end
 		end
 		offered = offer
+		if body and type(body.backups) == "boolean" then
+			backupsEnabled = body.backups
+		end
 		if body and type(body.command) == "table" then
 			result = run(app, body.command)
 		elseif os.clock() - started < 1 then
@@ -470,6 +584,13 @@ function Bridge.attach(app)
 	-- Deferred until App:init has finished, so the host and port the poll reports are set.
 	task.defer(poll, app, token)
 	task.spawn(reportRojoPlugins)
+end
+
+-- Called from App:startSession just before a session starts, so even its first sync is covered.
+function Bridge.session(app, serveSession)
+	serveSession:hookPrecommit(function(patch)
+		backUpRemovals(app, patch)
+	end)
 end
 
 -- Called from App:willUnmount when the plugin unloads.

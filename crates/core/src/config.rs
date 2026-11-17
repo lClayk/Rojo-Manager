@@ -130,6 +130,8 @@ pub struct Settings {
     pub group_experiences: bool,
     /// Offer agents get_connected_instances and execute_luau; off when another Studio MCP has them.
     pub studio_tools: bool,
+    /// Back up instances that exist only in Studio before Rojo removes them (see backups.rs).
+    pub backups: bool,
 }
 
 impl Default for Settings {
@@ -149,12 +151,13 @@ impl Default for Settings {
             auto_connect_accept: true,
             group_experiences: true,
             studio_tools: true,
+            backups: true,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 14] = [
+    pub const KEYS: [&'static str; 15] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -169,6 +172,7 @@ impl Settings {
         "auto_connect_accept",
         "group_experiences",
         "studio_tools",
+        "backups",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -187,6 +191,7 @@ impl Settings {
             "auto_connect_accept" => &mut self.auto_connect_accept,
             "group_experiences" => &mut self.group_experiences,
             "studio_tools" => &mut self.studio_tools,
+            "backups" => &mut self.backups,
             _ => return None,
         })
     }

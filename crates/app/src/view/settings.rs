@@ -272,6 +272,13 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
                     Some("Applies the project to Studio without asking"),
                     cx,
                 ),
+                toggle(
+                    snapshot,
+                    "backups",
+                    "Back up what Rojo removes from Studio",
+                    Some("Instances that exist only in Studio, kept 20 per project"),
+                    cx,
+                ),
             ]
             .into_iter()
             .chain(shortcuts.map(|(key, label, hint)| toggle(snapshot, key, label, Some(hint), cx))),
