@@ -10,6 +10,7 @@ pub mod https;
 pub mod localnet;
 pub mod manager;
 pub mod rojo_api;
+pub mod scaffold;
 pub mod shell;
 pub mod startup;
 pub mod studio;

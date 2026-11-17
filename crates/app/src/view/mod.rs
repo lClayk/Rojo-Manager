@@ -24,6 +24,7 @@ use crate::theme::*;
 use crate::widgets::{Button, Callback, Dialog, TITLE_BAR, TITLE_BAR_INSET, Variant, tabbable};
 
 pub use logs::Logs;
+mod add;
 mod backups;
 use settings::AgentHelp;
 
@@ -71,6 +72,8 @@ pub struct MainView {
     logs: Option<Logs>,
     /// The project whose backups are open.
     backups: Option<String>,
+    /// The Add project choices are open.
+    add_open: bool,
     confirm: Option<Confirm>,
     editing: Option<Editing>,
     /// The button that briefly shows an outcome ("Copied", "Added") instead of its label.
@@ -100,6 +103,7 @@ impl MainView {
             tools_open: false,
             logs: None,
             backups: None,
+            add_open: false,
             confirm: None,
             editing: None,
             flash: None,
@@ -216,6 +220,12 @@ impl MainView {
     }
 
     fn add_project(&mut self, cx: &mut Context<Self>) {
+        self.add_open = true;
+        cx.notify();
+    }
+
+    /// Ask for a project folder, or a parent folder of several, and add them.
+    fn add_existing(&mut self, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -286,6 +296,7 @@ impl MainView {
             && !std::mem::take(&mut self.tools_open)
             && self.logs.take().is_none()
             && self.backups.take().is_none()
+            && !std::mem::take(&mut self.add_open)
         {
             self.settings_open = false;
         }
@@ -763,7 +774,7 @@ impl Render for MainView {
         // Only the topmost layer's controls are Tab stops: the list, or the dialog on top of it.
         let top: u8 = if self.confirm.is_some() || self.agent_help.is_some() {
             4
-        } else if self.logs.is_some() || self.backups.is_some() {
+        } else if self.logs.is_some() || self.backups.is_some() || self.add_open {
             3
         } else if self.tools_open {
             2
@@ -798,6 +809,7 @@ impl Render for MainView {
                 self.backups.as_ref().map(|name| tabbable(top == 3, || backups::render(self, name, cx))),
                 |root, backups| root.child(backups),
             )
+            .when(self.add_open, |root| root.child(tabbable(top == 3, || add::render(cx))))
             .when_some(
                 self.agent_help.as_ref().map(|help| settings::render_agent_help(self, help, cx)),
                 |root, help| root.child(help),

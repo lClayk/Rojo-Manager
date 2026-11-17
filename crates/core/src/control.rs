@@ -57,7 +57,7 @@ impl std::fmt::Display for ControlError {
 /// What the servers call. Implementations are thread-safe; requests arrive on server threads.
 ///
 /// - GET  /projects                  {"projects": projects()}
-/// - POST /projects                  act(None, "add", body)
+/// - POST /projects                  act(None, "add", body): add {path}, create {path, create}, or convert {path, from}
 /// - POST /projects/<name>/<action>  act(Some(name), action, body), action in ACTIONS
 /// - GET  /projects/<name>/logs      logs(name)
 /// - GET  /projects/<name>/backups   backups(name)
