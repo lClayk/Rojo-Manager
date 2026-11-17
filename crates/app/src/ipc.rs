@@ -50,9 +50,6 @@ pub enum Call {
     Remove {
         name: String,
     },
-    Keep {
-        name: String,
-    },
     AnswerSync {
         instance: String,
         accept: bool,
@@ -133,10 +130,9 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         }
         Call::PortOwner { name } => json(engine.port_owner(&name)),
         Call::KillPortOwner { name, pid } => json(engine.kill_port_owner(&name, pid)),
-        Call::AddProjects { path } => json(engine.add_projects(&path, false)),
+        Call::AddProjects { path } => json(engine.add_projects(&path)),
         Call::Update { name, update } => json(engine.update(&name, update)),
         Call::Remove { name } => json(engine.remove(&name)),
-        Call::Keep { name } => json(engine.keep(&name)),
         Call::AnswerSync { instance, accept } => json(engine.answer_sync(&instance, accept)),
         Call::OpenStudio { name } => json(engine.open_studio(&name)),
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
@@ -260,9 +256,6 @@ impl Client {
     }
     pub fn remove(&self, name: &str) -> Result<(), String> {
         self.call(Call::Remove { name: name.into() })
-    }
-    pub fn keep(&self, name: &str) -> Result<(), String> {
-        self.call(Call::Keep { name: name.into() })
     }
     pub fn answer_sync(&self, instance: &str, accept: bool) -> Result<(), String> {
         self.call(Call::AnswerSync { instance: instance.into(), accept })

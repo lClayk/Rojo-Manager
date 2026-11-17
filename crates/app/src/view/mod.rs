@@ -641,12 +641,6 @@ impl MainView {
                         }
                     }
                 }
-                logic::ListItem::Temporary(projects) => {
-                    rows.push(project_row::render_temporary(&projects));
-                    for project in &projects {
-                        row(self, &mut rows, project, 1, window, cx);
-                    }
-                }
             }
         }
         div()

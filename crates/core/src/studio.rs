@@ -148,14 +148,19 @@ pub fn open_place(place: &Place) -> io::Result<()> {
 }
 
 /// Force-close the Studio windows that have this place file open, whose titles start with its path.
-/// Returns how many closed. Windows only: elsewhere the window stays open.
-pub fn close_place_file(path: &Path) -> usize {
+/// Returns how many closed, or which one would not. Windows only: elsewhere the window stays open.
+pub fn close_place_file(path: &Path) -> Result<usize, String> {
     let studio = crate::executable("RobloxStudioBeta");
     let owners = crate::localnet::window_owners(&format!("{} - ", path.display()));
     let studios = owners
         .into_iter()
         .filter(|pid| crate::localnet::process_name(*pid).is_some_and(|name| name.eq_ignore_ascii_case(&studio)));
-    studios.filter(|pid| crate::localnet::kill_process(*pid).is_ok()).count()
+    let mut closed = 0;
+    for pid in studios {
+        crate::localnet::kill_process(pid).map_err(|e| format!("Could not close Studio (process {pid}): {e}"))?;
+        closed += 1;
+    }
+    Ok(closed)
 }
 
 #[cfg(test)]

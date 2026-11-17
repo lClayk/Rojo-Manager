@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const ACTIONS: [&str; 8] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove", "keep"];
+pub const ACTIONS: [&str; 7] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove"];
 pub const MAX_BODY: usize = 16384;
 /// A bridge poll can carry a command's result, such as the output of agent Luau.
 pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
@@ -85,13 +85,13 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError>;
     /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
-    /// Makes a lane ({"from", "path", "holder"}), answering {"lane", "project"}; or removes one.
+    /// Makes a lane ({"from", "path", "holder"}), answering {"project"}; or removes one.
     fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError>;
 }
 
 /// A bridge's poll: its place, the server its Rojo is connected to (0 for none), the Rojo plugin's
 /// status, and the result of the command the previous poll handed it. Bridges since version 9 also
-/// send `game.Name` for an unpublished place, which is a local place's file name.
+/// send the name of an unpublished place, which is a local place's file name (see the bridge's placeName).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgePoll {

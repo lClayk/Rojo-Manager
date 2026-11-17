@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use rojo_manager_core::config::PlaceLink;
+use rojo_manager_core::config::{Lane, PlaceLink};
 use rojo_manager_core::control::{ControlError, RequestError};
 use rojo_manager_core::manager::SyncSummary;
 use serde::de::DeserializeOwned;
@@ -80,15 +80,18 @@ pub fn specs(studio_tools: bool) -> Value {
         {
             "name": "lane",
             "description": "An isolated Studio for parallel work, such as an agent working in a git worktree. create \
-                makes a temporary project at path (a copy of the project from), gives it a local place of its own, \
-                opens that in Studio, starts its server, connects Rojo, and accepts the first sync. remove closes \
-                that Studio, stops the server, and deletes the place. Lanes are gone when Rojo Manager exits.",
+                takes path, an existing copy of the project from (make the worktree first; this does not copy \
+                anything), adds it with a local place of its own built from the same project file, opens that in \
+                Studio, starts its server, connects Rojo, and accepts the first sync. A local place has no \
+                DataStores and none of the published place's Studio-built content. A lane stays across Rojo \
+                Manager restarts until remove, which force-closes its Studio (unsaved changes there are lost), \
+                stops the server, and deletes the place, or until its folder is deleted.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
                 "action": {"type": "string", "enum": ["create", "remove"]},
                 "from": {"type": "string", "description": "Project to make the lane from, for create"},
                 "path": {"type": "string", "description": "Absolute folder of the lane's copy, for create"},
                 "lane": {"type": "string", "description": "Lane name, for remove"},
-                "holder": {"type": "string", "description": "Who holds it, shown in Rojo Manager; this agent by default"}}},
+                "holder": {"type": "string", "description": "A label shown in Rojo Manager, such as \"lane B\", for create"}}},
         },
         {
             "name": "server_logs",
@@ -101,21 +104,18 @@ pub fn specs(studio_tools: bool) -> Value {
         },
         {
             "name": "manage_project",
-            "description": "Add, change, keep, or remove Rojo Manager projects. add takes an absolute folder path: a \
-                Rojo project, or a parent folder whose project subfolders are all added on free ports. With \
-                temporary, the project is never saved: it is gone when removed or when Rojo Manager exits, and its \
-                server stops with it; keep saves it like any other project. update \
+            "description": "Add, change, or remove Rojo Manager projects. add takes an absolute folder path: a \
+                Rojo project, or a parent folder whose project subfolders are all added on free ports. update \
                 changes any of name, port, autostart, auto_connect (connect Rojo when the linked place \
                 opens in Studio while the server runs), sourcemap (keep sourcemap.json current with rojo \
                 sourcemap --watch while the server runs), and place (a place ID or link, local for an unpublished \
                 place file built from the project, or \"\" to unlink). \
                 Renaming or changing the port needs the server stopped. remove drops the project from \
-                the list, stopping its server; its files are kept.",
+                the list, stopping its server; its files are kept, except a local place file.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
-                "action": {"type": "string", "enum": ["add", "update", "keep", "remove"]},
-                "project": {"type": "string", "description": "Project name, for update, keep, and remove"},
+                "action": {"type": "string", "enum": ["add", "update", "remove"]},
+                "project": {"type": "string", "description": "Project name, for update and remove"},
                 "path": {"type": "string", "description": "Absolute folder path, for add"},
-                "temporary": {"type": "boolean", "default": false, "description": "For add"},
                 "name": {"type": "string"},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "autostart": {"type": "boolean", "description": "Start the server when Rojo Manager opens"},
@@ -224,6 +224,8 @@ struct Project {
     state: String,
     port: u16,
     #[serde(default)]
+    project_file: String,
+    #[serde(default)]
     place: Option<PlaceLink>,
     /// The linked place's experience name, once Rojo Manager looked it up.
     #[serde(default)]
@@ -235,7 +237,7 @@ struct Project {
     #[serde(default)]
     sourcemap: bool,
     #[serde(default)]
-    temporary: bool,
+    lane: Option<Lane>,
     /// Its last output lines.
     #[serde(default)]
     log: Vec<String>,
@@ -266,8 +268,8 @@ struct Brief {
     auto_connect: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sourcemap: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    temporary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane: Option<Lane>,
     /// Only in list_projects, when the linked place is open in Studio.
     #[serde(skip_serializing_if = "Option::is_none")]
     studio: Option<StudioPlace>,
@@ -288,7 +290,7 @@ impl From<Project> for Brief {
             autostart: project.autostart,
             auto_connect: project.auto_connect,
             sourcemap: project.sourcemap,
-            temporary: project.temporary,
+            lane: project.lane,
             studio: None,
         }
     }
@@ -451,7 +453,7 @@ struct StudioPlace {
 struct Instance {
     instance_id: String,
     place_id: u64,
-    /// game.Name of an unpublished place, from bridges since version 9.
+    /// The name of an unpublished place, a local place's file name, from bridges since version 9.
     #[serde(default)]
     place_name: Option<String>,
     #[serde(default)]
@@ -688,7 +690,9 @@ fn open_place(
         if instance_id.is_none() {
             let hint = match place {
                 PlaceLink::Published(_) => "",
-                PlaceLink::Local(_) => " A local place also needs the bridge from Rojo Manager 1.0 or newer.",
+                PlaceLink::Local(_) => {
+                    " A local place needs bridge version 9 or newer: check and install it with the updates tool."
+                }
             };
             return Err(format!(
                 "Studio was asked to open {}, but its Rojo Manager bridge did not report in within 3 minutes. Check \
@@ -862,15 +866,11 @@ enum Managed {
 }
 
 fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String> {
-    let action = choice(args, "action", &["add", "update", "keep", "remove"])?;
+    let action = choice(args, "action", &["add", "update", "remove"])?;
     if action == "add" {
         let path = string(args, "path")?;
-        let temporary = match args.get("temporary") {
-            None | Some(Value::Null) => false,
-            Some(value) => value.as_bool().ok_or("temporary must be true or false")?,
-        };
         manager_projects(backend)?; // starts the manager if needed
-        let body = if temporary { json!({ "path": path, "temporary": true }) } else { json!({ "path": path }) };
+        let body = json!({ "path": path });
         let reply = call(backend, "POST", &["projects"], Some(&body), Duration::from_secs(30))?;
         let added: Vec<Project> = field(reply, "added")?;
         return Ok(Managed::Added { added: added.into_iter().map(Brief::from).collect() });
@@ -878,10 +878,6 @@ fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String>
     let name = find_project(backend, &string(args, "project")?)?.name;
     if action == "remove" {
         return Ok(Managed::Removed(call(backend, "POST", &["projects", &name, "remove"], None, CALL_TIMEOUT)?));
-    }
-    if action == "keep" {
-        let project = act(backend, &name, "keep", None)?;
-        return Ok(Managed::Updated(Box::new(ProjectResult { project: project.into(), rojo: None })));
     }
     let changes: Map<String, Value> =
         PROJECT_FIELDS.iter().filter_map(|(key, stored)| Some((stored.to_string(), args.get(*key)?.clone()))).collect();
@@ -893,17 +889,14 @@ fn manage_project(backend: &dyn Backend, args: &Args) -> Result<Managed, String>
     Ok(Managed::Updated(Box::new(ProjectResult { project: project.into(), rojo: None })))
 }
 
-/// A lane as Rojo Manager reports it; only its name matters here.
-#[derive(Debug, Deserialize)]
-struct LaneInfo {
-    name: String,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum LaneResult {
     Created {
         lane: String,
+        /// The project file it serves, the same one as the project it was made from.
+        #[serde(rename = "projectFile")]
+        project_file: String,
         project: Box<Brief>,
         #[serde(rename = "instanceId", skip_serializing_if = "Option::is_none")]
         instance_id: Option<String>,
@@ -922,19 +915,22 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
     let action = choice(args, "action", &["create", "remove"])?;
     manager_projects(backend)?; // starts the manager if needed
     if action == "remove" {
-        let name = string(args, "lane")?;
+        let name = find_project(backend, &string(args, "lane")?)?.name;
         return Ok(LaneResult::Removed(call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT)?));
     }
     let from = find_project(backend, &string(args, "from")?)?.name;
     // Keys in sorted order, as in PROJECT_FIELDS.
     let path = string(args, "path")?;
     let mut body = json!({ "from": from });
-    if let Some(holder) = optional_string(args, "holder")?.or_else(crate::rpc::client_name) {
+    if let Some(holder) = optional_string(args, "holder")? {
         body["holder"] = json!(holder);
     }
     body["path"] = json!(path);
-    let name = field::<LaneInfo>(call(backend, "POST", &["lanes"], Some(&body), CALL_TIMEOUT)?, "lane")?.name;
+    let name = field::<Project>(call(backend, "POST", &["lanes"], Some(&body), CALL_TIMEOUT)?, "project")?.name;
     let opened = open_place(backend, Some(name.clone()), None, true).and_then(|mut opened| {
+        if opened.instance_id.is_none() {
+            return Err(format!("{BRIDGE_MISSING} A lane needs it to sync its Studio."));
+        }
         if let (Some(instance_id), Some("Confirming")) = (&opened.instance_id, opened.rojo.as_ref().map(Rojo::status)) {
             opened.rojo = Some(bridge(backend, instance_id, "accept", None)?);
             opened.next = None;
@@ -942,17 +938,21 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
         Ok(opened)
     });
     match opened {
-        Ok(opened) => Ok(LaneResult::Created {
-            project: Box::new(find_project(backend, &name)?.into()),
-            lane: name,
-            instance_id: opened.instance_id,
-            rojo: opened.rojo,
-            note: opened.note,
-        }),
-        Err(error) => {
-            let _ = call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT);
-            Err(format!("{error} The lane was removed again."))
+        Ok(opened) => {
+            let project = find_project(backend, &name)?;
+            Ok(LaneResult::Created {
+                project_file: project.project_file.clone(),
+                project: Box::new(project.into()),
+                lane: name,
+                instance_id: opened.instance_id,
+                rojo: opened.rojo,
+                note: opened.note,
+            })
         }
+        Err(error) => match call(backend, "POST", &["lanes", &name, "remove"], None, CALL_TIMEOUT) {
+            Ok(_) => Err(format!("{error} The lane was removed again.")),
+            Err(cleanup) => Err(format!("{error} Removing lane {name} again failed too: {cleanup}")),
+        },
     }
 }
 
@@ -1077,15 +1077,11 @@ mod tests {
                     updated["autoConnect"] = json!(true);
                     json!({"project": updated})
                 }
-                [.., "keep"] => json!({"project": project("off", true)}),
                 _ => json!({"removed": parts[1]}),
             },
             ..Fake::default()
         };
         let added = manage_project(&fake, &args(json!({"action": "add", "path": "C:/Games/Lobby"}))).unwrap();
-        let temporary = json!({"action": "add", "path": "C:/Games/Lobby", "temporary": true});
-        manage_project(&fake, &args(temporary)).unwrap();
-        manage_project(&fake, &args(json!({"action": "keep", "project": "TestGame"}))).unwrap();
         let update = json!({"action": "update", "project": "testgame", "auto_connect": true, "port": 34900});
         let updated = manage_project(&fake, &args(update)).unwrap();
         let removed = manage_project(&fake, &args(json!({"action": "remove", "project": "TestGame"}))).unwrap();
@@ -1103,10 +1099,6 @@ mod tests {
             [
                 "GET projects",
                 r#"POST projects {"path":"C:/Games/Lobby"}"#,
-                "GET projects",
-                r#"POST projects {"path":"C:/Games/Lobby","temporary":true}"#,
-                "GET projects",
-                "POST projects/TestGame/keep",
                 "GET projects",
                 r#"POST projects/TestGame/update {"autoConnect":true,"port":34900}"#,
                 "GET projects",
@@ -1392,7 +1384,8 @@ mod tests {
         let mut made = project("off", false);
         made["name"] = json!("TestGame-lane");
         made["place"] = json!({"file": "TestGame-lane-1a2b3c4d.rbxl"});
-        made["temporary"] = json!(true);
+        made["lane"] = json!({"parent": "TestGame", "holder": "lane B"});
+        made["projectFile"] = json!("lobby.project.json");
         let mut serving = made.clone();
         serving["state"] = json!("serving");
         let open = json!({"bridge": true, "instances": [
@@ -1406,23 +1399,40 @@ mod tests {
                 json!([project("off", true), serving]),
             ]),
             reply: |_, parts| match parts {
-                ["lanes"] => json!({"lane": {"name": "TestGame-lane"}}),
+                ["lanes"] => json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "off"}}),
                 _ => json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "serving"}}),
             },
             instances: Script::new([json!({"bridge": true, "instances": []}), open]),
             studio: Script::new([json!({"status": "Confirming"}), json!({"status": "Connected"})]),
             ..Fake::default()
         };
-        let create = json!({"action": "create", "from": "testgame", "path": "C:/Lane", "holder": "me"});
+        let create = json!({"action": "create", "from": "testgame", "path": "C:/Lane", "holder": "lane B"});
         let created = lane(&fake, &args(create));
         assert_eq!(
             json_text(&created.unwrap()),
-            r#"{"lane":"TestGame-lane","project":{"name":"TestGame-lane","state":"serving","port":34879,"placeFile":"TestGame-lane-1a2b3c4d.rbxl","temporary":true},"instanceId":"9","rojo":{"status":"Connected"}}"#
+            r#"{"lane":"TestGame-lane","projectFile":"lobby.project.json","project":{"name":"TestGame-lane","state":"serving","port":34879,"placeFile":"TestGame-lane-1a2b3c4d.rbxl","lane":{"parent":"TestGame","holder":"lane B"}},"instanceId":"9","rojo":{"status":"Connected"}}"#
         );
         let calls = fake.calls();
-        assert_eq!(calls[2], r#"POST lanes {"from":"TestGame","holder":"me","path":"C:/Lane"}"#);
+        assert_eq!(calls[2], r#"POST lanes {"from":"TestGame","holder":"lane B","path":"C:/Lane"}"#);
         assert!(calls.contains(&"POST projects/TestGame-lane/open-studio".to_string()));
         assert_eq!(calls[calls.len() - 2], r#"POST studio/9 {"action":"accept"}"#);
+        lane(&fake, &args(json!({"action": "remove", "lane": "testgame-lane"}))).unwrap();
+        assert_eq!(fake.calls().last().unwrap(), "POST lanes/TestGame-lane/remove");
+
+        // Without the bridge, the lane's Studio could never sync, so the lane is removed again.
+        let mut made = project("off", false);
+        made["name"] = json!("TestGame-lane");
+        made["place"] = json!({"file": "TestGame-lane-1a2b3c4d.rbxl"});
+        let fake = Fake {
+            projects: Script::new([json!([project("off", true)]), json!([project("off", true)]), json!([made])]),
+            reply: |_, _| json!({"project": {"name": "TestGame-lane", "port": 34880, "state": "serving"}}),
+            instances: Script::new([json!({"bridge": false, "instances": []})]),
+            ..Fake::default()
+        };
+        let create = json!({"action": "create", "from": "TestGame", "path": "C:/Lane"});
+        let error = lane(&fake, &args(create)).unwrap_err();
+        assert!(error.contains("not installed") && error.ends_with("The lane was removed again."), "{error}");
+        assert!(fake.calls().contains(&"POST lanes/TestGame-lane/remove".to_string()));
     }
 
     #[test]

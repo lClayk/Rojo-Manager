@@ -102,21 +102,6 @@ pub fn render_experience(
         .into_any_element()
 }
 
-/// The header over temporary projects, which are gone when Rojo Manager exits unless kept.
-pub fn render_temporary(projects: &[&ProjectView]) -> AnyElement {
-    div()
-        .id("temporary")
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .px(px(16.))
-        .py(px(10.))
-        .tooltip(crate::widgets::tooltip("Removed when Rojo Manager exits. Keep one to save it."))
-        .child(div().text_size(TEXT_LG).font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)).child("Temporary"))
-        .child(div().text_size(TEXT_SM).text_color(rgb(MUTED)).child(logic::group_summary(projects, "project")))
-        .into_any_element()
-}
-
 #[derive(Clone, Copy)]
 pub(super) enum GroupAction {
     Start,
@@ -258,7 +243,7 @@ pub fn render(
         .mt(px(6.))
         .mx(px(-6.))
         .child(port)
-        .when(!p.temporary, |d| {
+        .when(p.lane.is_none(), |d| {
             d.child(
                 switch_link(format!("autostart-{}", p.name), "Autostart", p.autostart, "Start this project when Rojo Manager opens")
                     .on_click(on_click(&p.name, cx, |this, name, _, cx| this.toggle_flag(name, Flag::Autostart, cx))),
@@ -307,18 +292,6 @@ pub fn render(
             div()
                 .flex()
                 .ml_auto()
-                .when(p.temporary && p.lane.is_none(), |d| {
-                    d.child(
-                        tip_link(format!("keep-{}", p.name), "Keep", "Save this project, so it stays after Rojo Manager exits")
-                            .on_click(on_click(&p.name, cx, |this, name, _, cx| {
-                                let name = name.to_string();
-                                let label = name.clone();
-                                this.run(cx, move |engine| engine.keep(&name), move |view, (), cx| {
-                                    view.notify(format!("Kept {label}"), cx)
-                                });
-                            })),
-                    )
-                })
                 .child(
                     tip_link(format!("logs-{}", p.name), "Logs", format!("View logs for {}", p.name))
                         .opacity(0.)
@@ -586,14 +559,23 @@ impl MainView {
             let on_confirm = Box::new(remove);
             return self.ask(Confirm { title: "Remove lane", message, label: "Remove", danger: true, on_confirm }, cx);
         }
-        if !logic::is_active(project.state) {
+        let local = matches!(project.place, Some(PlaceLink::Local(_)));
+        if !local && !logic::is_active(project.state) {
             return remove(self, cx);
         }
-        let message =
-            format!("{} is currently running on port {}. Stop the server and remove?", project.name, project.port);
-        self.ask(
-            Confirm { title: "Server running", message, label: "Remove", danger: true, on_confirm: Box::new(remove) },
-            cx,
-        );
+        let (title, mut message) = match logic::is_active(project.state) {
+            true => {
+                let message = format!(
+                    "{} is currently running on port {}. Stop the server and remove?",
+                    project.name, project.port
+                );
+                ("Server running", message)
+            }
+            false => ("Remove project", format!("Remove {}?", project.name)),
+        };
+        if local {
+            message.push_str(" Its local place file is deleted.");
+        }
+        self.ask(Confirm { title, message, label: "Remove", danger: true, on_confirm: Box::new(remove) }, cx);
     }
 }
