@@ -3,8 +3,9 @@
 
 use std::collections::HashSet;
 
-use rojo_manager_core::config::{PlaceLink, Settings};
+use rojo_manager_core::config::{MAX_IDLE_CLOSE, PlaceLink, Settings};
 use rojo_manager_core::manager::{ProjectView, ServerState, SyncSummary};
+use rojo_manager_core::pull::Pulled;
 use rojo_manager_core::tooling::{StudioPlugin, bridge_outdated};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +246,61 @@ pub fn parse_port(text: &str) -> Result<u16, &'static str> {
     }
 }
 
+/// The idle close link's text: "Idle close 30 min", or "Idle close off".
+pub fn idle_close_label(minutes: Option<u32>) -> String {
+    match minutes {
+        Some(minutes) => format!("Idle close {minutes} min"),
+        None => "Idle close off".into(),
+    }
+}
+
+/// Idle close editor input: whole minutes up to a week; empty or 0 turns it off.
+pub fn parse_idle_close(text: &str) -> Result<u32, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(0);
+    }
+    match text.parse::<u32>() {
+        Ok(minutes) if minutes <= MAX_IDLE_CLOSE && text.bytes().all(|b| b.is_ascii_digit()) => Ok(minutes),
+        _ => Err("Idle close is a number of minutes, up to 10080"),
+    }
+}
+
+/// What a pull did: "3 files written, 1 removed", and Rojo's state in Studio when it did not
+/// connect again.
+pub fn pull_summary(pulled: &Pulled) -> String {
+    let files = |count: usize| if count == 1 { "1 file".to_string() } else { format!("{count} files") };
+    let summary = match (pulled.written.len(), pulled.removed.len()) {
+        (written, 0) => format!("{} written", files(written)),
+        (0, removed) => format!("{} removed", files(removed)),
+        (written, removed) => format!("{} written, {removed} removed", files(written)),
+    };
+    match &pulled.rojo {
+        Some(rojo) => format!("{summary}. Rojo in Studio: {rojo}"),
+        None => summary,
+    }
+}
+
+/// The question before a pull writes anything, listing the first files; None when nothing would change.
+pub fn pull_question(project: &str, preview: &Pulled) -> Option<String> {
+    if preview.is_empty() {
+        return None;
+    }
+    let list = |label: &str, paths: &[String]| {
+        let shown: Vec<&str> = paths.iter().take(6).map(String::as_str).collect();
+        let more = paths.len() - shown.len();
+        let more = if more > 0 { format!(", and {more} more") } else { String::new() };
+        (!paths.is_empty()).then(|| format!("\n{label}: {}{more}", shown.join(", ")))
+    };
+    let mut message = format!("Write Studio's version of {project}'s synced folders into its files?");
+    message.extend(list("Removed", &preview.removed));
+    message.extend(list("Written", &preview.written));
+    if !preview.missing.is_empty() {
+        message.push_str(&format!("\nNot in Studio, left alone: {}", preview.missing.join(", ")));
+    }
+    Some(message)
+}
+
 /// Split a path so the parent can truncate while the folder name (with its separator) stays visible.
 pub fn split_path(path: &str) -> (&str, &str) {
     let trimmed = path.trim_end_matches(['\\', '/']);
@@ -331,6 +387,9 @@ mod tests {
             sourcemap: false,
             lane: None,
             pending_sync: None,
+            idle_close: None,
+            studio_open: false,
+            studio_hidden: false,
             backups: vec![],
             experience: None,
             state,
@@ -419,6 +478,36 @@ mod tests {
         for text in ["0", "65536", "-1", "+80", "8.5", "", "abc"] {
             assert!(parse_port(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn idle_close_is_whole_minutes_and_empty_or_zero_turns_it_off() {
+        assert_eq!((parse_idle_close(""), parse_idle_close(" 0 "), parse_idle_close("30")), (Ok(0), Ok(0), Ok(30)));
+        for text in ["-1", "1.5", "10081", "soon"] {
+            assert!(parse_idle_close(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_pull_asks_with_removals_first_and_not_at_all_when_nothing_changes() {
+        let paths = |count: usize| (0..count).map(|n| format!("src/{n}.luau")).collect::<Vec<_>>();
+        let pulled = |written, removed| Pulled {
+            preview: true,
+            written,
+            removed,
+            missing: vec!["Workspace.Map".into()],
+            rojo: None,
+        };
+        assert_eq!(pull_question("Game", &pulled(vec![], vec![])), None);
+        let question = pull_question("Game", &pulled(paths(8), paths(1))).unwrap();
+        let lines: Vec<&str> = question.lines().collect();
+        assert_eq!(lines[1], "Removed: src/0.luau");
+        assert!(lines[2].starts_with("Written: src/0.luau") && lines[2].ends_with(", and 2 more"));
+        assert_eq!(lines[3], "Not in Studio, left alone: Workspace.Map");
+        assert_eq!(pull_summary(&pulled(paths(3), paths(1))), "3 files written, 1 removed");
+        assert_eq!(pull_summary(&pulled(paths(1), vec![])), "1 file written");
+        let waiting = Pulled { rojo: Some("Confirming".into()), ..pulled(vec![], paths(2)) };
+        assert_eq!(pull_summary(&waiting), "2 files removed. Rojo in Studio: Confirming");
     }
 
     #[test]

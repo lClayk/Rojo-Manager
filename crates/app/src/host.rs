@@ -157,7 +157,8 @@ impl Host {
                         self.in_background(move |engine| engine.toggle(&name));
                     }
                 }
-                Msg::OpenStudio(name) => self.in_background(move |engine| engine.open_studio(&name).map(|_| ())),
+                // Also shows a Studio that an agent opened hidden.
+                Msg::OpenStudio(name) => self.in_background(move |engine| engine.open_studio(&name, false).map(|_| ())),
                 Msg::InstallUpdate => {
                     // The window asks first, since installing restarts the app and its servers.
                     self.show();

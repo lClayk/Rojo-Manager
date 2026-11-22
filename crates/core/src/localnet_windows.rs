@@ -91,6 +91,15 @@ pub fn tcp_snapshot(connections: bool) -> io::Result<(HashMap<u16, u32>, HashMap
     Ok((listeners()?, established))
 }
 
+/// The process at the client end of a loopback connection: the one whose socket has local port
+/// `client` and is connected to `server`.
+pub fn connection_owner(client: u16, server: u16) -> Option<u32> {
+    [AF_INET, AF_INET6].into_iter().find_map(|family| {
+        let rows = table(family, TCP_TABLE_OWNER_PID_CONNECTIONS).ok()?;
+        rows.iter().find(|row| row.local == client && row.remote == server).map(|row| row.pid)
+    })
+}
+
 /// Executable file name of a running process (QueryFullProcessImageNameW), or None.
 pub fn process_name(pid: u32) -> Option<String> {
     // SAFETY: a plain Win32 call; the handle is closed below.
@@ -106,7 +115,8 @@ pub fn process_name(pid: u32) -> Option<String> {
     Path::new(&path).file_name().map(|name| name.to_string_lossy().into_owned())
 }
 
-/// The processes owning a visible top-level window whose title starts with `prefix`, ignoring case.
+/// The processes owning a top-level window, shown or hidden, whose title starts with `prefix`,
+/// ignoring case.
 pub fn window_owners(prefix: &str) -> Vec<u32> {
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId};

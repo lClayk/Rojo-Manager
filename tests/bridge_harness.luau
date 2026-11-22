@@ -126,6 +126,15 @@ local function copyOf(name: string, attributes: { [string]: any })
 	return copy
 end
 
+-- A signal nothing fires: the bridge only connects to these to notice activity.
+local function signal()
+	return {
+		Connect = function()
+			return { Disconnect = function() end }
+		end,
+	}
+end
+
 local services = {
 	HttpService = HttpService,
 	-- "Serializes" copies as JSON, which is all the round trip through Rojo Manager needs.
@@ -158,7 +167,11 @@ local services = {
 			return "recording"
 		end,
 		FinishRecording = function() end,
+		OnRecordingFinished = signal(),
+		OnUndo = signal(),
+		OnRedo = signal(),
 	},
+	Selection = { SelectionChanged = signal() },
 	LogService = LogService,
 	RunService = {
 		IsEdit = function()

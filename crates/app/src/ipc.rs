@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use rojo_manager_core::config::PlaceLink;
 use rojo_manager_core::manager::{Engine, Event, ProjectView, Snapshot, Update};
+use rojo_manager_core::pull::Pulled;
 use rojo_manager_core::tooling::Job;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,11 @@ pub enum Call {
     },
     OpenStudio {
         name: String,
+        hidden: bool,
+    },
+    Pull {
+        name: String,
+        preview: bool,
     },
     OpenFolder {
         name: String,
@@ -154,7 +160,8 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
                 missing => format!("restored {}, {missing} had no parent left", count("restored")),
             }
         })),
-        Call::OpenStudio { name } => json(engine.open_studio(&name)),
+        Call::OpenStudio { name, hidden } => json(engine.open_studio(&name, hidden)),
+        Call::Pull { name, preview } => json(engine.pull(&name, preview)),
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
         Call::SetCollapsed { universe_id, collapsed } => json(engine.set_collapsed(universe_id, collapsed)),
@@ -290,8 +297,13 @@ impl Client {
     pub fn restore_backup(&self, name: &str, id: &str) -> Result<String, String> {
         self.call(Call::RestoreBackup { name: name.into(), id: id.into() })
     }
-    pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
-        self.call(Call::OpenStudio { name: name.into() })
+    /// Open the place in Studio, or show (or with `hidden`, hide) the Studio that has it open.
+    pub fn open_studio(&self, name: &str, hidden: bool) -> Result<PlaceLink, String> {
+        self.call(Call::OpenStudio { name: name.into(), hidden })
+    }
+    /// Write Studio's synced instances into the project's files, or with `preview` list the changes.
+    pub fn pull(&self, name: &str, preview: bool) -> Result<Pulled, String> {
+        self.call(Call::Pull { name: name.into(), preview })
     }
     pub fn open_folder(&self, name: &str) -> Result<(), String> {
         self.call(Call::OpenFolder { name: name.into() })

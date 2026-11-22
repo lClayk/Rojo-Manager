@@ -250,6 +250,19 @@ pub fn render(
         .into_any_element()
     });
 
+    let idle_close = editor(Field::IdleClose, px(72.)).unwrap_or_else(|| {
+        tip_link(
+            format!("idle-{}", p.name),
+            logic::idle_close_label(p.idle_close),
+            "Close this place's Studio after this many minutes with nothing happening in it, and stop the server unless it autostarts. Unsaved changes in that Studio are lost. Empty or 0 turns it off.",
+        )
+        .on_click(on_click(&p.name, cx, |this, name, window, cx| {
+            let minutes = this.project(name).and_then(|p| p.idle_close).map(|m| m.to_string()).unwrap_or_default();
+            this.edit(name, Field::IdleClose, minutes, window, cx);
+        }))
+        .into_any_element()
+    });
+
     let links = div()
         .flex()
         .flex_wrap()
@@ -287,14 +300,33 @@ pub fn render(
         )
         .child(place)
         .when_some(p.place.as_ref(), |d, place| {
+            let (label, tip) = match p.studio_hidden {
+                true => ("Show Studio", "An agent opened this place in a hidden Studio. Show its window.".to_string()),
+                false => ("Open Studio", format!("Open {} in Roblox Studio", place.describe())),
+            };
+            d.child(tip_link(format!("studio-{}", p.name), label, tip).on_click(on_click(
+                &p.name,
+                cx,
+                |this, name, _, cx| {
+                    let shown = this.project(name).is_some_and(|p| p.studio_hidden);
+                    let name = name.to_string();
+                    this.run(cx, move |engine| engine.open_studio(&name, false), move |this, place: PlaceLink, cx| {
+                        let verb = if shown { "Showing" } else { "Opening" };
+                        this.notify(format!("{verb} {} in Roblox Studio", place.describe()), cx)
+                    });
+                },
+            )))
+            // Shown while it is set or the place is open, so the links of other rows fit one line.
+            .when(p.idle_close.is_some() || p.studio_open, |d| d.child(idle_close))
+        })
+        .when(p.studio_open, |d| {
             d.child(
-                tip_link(format!("studio-{}", p.name), "Open Studio", format!("Open {} in Roblox Studio", place.describe()))
-                    .on_click(on_click(&p.name, cx, |this, name, _, cx| {
-                        let name = name.to_string();
-                        this.run(cx, move |engine| engine.open_studio(&name), |this, place: PlaceLink, cx| {
-                            this.notify(format!("Opening {} in Roblox Studio", place.describe()), cx)
-                        });
-                    })),
+                tip_link(
+                    format!("pull-{}", p.name),
+                    "Pull",
+                    "Write what Studio has for this project's synced folders into its files. Shows the changes first.",
+                )
+                .on_click(on_click(&p.name, cx, |this, name, _, cx| this.pull(name, cx))),
             )
         })
         .children(logic::visible_badges(&p.badges, &snapshot.settings).into_iter().map(|badge| {
@@ -454,6 +486,18 @@ pub(super) fn commit(view: &mut MainView, name: &str, field: Field, text: String
                 );
             }
         },
+        Field::IdleClose => match logic::parse_idle_close(&text) {
+            Err(error) => view.notify(error, cx),
+            Ok(minutes) if (minutes > 0).then_some(minutes) == project.idle_close => {}
+            Ok(minutes) => {
+                let update = Update { idle_close: Some(minutes), ..Update::default() };
+                let label = match minutes {
+                    0 => format!("{name}: its Studio stays open when idle"),
+                    _ => format!("{name}: its Studio closes after {minutes} min idle"),
+                };
+                view.run(cx, move |engine| engine.update(&name, update), move |view, _, cx| view.notify(label, cx));
+            }
+        },
         Field::Place => {
             if text.eq_ignore_ascii_case(&logic::place_text(project.place.as_ref())) {
                 return;
@@ -513,7 +557,9 @@ impl MainView {
             match action {
                 GroupAction::Start => self.run(cx, move |engine| engine.start_server(&name), |_, (), _| {}),
                 GroupAction::Stop => self.run(cx, move |engine| engine.stop_server(&name), |_, (), _| {}),
-                GroupAction::Open => self.run(cx, move |engine| engine.open_studio(&name), |_, _: PlaceLink, _| {}),
+                GroupAction::Open => {
+                    self.run(cx, move |engine| engine.open_studio(&name, false), |_, _: PlaceLink, _| {})
+                }
             }
         }
     }
@@ -537,6 +583,35 @@ impl MainView {
         let name = name.to_string();
         let label = format!("{name}: {label} {}", if value { "on" } else { "off" });
         self.run(cx, move |engine| engine.update(&name, update), move |view, _, cx| view.notify(label, cx));
+    }
+
+    /// Pull Studio's synced instances into the project's files: list the changes, then ask.
+    fn pull(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        let project = name.clone();
+        self.notify(format!("{name}: reading Studio..."), cx);
+        self.run(
+            cx,
+            move |engine| engine.pull(&project, true),
+            move |view, preview, cx| {
+                let Some(message) = logic::pull_question(&name, &preview) else {
+                    let nothing = match preview.missing.is_empty() {
+                        true => "Studio and the files already match".to_string(),
+                        false => format!("nothing to write. Not in Studio, left alone: {}", preview.missing.join(", ")),
+                    };
+                    return view.notify(format!("{name}: {nothing}"), cx);
+                };
+                let on_confirm = Box::new(move |view: &mut MainView, cx: &mut Context<MainView>| {
+                    let project = name.clone();
+                    view.run(
+                        cx,
+                        move |engine| engine.pull(&project, false),
+                        move |view, pulled, cx| view.notify(format!("{name}: {}", logic::pull_summary(&pulled)), cx),
+                    );
+                });
+                view.ask(Confirm { title: "Pull from Studio", message, label: "Pull", danger: false, on_confirm }, cx);
+            },
+        );
     }
 
     fn open_logs(&mut self, name: &str, cx: &mut Context<Self>) {

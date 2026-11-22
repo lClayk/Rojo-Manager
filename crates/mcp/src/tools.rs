@@ -60,11 +60,18 @@ pub fn specs(studio_tools: bool) -> Value {
             "name": "open_place",
             "description": "Open a Roblox place in Studio and wait until its Rojo Manager bridge reports in. Pass a project \
                 to use its linked place, or a place ID or link. Passing both links that place to the \
-                project. connect_rojo also starts the project's server and connects the Rojo plugin.",
+                project. connect_rojo also starts the project's server and connects the Rojo plugin. hidden true \
+                opens the project's place without showing a Studio window (Windows only), for work the user does \
+                not need to watch; on a place that is already open, hidden true hides its window and false shows \
+                it. idle_close sets how many minutes of nothing happening in that Studio close it again.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "project": {"type": "string", "description": "Project name"},
                 "place": {"type": "string", "description": "Place ID, game link, Creator Hub link, or local"},
-                "connect_rojo": {"type": "boolean", "default": false}}},
+                "connect_rojo": {"type": "boolean", "default": false},
+                "hidden": {"type": "boolean", "description": "Hide or show the Studio window; needs project. \
+                    Omit to open visible and leave an open Studio as it is."},
+                "idle_close": {"type": "integer", "minimum": 0, "maximum": 10080, "description": "Minutes; saved on \
+                    the project, 0 turns it off. Change it later with manage_project update."}}},
         },
         {
             "name": "rojo_session",
@@ -73,12 +80,23 @@ pub fn specs(studio_tools: bool) -> Value {
                 Rojo's initial sync confirmation. Before Rojo removes instances that exist only in Studio, \
                 Rojo Manager backs them up: backups lists them, newest first, and restore puts one back \
                 (the newest, or backup) under its old parents in the open place. Rojo removes restored \
-                instances again on its next sync unless the project ignores them.",
+                instances again on its next sync unless the project ignores them. pull goes the other way: it \
+                writes what Studio has for the folders the project syncs into the project's files with rojo \
+                syncback, and answers the files written and removed; preview true only lists them. Use it \
+                after edits made in Studio, such as UI built there. Studio's version wins: files for \
+                instances Studio does not have are removed, so preview first when the files may be newer \
+                than Studio, such as while Rojo waits to confirm its sync. The project file itself is not \
+                changed. A script with children is listed when something under it changed, even if its own \
+                source did not. While files are written, the project's server is stopped and Rojo in that \
+                Studio disconnected; both come back after, and rojo in the answer is Rojo's state when that \
+                is not Connected.",
             "inputSchema": {"type": "object", "required": ["project", "action"], "additionalProperties": false,
                 "properties": {"project": {"type": "string", "description": "Project name"},
                     "action": {"type": "string",
-                        "enum": ["connect", "disconnect", "status", "accept", "abort", "backups", "restore"]},
+                        "enum": ["connect", "disconnect", "status", "accept", "abort", "backups", "restore", "pull"]},
                     "backup": {"type": "string", "description": "For restore: a backup id from backups"},
+                    "preview": {"type": "boolean", "default": false, "description": "For pull: list the changes \
+                        without writing them"},
                     "wait": {"type": "boolean", "default": true, "description": "For connect: return once Rojo \
                         connects, asks to confirm the initial sync, or fails, up to 30 seconds"}}},
         },
@@ -90,13 +108,17 @@ pub fn specs(studio_tools: bool) -> Value {
                 Studio, starts its server, connects Rojo, and accepts the first sync. A local place has no \
                 DataStores and none of the published place's Studio-built content. A lane stays across Rojo \
                 Manager restarts until remove, which force-closes its Studio (unsaved changes there are lost), \
-                stops the server, and deletes the place, or until its folder is deleted.",
+                stops the server, and deletes the place, or until its folder is deleted. hidden and idle_close \
+                work as in open_place.",
             "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": false, "properties": {
                 "action": {"type": "string", "enum": ["create", "remove"]},
                 "from": {"type": "string", "description": "Project to make the lane from, for create"},
                 "path": {"type": "string", "description": "Absolute folder of the lane's copy, for create"},
                 "lane": {"type": "string", "description": "Lane name, for remove"},
-                "holder": {"type": "string", "description": "A label shown in Rojo Manager, such as \"lane B\", for create"}}},
+                "holder": {"type": "string", "description": "A label shown in Rojo Manager, such as \"lane B\", for create"},
+                "hidden": {"type": "boolean", "description": "For create: open its Studio without a window (Windows only)"},
+                "idle_close": {"type": "integer", "minimum": 0, "maximum": 10080, "description": "For create: minutes \
+                    of nothing happening in its Studio after which it closes; the lane stays"}}},
         },
         {
             "name": "server_logs",
@@ -117,7 +139,9 @@ pub fn specs(studio_tools: bool) -> Value {
                 and all, becomes its local place. Both add the project with a local place and auto_connect. update \
                 changes any of name, port, autostart, auto_connect (connect Rojo when the linked place \
                 opens in Studio while the server runs), sourcemap (keep sourcemap.json current with rojo \
-                sourcemap --watch while the server runs), and place (a place ID or link, local for an unpublished \
+                sourcemap --watch while the server runs), idle_close (minutes of nothing happening in the place's \
+                Studio after which Rojo Manager closes it, losing unsaved changes there, and stops the server \
+                unless it autostarts; 0 turns it off), and place (a place ID or link, local for an unpublished \
                 place file built from the project, or \"\" to unlink). \
                 Renaming or changing the port needs the server stopped. remove drops the project from \
                 the list, stopping its server; its files are kept, except a local place file.",
@@ -131,6 +155,7 @@ pub fn specs(studio_tools: bool) -> Value {
                 "autostart": {"type": "boolean", "description": "Start the server when Rojo Manager opens"},
                 "auto_connect": {"type": "boolean"},
                 "sourcemap": {"type": "boolean"},
+                "idle_close": {"type": "integer", "minimum": 0, "maximum": 10080},
                 "place": {"type": "string"}}},
         },
         {
@@ -201,12 +226,19 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         "open_place" => {
             let project = optional_string(args, "project")?;
             let place = optional_string(args, "place")?;
-            text(&open_place(backend, project, place, args.get("connect_rojo") == Some(&Value::Bool(true)))?)
+            let connect_rojo = args.get("connect_rojo") == Some(&Value::Bool(true));
+            text(&open_place(backend, project, place, connect_rojo, StudioOptions::read(args)?)?)
         }
         "rojo_session" => {
-            let choices = ["connect", "disconnect", "status", "accept", "abort", "backups", "restore"];
+            let choices = ["connect", "disconnect", "status", "accept", "abort", "backups", "restore", "pull"];
             let (project, action) = project_action(backend, args, &choices)?;
             match action {
+                "pull" => {
+                    let body = json!({ "preview": args.get("preview") == Some(&Value::Bool(true)) });
+                    // syncback reads the whole place
+                    let timeout = Duration::from_secs(300);
+                    text(&call(backend, "POST", &["projects", &project, "pull"], Some(&body), timeout)?)
+                }
                 "backups" => text(&call(backend, "GET", &["projects", &project, "backups"], None, CALL_TIMEOUT)?),
                 "restore" => {
                     let body = match optional_string(args, "backup")? {
@@ -259,6 +291,8 @@ struct Project {
     sourcemap: bool,
     #[serde(default)]
     lane: Option<Lane>,
+    #[serde(default)]
+    idle_close: Option<u32>,
     /// Its last output lines.
     #[serde(default)]
     log: Vec<String>,
@@ -291,6 +325,9 @@ struct Brief {
     sourcemap: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane: Option<Lane>,
+    /// Minutes of nothing happening in its Studio after which Rojo Manager closes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_close: Option<u32>,
     /// Only in list_projects, when the linked place is open in Studio.
     #[serde(skip_serializing_if = "Option::is_none")]
     studio: Option<StudioPlace>,
@@ -312,6 +349,7 @@ impl From<Project> for Brief {
             auto_connect: project.auto_connect,
             sourcemap: project.sourcemap,
             lane: project.lane,
+            idle_close: project.idle_close,
             studio: None,
         }
     }
@@ -465,6 +503,9 @@ fn blank(value: &Option<String>) -> bool {
 struct StudioPlace {
     #[serde(rename = "instanceId")]
     instance_id: String,
+    /// Its window is hidden; open_place with hidden false shows it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    hidden: bool,
     rojo: Rojo,
 }
 
@@ -477,6 +518,9 @@ struct Instance {
     /// The name of an unpublished place, a local place's file name, from bridges since version 9.
     #[serde(default)]
     place_name: Option<String>,
+    /// Its Studio window is hidden.
+    #[serde(default)]
+    hidden: bool,
     #[serde(default)]
     rojo: Rojo,
 }
@@ -503,9 +547,12 @@ fn studio_instances(backend: &dyn Backend) -> Result<Option<Vec<Instance>>, Stri
     Ok((installed || !instances.is_empty()).then_some(instances))
 }
 
-/// The open Studio window with this place, if any.
-fn find_instance(instances: &[Instance], place: &PlaceLink) -> Option<String> {
-    instances.iter().find(|instance| instance.has(place)).map(|instance| instance.instance_id.clone())
+/// The open Studio window with this place, if any: its instanceId, and whether its window is hidden.
+fn find_instance(instances: &[Instance], place: &PlaceLink) -> Option<(String, bool)> {
+    instances
+        .iter()
+        .find(|instance| instance.has(place))
+        .map(|instance| (instance.instance_id.clone(), instance.hidden))
 }
 
 /// Run a Rojo plugin action through the bridge in one Studio window.
@@ -541,7 +588,7 @@ fn place_instance(backend: &dyn Backend, project: &Project) -> Result<String, St
         return Err(format!("{} has no linked place. Link one with open_place (project and place).", project.name));
     };
     let instances = studio_instances(backend)?.ok_or(BRIDGE_MISSING)?;
-    find_instance(&instances, place).ok_or_else(|| {
+    find_instance(&instances, place).map(|(instance_id, _)| instance_id).ok_or_else(|| {
         let mut message = place.describe();
         message[..1].make_ascii_uppercase();
         format!("{message} is not open in Studio, or its Rojo Manager bridge is not loaded. Use open_place first.")
@@ -631,6 +678,9 @@ struct Opened {
     instance_id: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     opened: bool,
+    /// The Studio window is hidden.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    hidden: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -639,19 +689,49 @@ struct Opened {
     next: Option<String>,
 }
 
+/// How open_place and lane create open Studio.
+#[derive(Debug, Clone, Copy, Default)]
+struct StudioOptions {
+    /// Hide (true) or show (false) the Studio window. None opens visible and leaves an open one as it is.
+    hidden: Option<bool>,
+    /// The project's idle close in minutes; 0 turns it off.
+    idle_close: Option<u64>,
+}
+
+impl StudioOptions {
+    fn read(args: &Args) -> Result<StudioOptions, String> {
+        let hidden = match args.get("hidden") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_bool().ok_or("hidden must be true or false")?),
+        };
+        let idle_close = match args.get("idle_close") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or("idle_close must be a number of minutes, 0 for off")?),
+        };
+        Ok(StudioOptions { hidden, idle_close })
+    }
+}
+
 /// open_place: reuses a Studio that already has the place open, otherwise opens it and waits up to
 /// 3 minutes for its bridge to report in. Rojo Manager opens a local place itself, building it first
-/// when its file is missing.
+/// when its file is missing, and opens, hides, and shows a Studio whose window is to be hidden.
 fn open_place(
     backend: &dyn Backend,
     project_name: Option<String>,
     place_text: Option<String>,
     connect_rojo: bool,
+    options: StudioOptions,
 ) -> Result<Opened, String> {
     let mut project = project_name.map(|name| find_project(backend, &name)).transpose()?;
+    if project.is_none() && (options.hidden.is_some() || options.idle_close.is_some()) {
+        return Err("hidden and idle_close need a project, which Rojo Manager keeps them for.".into());
+    }
     if let (Some(found), Some(text)) = (&project, &place_text) {
         let linked = act(backend, &found.name, "link-place", Some(&json!({ "place": text })))?;
         project = Some(linked);
+    }
+    if let (Some(found), Some(minutes)) = (&project, options.idle_close) {
+        project = Some(act(backend, &found.name, "update", Some(&json!({ "idleClose": minutes })))?);
     }
     let place = match (&project, &place_text) {
         (Some(project), _) => project
@@ -676,18 +756,30 @@ fn open_place(
     }
 
     let instances = studio_instances(backend)?;
-    let mut instance_id = instances.as_deref().and_then(|instances| find_instance(instances, &place));
-    let opened = instance_id.is_none();
-    if opened {
-        match (&place, &project) {
-            (PlaceLink::Published(published), _) => {
+    let mut instance = instances.as_deref().and_then(|instances| find_instance(instances, &place));
+    let opened = instance.is_none();
+    // Rojo Manager opens the place hidden, or shows or hides the Studio that has it open.
+    let name = project.as_ref().map(|project| project.name.clone()).unwrap_or_default();
+    let set_hidden = |hidden: bool| {
+        call(backend, "POST", &["projects", &name, "open-studio"], Some(&json!({ "hidden": hidden })), BUILD_TIMEOUT)
+    };
+    match (&instance, options.hidden) {
+        (Some((_, shown)), Some(hidden)) if *shown != hidden => {
+            set_hidden(hidden)?;
+            instance = instance.map(|(instance_id, _)| (instance_id, hidden));
+        }
+        (None, Some(hidden)) => drop(set_hidden(hidden)?),
+        (None, None) => match &place {
+            PlaceLink::Published(published) => {
                 backend.open_place(published).map_err(|error| format!("Could not open Roblox Studio: {error}"))?
             }
-            (PlaceLink::Local(_), project) => {
-                let name = project.as_ref().map(|project| project.name.as_str()).unwrap_or_default();
-                call(backend, "POST", &["projects", name, "open-studio"], None, BUILD_TIMEOUT)?;
+            PlaceLink::Local(_) => {
+                drop(call(backend, "POST", &["projects", &name, "open-studio"], None, BUILD_TIMEOUT)?)
             }
-        }
+        },
+        (Some(_), _) => {}
+    }
+    if opened {
         if instances.is_none() {
             let mut note = "The Rojo Manager bridge is not installed, so the opened place cannot be confirmed.";
             if let Some(project) = project.filter(|_| connect_rojo) {
@@ -700,32 +792,42 @@ fn open_place(
                 place_file,
                 instance_id: None,
                 opened,
+                hidden: false,
                 note: Some(note),
                 rojo: None,
                 next: None,
             });
         }
         let deadline = Instant::now() + Duration::from_secs(180);
-        while instance_id.is_none() && Instant::now() < deadline {
+        while instance.is_none() && Instant::now() < deadline {
             backend.sleep(Duration::from_secs(2));
             let instances = studio_instances(backend)?.unwrap_or_default();
-            instance_id = find_instance(&instances, &place);
+            instance = find_instance(&instances, &place);
         }
-        if instance_id.is_none() {
+        if instance.is_none() {
             let hint = match place {
                 PlaceLink::Published(_) => "",
                 PlaceLink::Local(_) => {
                     " A local place needs bridge version 9 or newer: check and install it with the updates tool."
                 }
             };
+            // Whatever keeps a hidden Studio from loading, such as a dialog, should be seen.
+            let shown = match options.hidden == Some(true) && set_hidden(false).is_ok() {
+                true => " Its window is shown now, in case a dialog there needs an answer.",
+                false => "",
+            };
             return Err(format!(
                 "Studio was asked to open {}, but its Rojo Manager bridge did not report in within 3 minutes. Check \
-                 that the Creator Store Rojo is off, so the bridge's Rojo loads.{hint}",
+                 that the Creator Store Rojo is off, so the bridge's Rojo loads.{hint}{shown}",
                 place.describe()
             ));
         }
     }
-    let mut result = Opened { place_id, place_file, instance_id, opened, note: None, rojo: None, next: None };
+    let (instance_id, hidden) = instance.unzip();
+    let hidden = hidden.unwrap_or(false);
+    let note = (options.hidden == Some(true) && !hidden)
+        .then_some("Studio's window could not be hidden here (hiding is Windows only), so it is open and visible.");
+    let mut result = Opened { place_id, place_file, instance_id, opened, hidden, note, rojo: None, next: None };
     if let Some(project) = project.filter(|_| connect_rojo) {
         let session = run_session(backend, &project.name, "connect", true)?;
         result.instance_id = Some(session.instance_id);
@@ -755,7 +857,11 @@ fn list_projects(backend: &dyn Backend) -> Result<ProjectList, String> {
                 let index = instances.iter().position(|instance| instance.has(&place))?;
                 Some(instances.swap_remove(index))
             });
-            item.studio = open.map(|instance| StudioPlace { instance_id: instance.instance_id, rojo: instance.rojo });
+            item.studio = open.map(|instance| StudioPlace {
+                instance_id: instance.instance_id,
+                hidden: instance.hidden,
+                rojo: instance.rojo,
+            });
             item
         })
         .collect();
@@ -869,9 +975,10 @@ fn server_logs(backend: &dyn Backend, args: &Args) -> Result<Logs, String> {
 
 /// Tool argument names, mapped to the fields Rojo Manager stores. Sorted by stored name, so request
 /// bodies are identical whether or not serde_json's `preserve_order` is unified in (GPUI enables it).
-const PROJECT_FIELDS: [(&str, &str); 6] = [
+const PROJECT_FIELDS: [(&str, &str); 7] = [
     ("auto_connect", "autoConnect"),
     ("autostart", "autostart"),
+    ("idle_close", "idleClose"),
     ("name", "name"),
     ("place", "place"),
     ("port", "port"),
@@ -955,8 +1062,9 @@ fn lane(backend: &dyn Backend, args: &Args) -> Result<LaneResult, String> {
         body["holder"] = json!(holder);
     }
     body["path"] = json!(path);
+    let options = StudioOptions::read(args)?;
     let name = field::<Project>(call(backend, "POST", &["lanes"], Some(&body), CALL_TIMEOUT)?, "project")?.name;
-    let opened = open_place(backend, Some(name.clone()), None, true).and_then(|mut opened| {
+    let opened = open_place(backend, Some(name.clone()), None, true, options).and_then(|mut opened| {
         if opened.instance_id.is_none() {
             return Err(format!("{BRIDGE_MISSING} A lane needs it to sync its Studio."));
         }
@@ -1125,7 +1233,7 @@ mod tests {
             r#"{"project":{"name":"TestGame","state":"off","port":34879,"placeId":2,"auto_connect":true}}"#
         );
         assert_eq!(json_text(&removed), r#"{"removed":"TestGame"}"#);
-        assert_eq!(error, "Pass at least one of: auto_connect, autostart, name, place, port, sourcemap");
+        assert_eq!(error, "Pass at least one of: auto_connect, autostart, idle_close, name, place, port, sourcemap");
         assert_eq!(
             fake.calls(),
             [
@@ -1326,7 +1434,8 @@ mod tests {
             instances: studio_open(),
             ..Fake::default()
         };
-        let opened = open_place(&fake, Some("TestGame".into()), Some("https://www.roblox.com/games/2".into()), false);
+        let link = Some("https://www.roblox.com/games/2".into());
+        let opened = open_place(&fake, Some("TestGame".into()), link, false, StudioOptions::default());
         assert_eq!(json_text(&opened.unwrap()), r#"{"placeId":2,"instanceId":"7"}"#);
         assert_eq!(
             fake.calls(),
@@ -1337,14 +1446,16 @@ mod tests {
     #[test]
     fn open_place_opens_studio_when_the_place_is_not_open() {
         let fake = Fake { instances: no_bridge(), ..Fake::default() };
-        let opened = open_place(&fake, None, Some("2".into()), false).unwrap();
+        let opened = open_place(&fake, None, Some("2".into()), false, StudioOptions::default()).unwrap();
         assert_eq!(
             json_text(&opened),
             r#"{"placeId":2,"opened":true,"note":"The Rojo Manager bridge is not installed, so the opened place cannot be confirmed."}"#
         );
         assert_eq!(fake.calls(), ["resolve 2", "GET projects", "open 2"]);
-        let error = open_place(&fake, None, Some("2".into()), true).unwrap_err();
+        let error = open_place(&fake, None, Some("2".into()), true, StudioOptions::default()).unwrap_err();
         assert_eq!(error, "connect_rojo needs a project, so Rojo Manager knows which server to use.");
+        let hidden = StudioOptions { hidden: Some(true), idle_close: None };
+        assert!(open_place(&fake, None, Some("2".into()), false, hidden).unwrap_err().contains("need a project"));
 
         // connect_rojo without the bridge still starts the server, and says Rojo is not connected.
         let fake = Fake {
@@ -1352,7 +1463,7 @@ mod tests {
             instances: no_bridge(),
             ..Fake::default()
         };
-        let opened = open_place(&fake, Some("TestGame".into()), None, true).unwrap();
+        let opened = open_place(&fake, Some("TestGame".into()), None, true, StudioOptions::default()).unwrap();
         assert!(opened.opened && opened.note.unwrap().contains("Rojo was not connected"));
         assert!(fake.calls().contains(&r#"POST projects/TestGame/start {"wait":true}"#.to_string()));
     }
@@ -1382,9 +1493,23 @@ mod tests {
             instances: studio_open(),
             ..Fake::default()
         };
-        let opened = open_place(&fake, Some("TestGame".into()), None, false).unwrap();
-        assert_eq!(json_text(&opened), r#"{"placeId":2,"instanceId":"7"}"#);
+        let open = |options| open_place(&fake, Some("TestGame".into()), None, false, options).unwrap();
+        assert_eq!(json_text(&open(StudioOptions::default())), r#"{"placeId":2,"instanceId":"7"}"#);
         assert_eq!(fake.calls(), ["GET projects"]);
+        // Showing a Studio that is shown asks for nothing; hiding it goes through Rojo Manager, as
+        // does the idle close, which is saved on the project first.
+        open(StudioOptions { hidden: Some(false), idle_close: None });
+        assert_eq!(fake.calls().len(), 2);
+        let hidden = open(StudioOptions { hidden: Some(true), idle_close: Some(30) });
+        assert_eq!(json_text(&hidden), r#"{"placeId":2,"instanceId":"7","hidden":true}"#);
+        assert_eq!(
+            fake.calls()[2..],
+            [
+                "GET projects",
+                r#"POST projects/TestGame/update {"idleClose":30}"#,
+                r#"POST projects/TestGame/open-studio {"hidden":true}"#
+            ]
+        );
     }
 
     #[test]
@@ -1399,10 +1524,10 @@ mod tests {
             instances: Script::new([json!({"bridge": true, "instances": []}), open]),
             ..Fake::default()
         };
-        let opened = open_place(&fake, Some("TestGame".into()), None, false).unwrap();
+        let opened = open_place(&fake, Some("TestGame".into()), None, false, StudioOptions::default()).unwrap();
         assert_eq!(json_text(&opened), r#"{"placeFile":"TestGame-1a2b3c4d.rbxl","instanceId":"9","opened":true}"#);
         assert_eq!(fake.calls(), ["GET projects", "POST projects/TestGame/open-studio"]);
-        let error = open_place(&fake, None, Some("local".into()), false).unwrap_err();
+        let error = open_place(&fake, None, Some("local".into()), false, StudioOptions::default()).unwrap_err();
         assert_eq!(error, "A local place is built from a project. Pass the project too.");
     }
 

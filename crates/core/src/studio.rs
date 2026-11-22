@@ -2,7 +2,6 @@
 //! link the Creator Hub's Edit in Studio button uses.
 
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -145,22 +144,6 @@ pub fn launch_uri(place: &Place) -> String {
 /// Hand the place to Studio. Errors when Studio is not installed.
 pub fn open_place(place: &Place) -> io::Result<()> {
     crate::shell::open(&launch_uri(place))
-}
-
-/// Force-close the Studio windows that have this place file open, whose titles start with its path.
-/// Returns how many closed, or which one would not. Windows only: elsewhere the window stays open.
-pub fn close_place_file(path: &Path) -> Result<usize, String> {
-    let studio = crate::executable("RobloxStudioBeta");
-    let owners = crate::localnet::window_owners(&format!("{} - ", path.display()));
-    let studios = owners
-        .into_iter()
-        .filter(|pid| crate::localnet::process_name(*pid).is_some_and(|name| name.eq_ignore_ascii_case(&studio)));
-    let mut closed = 0;
-    for pid in studios {
-        crate::localnet::kill_process(pid).map_err(|e| format!("Could not close Studio (process {pid}): {e}"))?;
-        closed += 1;
-    }
-    Ok(closed)
 }
 
 #[cfg(test)]
