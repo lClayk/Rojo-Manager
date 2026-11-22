@@ -1363,30 +1363,6 @@ impl Engine {
         }
     }
 
-    /// The live Studio window an instanceId names, with its process.
-    fn instance_process(&self, instance: &str) -> Result<(u64, u32), ControlError> {
-        let state = self.lock();
-        let id = instance.parse::<u64>().ok();
-        let report =
-            id.and_then(|id| Some((id, state.bridges.get(&id).filter(|report| self.bridge_live(id, report))?)));
-        let (id, report) =
-            report.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
-        let pid = report.pid.ok_or_else(|| ControlError::new("That Studio's process could not be found.", 409))?;
-        Ok((id, pid))
-    }
-
-    /// Hide or show one Studio's windows. A hidden Studio keeps running, with its plugins.
-    pub fn set_instance_hidden(&self, instance: &str, hide: bool) -> Result<Value, ControlError> {
-        let (id, pid) = self.instance_process(instance)?;
-        studio_process::set_hidden(pid, hide).map_err(|e| ControlError::new(e, 409))?;
-        if let Some(report) = self.lock().bridges.get_mut(&id) {
-            report.hidden = hide;
-            report.active = Instant::now();
-        }
-        self.changed();
-        Ok(json!({ "instanceId": instance, "hidden": hide }))
-    }
-
     /// The Studio processes that have this project's place open: those whose bridge reports it, the
     /// one it was opened hidden in, and on Windows those whose window title starts with a local
     /// place's path, which covers a Studio whose bridge has not loaded.
@@ -2823,9 +2799,6 @@ impl ControlHandler for Control {
         if action == "output" {
             let (since, count, level) = parse_output_query(body)?;
             return self.0.studio_output(instance, since, level, count);
-        }
-        if matches!(action, "show" | "hide") {
-            return self.0.set_instance_hidden(instance, action == "hide");
         }
         let valid = match action {
             "status" | "disconnect" | "accept" | "abort" => true,
