@@ -2026,7 +2026,8 @@ impl Engine {
     }
 
     /// Stop the project's server if it runs, then drop the project. Its folder is kept, but its local
-    /// place file goes with it, and a lane's Studio window is closed first.
+    /// place file goes with it. A lane's Studio window is closed first; another project's Studio stays
+    /// open, and is shown when it was hidden.
     pub fn remove(&self, name: &str) -> Result<(), String> {
         let lane = self.lock().config.project(name).is_some_and(|p| p.lane.is_some());
         match lane {
@@ -2076,10 +2077,16 @@ impl Engine {
     }
 
     fn remove_project(&self, name: &str) -> Result<(), String> {
-        let (busy, port) = {
+        let (busy, port, project) = {
             let state = self.lock();
-            (state.busy(name), state.port(name)?)
+            (state.busy(name), state.port(name)?, state.config.project(name).cloned())
         };
+        // A hidden Studio is shown first: without its project, nothing is left to show it.
+        for pid in project.iter().flat_map(|project| self.place_processes(project)) {
+            if studio_process::hidden(pid) == Some(true) {
+                let _ = studio_process::set_hidden(pid, false);
+            }
+        }
         if busy || port_in_use(port) {
             self.stop(name);
         }
