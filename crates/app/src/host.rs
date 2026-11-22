@@ -364,8 +364,8 @@ pub fn run(launch: Launch) {
     let app_dir =
         std::env::current_exe().ok().and_then(|exe| exe.parent().map(|dir| dir.to_path_buf())).unwrap_or_default();
     updates::remove_replaced(&app_dir);
-    // Dev builds leave the shortcut to the copy people actually use.
-    if !cfg!(debug_assertions) {
+    // Dev builds and isolated profiles leave the shortcut to the copy people actually use.
+    if !cfg!(debug_assertions) && rojo_manager_core::config::isolated_dir().is_none() {
         std::thread::spawn(rojo_manager_core::startup::add_to_start_menu);
     }
     let sink: Sink = Arc::default();
