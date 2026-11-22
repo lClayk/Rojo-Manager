@@ -601,15 +601,18 @@ impl MainView {
                     };
                     return view.notify(format!("{name}: {nothing}"), cx);
                 };
+                // Removing files is the part a pull cannot take back.
+                let danger = !preview.removed.is_empty();
                 let on_confirm = Box::new(move |view: &mut MainView, cx: &mut Context<MainView>| {
                     let project = name.clone();
+                    view.notify(format!("{name}: writing files..."), cx);
                     view.run(
                         cx,
                         move |engine| engine.pull(&project, false),
                         move |view, pulled, cx| view.notify(format!("{name}: {}", logic::pull_summary(&pulled)), cx),
                     );
                 });
-                view.ask(Confirm { title: "Pull from Studio", message, label: "Pull", danger: false, on_confirm }, cx);
+                view.ask(Confirm { title: "Pull from Studio", message, label: "Pull", danger, on_confirm }, cx);
             },
         );
     }
