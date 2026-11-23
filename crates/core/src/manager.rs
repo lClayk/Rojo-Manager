@@ -759,7 +759,7 @@ impl Engine {
             sourcemap: p.sourcemap,
             lane: p.lane.clone(),
             pending_sync: state.pending_sync(p),
-            idle_close: p.idle_close,
+            idle_close: p.idle_close.filter(|_| state.config.settings.idle_close),
             studio_open: state.place_bridges(p).next().is_some(),
             studio_hidden: state.place_bridges(p).any(|(_, report)| report.hidden),
             backups: state.backups.get(&p.name).cloned().unwrap_or_default(),
@@ -1225,12 +1225,13 @@ impl Engine {
                 (false, before, reported) => before.or(reported).unwrap_or(now),
             };
             let closing = before.is_some_and(|report| report.closing);
+            let idle_close = state.config.settings.idle_close;
             let project = state
                 .config
                 .projects
                 .iter()
                 .find(|p| p.place.as_ref().is_some_and(|place| place.matches(place_id, place_name.as_deref())))
-                .map(|p| (p.name.clone(), p.idle_close));
+                .map(|p| (p.name.clone(), p.idle_close.filter(|_| idle_close)));
             // The bridge names the process from here on, so the one remembered from opening the
             // place hidden is dropped before that number can come to mean another Studio.
             if let (Some(_), Some((name, _))) = (pid, &project) {
@@ -1784,6 +1785,9 @@ impl Engine {
         if project.lane.is_some() && !matches!(linked, Some(PlaceLink::Local(_))) {
             return Err("A lane keeps its local place.".into());
         }
+        if update.idle_close.is_some_and(|minutes| minutes > 0) && !state.config.settings.idle_close {
+            return Err("Idle close is turned off in Rojo Manager's Settings, which only the user changes.".into());
+        }
         if update.idle_close.is_some_and(|minutes| minutes > config::MAX_IDLE_CLOSE) {
             return Err(format!("Idle close is at most {} minutes; 0 turns it off.", config::MAX_IDLE_CLOSE));
         }
@@ -2092,6 +2096,7 @@ impl Engine {
         }
         let mut state = self.lock();
         let place = state.config.project(name).and_then(local_place);
+        let remove_recovery = state.config.settings.remove_recovery;
         let mut config = state.config.clone();
         config.projects.retain(|p| p.name != name);
         config::save(&config)?;
@@ -2103,7 +2108,9 @@ impl Engine {
         if let Some(path) = place {
             let _ = std::fs::remove_file(format!("{}.lock", path.display()));
             // A Studio closed by force leaves auto-recovery copies of the place behind.
-            studio_process::remove_recovery(&path);
+            if remove_recovery {
+                studio_process::remove_recovery(&path);
+            }
             let _ = std::fs::remove_file(path);
         }
         self.changed();
@@ -2762,6 +2769,12 @@ impl ControlHandler for Control {
                 if !value.is_boolean() {
                     return Err(ControlError::bad(format!("{key} must be true or false")));
                 }
+                if key == "idle_close" {
+                    return Err(ControlError::new(
+                        "idle_close is the user's to change, in Rojo Manager's Settings.",
+                        403,
+                    ));
+                }
             }
             for (key, value) in changes {
                 self.0.set_setting(key, value.as_bool() == Some(true)).map_err(|e| ControlError::new(e, 500))?;
@@ -3108,8 +3121,9 @@ mod tests {
         assert_eq!(pending(), None);
     }
 
-    #[test]
-    fn an_idle_studio_with_an_old_bridge_stays_open_and_its_user_is_told_once() {
+    /// An engine with one project, linked to place 100, that closes its Studio after a minute idle,
+    /// and the alerts it raises.
+    fn idle_close_engine() -> (Arc<Engine>, Arc<Mutex<Vec<String>>>) {
         let project = config::Project {
             name: "MyGame".into(),
             path: "C:\\Games\\MyGame".into(),
@@ -3130,6 +3144,12 @@ mod tests {
                     seen.lock().unwrap().push(message);
                 }
             });
+        (engine, alerts)
+    }
+
+    #[test]
+    fn an_idle_studio_with_an_old_bridge_stays_open_and_its_user_is_told_once() {
+        let (engine, alerts) = idle_close_engine();
         // A bridge older than 13 does not say how long its Studio has been idle.
         let report = || engine.report_bridge(7, 100, None, 0, json!({}), PollExtra::default());
         report();
@@ -3140,6 +3160,27 @@ mod tests {
         report();
         assert_eq!(alerts.lock().unwrap().len(), 1);
         assert!(alerts.lock().unwrap()[0].starts_with("MyGame: its Studio looks idle but stays open"));
+    }
+
+    #[test]
+    fn idle_close_turned_off_in_settings_is_off_for_projects_and_agents() {
+        let (engine, alerts) = idle_close_engine();
+        engine.lock().config.settings.idle_close = false;
+        let report = || engine.report_bridge(7, 100, None, 0, json!({}), PollExtra::default());
+        report();
+        engine.lock().bridges.get_mut(&7).unwrap().active =
+            Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+        report();
+        // The Studio is not idle to the app, and the project shows no time.
+        assert!(alerts.lock().unwrap().is_empty());
+        assert!(!engine.lock().bridges[&7].closing);
+        assert_eq!(engine.project("MyGame").unwrap().idle_close, None);
+        // No project takes a time, and an agent cannot turn the setting back on.
+        let update = Update { idle_close: Some(5), ..Update::default() };
+        assert!(engine.update("MyGame", update).unwrap_err().starts_with("Idle close is turned off"));
+        let changes = json!({"idle_close": true});
+        let error = Control(Arc::clone(&engine)).settings(changes.as_object()).unwrap_err();
+        assert_eq!((error.status, engine.settings().idle_close), (403, false));
     }
 
     #[test]

@@ -279,6 +279,20 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
                     Some("Instances that exist only in Studio, kept 20 per project"),
                     cx,
                 ),
+                toggle(
+                    snapshot,
+                    "idle_close",
+                    "Idle close",
+                    Some("Projects may close an idle Studio. Agents cannot change this"),
+                    cx,
+                ),
+                toggle(
+                    snapshot,
+                    "remove_recovery",
+                    "Delete a removed local place's auto-recovery copies",
+                    Some("The copies Studio keeps of a place it did not close itself"),
+                    cx,
+                ),
             ]
             .into_iter()
             .chain(shortcuts.map(|(key, label, hint)| toggle(snapshot, key, label, Some(hint), cx))),
