@@ -16,6 +16,7 @@
 -- While Rojo waits for its initial sync to be confirmed, the status carries a summary of what
 -- accepting would do, so agents and the window see it before anyone accepts.
 -- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
+-- When a session starts, Rojo's reminder to connect is closed, and it stays away during the session.
 --
 -- In Edit mode and in a playtest's server it also sends Studio's Output to Rojo Manager in small
 -- batches as lines appear, so agents can read prints, warnings, and errors. A playtest's client
@@ -25,7 +26,7 @@ local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 11
+local VERSION = 12
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
@@ -56,6 +57,11 @@ local MAX_PENDING_PATHS = 20
 -- How long connect with wait waits for Rojo to connect, ask to confirm, or fail.
 local CONNECT_WAIT = 30
 local SETTLED = { Connected = true, Confirming = true, Error = true }
+-- How long ending a session waits for Rojo to finish starting it.
+local START_WAIT = 10
+-- Auto-connect sessions whose sync prompt is still to be accepted. A connect that waits does not
+-- report such a prompt, which is gone a moment later.
+local accepting = 0
 
 -- Rojo renames the DataModel to the project's name on its first sync, and a playtest's copy of the
 -- place is named "Game" without the DataModel's attributes. So the file name of a local place Rojo
@@ -166,9 +172,21 @@ local attached: { [any]: {} } = {}
 -- The attached app's Output connection.
 local outputs: { [any]: RBXScriptConnection } = {}
 
+-- The session Rojo last started, from Bridge.session. Rojo sets its own serveSession only once
+-- starting has returned, and starting shows a notification whose text it measures first. That
+-- yields, for seconds while Studio is still loading, so a session can run without it.
+local sessions: { [any]: any } = {}
+
+-- Whether Rojo is in a session, or starting one.
+local function inSession(app): boolean
+	local session = sessions[app]
+	return session ~= nil and session:getStatus() ~= "Disconnected"
+end
+
 -- Rojo's live session, if any.
 local function connected(app): boolean
-	return app.serveSession ~= nil and app.serveSession:getStatus() == "Connected"
+	local session = sessions[app]
+	return session ~= nil and session:getStatus() == "Connected"
 end
 
 -- An instance's path as Rojo Manager shows it: "Workspace.Map", or "game" for the DataModel.
@@ -305,9 +323,15 @@ local function answer(app, choice: string)
 	return status(app)
 end
 
--- End the current session. A session waiting for its sync confirmation is aborted first, so its
--- waiting thread does not resume and apply its sync when a later session is accepted.
+-- End the current session. Rojo ends only a session it has finished starting (see sessions), so
+-- one that is still starting is waited for; stopping it sooner would let it connect afterwards.
+-- A session waiting for its sync confirmation is aborted first, so its waiting thread does not
+-- resume and apply its sync when a later session is accepted.
 local function endSession(app)
+	local deadline = os.clock() + START_WAIT
+	while inSession(app) and app.serveSession ~= sessions[app] and os.clock() < deadline do
+		task.wait(0.1)
+	end
 	if (app.state or {}).appStatus == "Confirming" then
 		app.confirmationBindable:Fire("Abort")
 	end
@@ -318,6 +342,8 @@ local function endSession(app)
 		-- would fail it and put Rojo in Error. Nothing should hear from this session any more.
 		session:onStatusChanged(function() end)
 	end
+	-- Also when Rojo never finished starting it, so it does not count as a session for good.
+	sessions[app] = nil
 end
 
 -- A value as JSON can carry it; an Instance as its full name, and anything else as its text.
@@ -334,20 +360,25 @@ end
 
 local actions = {
 	status = status,
-	-- Connect Rojo to the Rojo server on this computer at args.port. With args.wait, return once Rojo
-	-- connects, asks to confirm the initial sync, or fails, instead of at once.
+	-- Connect Rojo to the Rojo server on this computer at args.port. A session Rojo already has with
+	-- that server is kept, such as the one auto-connect just started for the same place. With
+	-- args.wait, return once Rojo connects, asks to confirm the initial sync, or fails, instead of
+	-- at once.
 	connect = function(app, args)
-		endSession(app)
-		-- A stale error would read as this attempt's outcome; clear it as Rojo's Okay button does.
-		if (app.state or {}).appStatus == "Error" then
-			app:setState({ appStatus = "NotConnected" })
-		end
-		app.setHost("localhost")
-		app.setPort(tostring(args.port))
-		-- Starting can yield on the sync lock, so it runs on its own thread.
-		task.spawn(app.startSession, app)
 		local deadline = os.clock() + CONNECT_WAIT
-		while args.wait == true and not SETTLED[status(app).status] and os.clock() < deadline do
+		local port = tonumber(app.port:getValue()) or DEFAULT_PORT
+		if not inSession(app) or port ~= args.port then
+			endSession(app)
+			-- A stale error would read as this attempt's outcome; clear it as Rojo's Okay button does.
+			if (app.state or {}).appStatus == "Error" then
+				app:setState({ appStatus = "NotConnected" })
+			end
+			app.setHost("localhost")
+			app.setPort(tostring(args.port))
+			-- Starting can yield on the sync lock, so it runs on its own thread.
+			task.spawn(app.startSession, app)
+		end
+		while args.wait == true and (accepting > 0 or not SETTLED[status(app).status]) and os.clock() < deadline do
 			task.wait(0.1)
 		end
 		return status(app)
@@ -442,17 +473,19 @@ end
 
 -- Answer the sync prompt of the session auto-connect just started, once Rojo asks.
 local function acceptPrompt(app)
+	accepting += 1
 	local deadline = os.clock() + 30
 	while os.clock() < deadline do
 		local status = (app.state or {}).appStatus
 		if status == "Confirming" then
-			app.confirmationBindable:Fire("Accept")
-			return
+			answer(app, "Accept")
+			break
 		elseif connected(app) or status == "Error" then
-			return -- no prompt this time, or the connection failed
+			break -- no prompt this time, or the connection failed
 		end
 		task.wait(0.2)
 	end
+	accepting -= 1
 end
 
 -- Poll until the plugin unloads. An auto-connect offer connects only when it appears (the place
@@ -492,7 +525,7 @@ local function poll(app, token: {})
 		end
 		local offer: number? = if body and type(body.port) == "number" then body.port else nil
 		-- No session, whatever page Rojo shows (Error after a lost connection, or Settings).
-		if offer ~= nil and offer ~= offered and app.serveSession == nil then
+		if offer ~= nil and offer ~= offered and not inSession(app) then
 			actions.connect(app, { port = offer })
 			if body and body.accept == true then
 				task.spawn(acceptPrompt, app)
@@ -507,6 +540,48 @@ local function poll(app, token: {})
 		elseif os.clock() - started < 1 then
 			-- Rojo Manager is not running, or did not hold the poll.
 			task.wait(RETRY_SECONDS)
+		end
+	end
+end
+
+-- Close Rojo's reminders to connect, the notifications with a Connect button. Rojo closes its
+-- reminder when a session starts, but only one its state already holds: while a render of Rojo's
+-- waits on a text measurement, new notifications are held back, and a reminder among them stayed
+-- up for the whole session. A state update given as a function sees those too.
+local function closeReminders(app)
+	app:setState(function(state)
+		if type(state.notifications) ~= "table" then
+			return nil
+		end
+		local notifications = table.clone(state.notifications)
+		local closed = false
+		for id, notification in notifications do
+			if type(notification.actions) == "table" and notification.actions.Connect then
+				notifications[id] = nil
+				closed = true
+			end
+		end
+		return if closed then { notifications = notifications } else nil
+	end)
+	app.dismissSyncReminder = nil
+end
+
+-- Rojo 7.6 and later look for a serving server every 30 seconds and remind the user to connect.
+-- A session can start while that check runs, or while Rojo does not know of it yet (see
+-- sessions), so the reminder is skipped during a session, and closed when a session started
+-- while it was being shown.
+local function skipRemindersWhileSyncing(app)
+	local send = app.sendSyncReminder
+	if type(send) ~= "function" then
+		return
+	end
+	app.sendSyncReminder = function(self, ...)
+		if inSession(self) then
+			return
+		end
+		send(self, ...)
+		if inSession(self) then
+			closeReminders(self)
 		end
 	end
 end
@@ -591,6 +666,7 @@ function Bridge.attach(app)
 		return
 	end
 	keepPlaceName()
+	skipRemindersWhileSyncing(app)
 	forwardOutput(app, "edit")
 	local token = {}
 	attached[app] = token
@@ -601,6 +677,8 @@ end
 
 -- Called from App:startSession just before a session starts, so even its first sync is covered.
 function Bridge.session(app, serveSession)
+	sessions[app] = serveSession
+	closeReminders(app)
 	serveSession:hookPrecommit(function(patch)
 		backUpRemovals(app, patch)
 	end)
@@ -609,6 +687,7 @@ end
 -- Called from App:willUnmount when the plugin unloads.
 function Bridge.detach(app)
 	attached[app] = nil
+	sessions[app] = nil
 	if outputs[app] then
 		outputs[app]:Disconnect()
 		outputs[app] = nil

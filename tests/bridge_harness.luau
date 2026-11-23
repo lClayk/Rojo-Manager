@@ -352,6 +352,13 @@ app = {
 		app.port.current = newPort
 	end,
 	setState = function(self, changes)
+		-- As Roact's: a function maps the state to its changes, or to nil for none.
+		if type(changes) == "function" then
+			changes = changes(self.state)
+			if changes == nil then
+				return
+			end
+		end
 		local state = table.clone(self.state)
 		for key, value in changes do
 			state[key] = value
@@ -359,9 +366,15 @@ app = {
 		self.state = state
 	end,
 	startSession = function()
-		local session = {
+		local session
+		local started = false
+		session = {
 			precommit = {},
+			-- Rojo's own session status: Disconnected once it is no longer the app's session.
 			getStatus = function()
+				if started and app.serveSession ~= session then
+					return "Disconnected"
+				end
 				return if app.state.appStatus == "Connected" then "Connected" else "Connecting"
 			end,
 		}
@@ -372,6 +385,7 @@ app = {
 		-- As the patched App:startSession does, before the session starts.
 		Bridge.session(app, session)
 		app.serveSession = session
+		started = true
 		if confirm then
 			app.state = { appStatus = "Confirming", patchTree = PATCH_TREE, confirmData = {} }
 			event(`confirming {app.port.current}`)
