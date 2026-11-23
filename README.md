@@ -145,7 +145,7 @@ cargo install cargo-about
 .\package.ps1
 ```
 
-The ZIP and SHA-256 checksum are written to `dist`. `cargo run -p rojo-manager` runs the app. Tests use temporary settings and never touch the real Windows startup entry. Set `ROJO_MANAGER_DATA_DIR` to a separate folder when testing an isolated app profile. CI runs the same steps and checks the packaged executables with `tests/check_bundle.py`.
+The ZIP and SHA-256 checksum are written to `dist`. `cargo run -p rojo-manager` runs the app. Tests use temporary settings and never touch the real Windows startup entry. Set `ROJO_MANAGER_DATA_DIR` to a separate folder when testing an isolated app profile, which also leaves the Start menu shortcut alone. CI runs the same steps and checks the packaged executables with `tests/check_bundle.py`.
 
 On macOS, build release executables for `aarch64-apple-darwin` and `x86_64-apple-darwin`, then run `./package-macos.sh` for a universal **Rojo Manager.app** and its ZIP in `dist`. CI does this too and checks the app with `tests/check_bundle_macos.py`.
 

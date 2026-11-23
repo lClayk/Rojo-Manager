@@ -239,10 +239,16 @@ impl Config {
     }
 }
 
+/// The data folder ROJO_MANAGER_DATA_DIR names. Set, the app runs an isolated profile, which
+/// leaves what belongs to the user's own copy (the Start menu shortcut) alone.
+pub fn isolated_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("ROJO_MANAGER_DATA_DIR").filter(|dir| !dir.is_empty())?);
+    Some(std::path::absolute(&dir).unwrap_or(dir))
+}
+
 pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ROJO_MANAGER_DATA_DIR").filter(|dir| !dir.is_empty()) {
-        let dir = PathBuf::from(dir);
-        return std::path::absolute(&dir).unwrap_or(dir);
+    if let Some(dir) = isolated_dir() {
+        return dir;
     }
     let home = std::env::home_dir().unwrap_or_default();
     let base = if cfg!(target_os = "macos") {
