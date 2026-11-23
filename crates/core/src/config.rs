@@ -139,6 +139,12 @@ pub struct Settings {
     pub studio_tools: bool,
     /// Back up instances that exist only in Studio before Rojo removes them (see backups.rs).
     pub backups: bool,
+    /// Let projects close their Studio when it is idle. Off, no Studio is closed for it and no
+    /// project can be given a time. Only the user changes this, never an agent.
+    pub idle_close: bool,
+    /// Delete Studio's auto-recovery copies of a local place together with that place. Off unless
+    /// the user turns it on, so a removal never takes what Studio kept to recover from.
+    pub remove_recovery: bool,
 }
 
 impl Default for Settings {
@@ -159,12 +165,14 @@ impl Default for Settings {
             group_experiences: true,
             studio_tools: true,
             backups: true,
+            idle_close: true,
+            remove_recovery: false,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 15] = [
+    pub const KEYS: [&'static str; 17] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -180,6 +188,8 @@ impl Settings {
         "group_experiences",
         "studio_tools",
         "backups",
+        "idle_close",
+        "remove_recovery",
     ];
 
     fn slot(&mut self, key: &str) -> Option<&mut bool> {
@@ -199,6 +209,8 @@ impl Settings {
             "group_experiences" => &mut self.group_experiences,
             "studio_tools" => &mut self.studio_tools,
             "backups" => &mut self.backups,
+            "idle_close" => &mut self.idle_close,
+            "remove_recovery" => &mut self.remove_recovery,
             _ => return None,
         })
     }

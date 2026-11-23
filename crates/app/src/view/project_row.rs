@@ -316,8 +316,9 @@ pub fn render(
                     });
                 },
             )))
-            // Shown while it is set or the place is open, so the links of other rows fit one line.
-            .when(p.idle_close.is_some() || p.studio_open, |d| d.child(idle_close))
+            // Shown while it is set or the place is open, so the links of other rows fit one line,
+            // and not at all while Settings has idle close off.
+            .when(snapshot.settings.idle_close && (p.idle_close.is_some() || p.studio_open), |d| d.child(idle_close))
         })
         .when(p.studio_open, |d| {
             d.child(

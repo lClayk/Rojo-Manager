@@ -63,7 +63,8 @@ pub fn specs(studio_tools: bool) -> Value {
                 project. connect_rojo also starts the project's server and connects the Rojo plugin. hidden true \
                 opens the project's place without showing a Studio window (Windows only), for work the user does \
                 not need to watch; on a place that is already open, hidden true hides its window and false shows \
-                it. idle_close sets how many minutes of nothing happening in that Studio close it again.",
+                it. idle_close sets how many minutes of nothing happening in that Studio close it again; it is \
+                refused while the user has idle close turned off in Settings.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "project": {"type": "string", "description": "Project name"},
                 "place": {"type": "string", "description": "Place ID, game link, Creator Hub link, or local"},
@@ -186,7 +187,8 @@ pub fn specs(studio_tools: bool) -> Value {
             "name": "app_settings",
             "description": "Rojo Manager's own preferences, such as launching at sign-in, the tray, update \
                 checks, and which install buttons projects show. Returns them; pass changes to set some. \
-                Only change these when the user asks.",
+                Only change these when the user asks. idle_close (whether projects may close an idle Studio) \
+                is read-only here: the user changes it in the window.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
                 "changes": {"type": "object", "additionalProperties": {"type": "boolean"},
                     "description": "Setting name to true or false"}}},
