@@ -241,6 +241,12 @@ pub fn tcp_snapshot(connections: bool) -> io::Result<(HashMap<u16, u32>, HashMap
     Ok((listening(&sockets), established))
 }
 
+/// The process at the client end of a loopback connection: the one whose socket has local port
+/// `client` and is connected to `server`.
+pub fn connection_owner(client: u16, server: u16) -> Option<u32> {
+    sockets().ok()?.iter().find(|socket| socket.local == client && socket.remote == server).map(|socket| socket.pid)
+}
+
 /// Executable file name of a running process (proc_pidpath), or None.
 pub fn process_name(pid: u32) -> Option<String> {
     let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];

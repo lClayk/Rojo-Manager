@@ -15,7 +15,8 @@
 -- token-protected API.
 -- While Rojo waits for its initial sync to be confirmed, the status carries a summary of what
 -- accepting would do, so agents and the window see it before anyone accepts.
--- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one.
+-- It also tells Rojo Manager how many Rojo plugins are running, so it can warn about a second one,
+-- and how long this Studio has been idle. For a pull, it sends the instances the project syncs.
 -- When a session starts, Rojo's reminder to connect is closed, and it stays away during the session.
 --
 -- In Edit mode and in a playtest's server it also sends Studio's Output to Rojo Manager in small
@@ -26,12 +27,13 @@ local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 12
+local VERSION = 13
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
 local BACKUP_URL = "http://localhost:34871/backup"
--- The largest backup Rojo Manager accepts, base64 included.
+local CAPTURE_URL = "http://localhost:34871/capture/"
+-- The largest backup or capture Rojo Manager accepts, base64 included.
 local MAX_BACKUP_BYTES = 64 * 1024 * 1024
 -- Marks each copy in a backup with the full name it had, so restore finds its parent.
 local BACKUP_PATH_ATTRIBUTE = "RojoManagerPath"
@@ -90,6 +92,13 @@ end
 -- Whether to back up Studio-only instances before Rojo removes them: Rojo Manager's setting, from
 -- its last poll answer.
 local backupsEnabled = true
+
+-- When something last happened in this Studio: a selection, an edit, or a sync from Rojo. Each
+-- poll says how long ago, so Rojo Manager can close a Studio nobody uses. It counts Output itself.
+local lastActivity = os.clock()
+local function markActive()
+	lastActivity = os.clock()
+end
 
 -- The instance at a full name from GetFullName ("Workspace.Map"), or nil. Names that contain dots
 -- cannot be told apart from nesting, so those are not found.
@@ -171,6 +180,8 @@ end
 local attached: { [any]: {} } = {}
 -- The attached app's Output connection.
 local outputs: { [any]: RBXScriptConnection } = {}
+-- The attached app's connections that mark activity.
+local watching: { [any]: { RBXScriptConnection } } = {}
 
 -- The session Rojo last started, from Bridge.session. Rojo sets its own serveSession only once
 -- starting has returned, and starting shows a notification whose text it measures first. That
@@ -387,6 +398,52 @@ local actions = {
 		endSession(app)
 		return status(app)
 	end,
+	-- Send the instances a pull asks for to Rojo Manager. args.roots lists paths of names under the
+	-- DataModel, each an instance the project syncs. A service cannot be serialized, so its
+	-- children are sent instead. All of it is serialized at once, so references between the
+	-- instances survive. Returns what was sent, in order, and the paths Studio does not have.
+	capture = function(_app, args)
+		local instances, entries, missing = {}, {}, {}
+		for _, path in args.roots do
+			local target: Instance? = game
+			for _, name in path do
+				target = target and target:FindFirstChild(name)
+			end
+			if not target or (target.Parent ~= game and not target.Archivable) then
+				table.insert(missing, table.concat(path, "."))
+			elseif target.Parent == game then
+				local count = 0
+				for _, child in target:GetChildren() do
+					-- Serializing leaves these out, such as Rojo's session lock.
+					if child.Archivable then
+						table.insert(instances, child)
+						count += 1
+					end
+				end
+				table.insert(entries, { path = path, count = count, children = true })
+			else
+				table.insert(instances, target)
+				table.insert(entries, { path = path, count = 1 })
+			end
+		end
+		if #instances > 0 then
+			local serialized = game:GetService("SerializationService"):SerializeInstancesAsync(instances)
+			local data = buffer.tostring(game:GetService("EncodingService"):Base64Encode(serialized))
+			if #data > MAX_BACKUP_BYTES then
+				error(`The synced instances are too large to send ({#data} bytes)`, 0)
+			end
+			local response = HttpService:RequestAsync({
+				Url = `{CAPTURE_URL}{args.id}`,
+				Method = "POST",
+				Headers = { ["Content-Type"] = "application/json" },
+				Body = HttpService:JSONEncode({ data = data }),
+			})
+			if not response.Success then
+				error(`Rojo Manager did not take the instances (HTTP {response.StatusCode})`, 0)
+			end
+		end
+		return { entries = entries, missing = missing }
+	end,
 	accept = function(app)
 		return answer(app, "Accept")
 	end,
@@ -502,6 +559,7 @@ local function poll(app, token: {})
 			port = connectedPort(app),
 			rojo = status(app),
 			result = result,
+			idle = math.floor(os.clock() - lastActivity),
 		}
 		local encoded, json = pcall(HttpService.JSONEncode, HttpService, report)
 		if result and (not encoded or #json > MAX_POLL_BYTES) then
@@ -668,6 +726,13 @@ function Bridge.attach(app)
 	keepPlaceName()
 	skipRemindersWhileSyncing(app)
 	forwardOutput(app, "edit")
+	local history = game:GetService("ChangeHistoryService")
+	watching[app] = {
+		game:GetService("Selection").SelectionChanged:Connect(markActive),
+		history.OnRecordingFinished:Connect(markActive),
+		history.OnUndo:Connect(markActive),
+		history.OnRedo:Connect(markActive),
+	}
 	local token = {}
 	attached[app] = token
 	-- Deferred until App:init has finished, so the host and port the poll reports are set.
@@ -680,6 +745,7 @@ function Bridge.session(app, serveSession)
 	sessions[app] = serveSession
 	closeReminders(app)
 	serveSession:hookPrecommit(function(patch)
+		markActive()
 		backUpRemovals(app, patch)
 	end)
 end
@@ -692,6 +758,10 @@ function Bridge.detach(app)
 		outputs[app]:Disconnect()
 		outputs[app] = nil
 	end
+	for _, connection in watching[app] or {} do
+		connection:Disconnect()
+	end
+	watching[app] = nil
 end
 
 return Bridge

@@ -97,7 +97,7 @@ fn syncback(rojo: &Path, file: &Path, folder: &Path, name: &str) -> Result<(), S
         match run(rojo, &[&args[..], &input[..]].concat(), Some(folder)) {
             Ok(_) => break,
             Err(error) if drop_missing(&mut services, &error) => continue,
-            Err(error) => return Err(syncback_error(&error)),
+            Err(error) => return Err(syncback_error(&error, "convert")),
         }
     }
     services.retain(|service| fs::read_dir(source(folder, service)).is_ok_and(|mut entries| entries.next().is_some()));
@@ -111,18 +111,20 @@ fn syncback(rojo: &Path, file: &Path, folder: &Path, name: &str) -> Result<(), S
 }
 
 /// What to tell the user when syncback fails: what to fix for duplicate names, which it refuses
-/// in a synced service, else Rojo's own error without its warnings.
-fn syncback_error(error: &str) -> String {
+/// in a synced service, else Rojo's own error without its warnings. `verb` is what was being done:
+/// "convert" or "pull".
+pub(crate) fn syncback_error(error: &str, verb: &str) -> String {
     let named = error.split("The child '").nth(1).and_then(|rest| rest.split_once("' of '"));
     let named = named.and_then(|(child, rest)| Some((child, rest.split_once("' is duplicated")?.0)));
     if let Some((child, parent)) = named {
+        let again = if verb == "convert" { "save the place, and convert again" } else { "then pull again" };
         return format!(
             "{parent} has more than one child named {child}, which Rojo cannot write as files. Rename them in \
-             Studio, save the place, and convert again."
+             Studio, {again}."
         );
     }
     let error = error.find("[ERROR").map_or(error, |at| &error[at..]);
-    format!("Rojo could not convert the place: {}", error.trim_start_matches("[ERROR rojo] "))
+    format!("Rojo could not {verb} the place: {}", error.trim_start_matches("[ERROR rojo] "))
 }
 
 /// The folder a service syncs to: "src/StarterPlayer/StarterPlayerScripts".
@@ -211,12 +213,12 @@ mod tests {
         let duplicated = "[WARN  rbx_binary] Unknown value type in 'Terrain'. Beginning syncback... [ERROR rojo] \
             Failed to syncback  because The child 'Admin' of 'ServerScriptService' is duplicated in the place file.";
         assert_eq!(
-            syncback_error(duplicated),
+            syncback_error(duplicated, "convert"),
             "ServerScriptService has more than one child named Admin, which Rojo cannot write as files. Rename \
              them in Studio, save the place, and convert again."
         );
         assert_eq!(
-            syncback_error("[WARN  x] noise [ERROR rojo] Failed to read the input file"),
+            syncback_error("[WARN  x] noise [ERROR rojo] Failed to read the input file", "convert"),
             "Rojo could not convert the place: Failed to read the input file"
         );
     }

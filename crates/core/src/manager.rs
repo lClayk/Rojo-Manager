@@ -19,11 +19,12 @@ use crate::backups::{self, Backup};
 use crate::config::{self, Config, Lane, LocalPlace, Place, PlaceLink, Settings};
 use crate::control::{BackupUpload, BridgePoll, ControlError, ControlHandler, OutputContext, OutputKind, StudioOutput};
 use crate::localnet::{self, port_in_use};
+use crate::pull::{self, Pulled};
 use crate::studio::{self, ResolveError};
 use crate::studio_link::Link;
 use crate::tooling::{self, Job, RojoState, RojoStatus};
 use crate::updates::{self, UpdateState, UpdateStatus};
-use crate::{rojo_api, scaffold, startup};
+use crate::{rojo_api, scaffold, startup, studio_process};
 
 pub const LOG_CAP: usize = 2000;
 /// New projects take the first free port from here; 34871 is the auto-connect port.
@@ -42,6 +43,10 @@ const OUTPUT_CAP: usize = 2000;
 const OUTPUT_TEXT: usize = 2000;
 /// The first bridge version that sends Studio's Output.
 const OUTPUT_BRIDGE: u64 = 8;
+/// The first bridge version that captures instances for a pull.
+const PULL_BRIDGE: u64 = 13;
+/// How long a pull waits for Studio to serialize and send its instances.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest unpublished place name kept from a bridge; local place files are much shorter.
 const MAX_PLACE_NAME: usize = 255;
 /// Rojo's port when its port field in Studio is empty.
@@ -97,6 +102,15 @@ pub struct ProjectView {
     /// A Studio with this place open waits for Rojo's initial sync to this server to be confirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_sync: Option<PendingSync>,
+    /// Minutes of nothing happening in the place's Studio after which it is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_close: Option<u32>,
+    /// A Studio with the bridge has this place open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub studio_open: bool,
+    /// That Studio's window is hidden.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub studio_hidden: bool,
     pub state: ServerState,
     /// Installers that apply: "Wally", then "Rokit" or "Aftman".
     pub badges: Vec<String>,
@@ -183,6 +197,8 @@ pub struct Update {
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub place: Option<Option<PlaceChoice>>,
     pub sourcemap: Option<bool>,
+    /// Minutes; 0 turns closing an idle Studio off.
+    pub idle_close: Option<u32>,
 }
 
 /// Rojo in one Studio waiting for its initial sync to be confirmed, with what that sync would do
@@ -338,6 +354,12 @@ struct State {
     /// Studio's recent Output by place (ID, and name when unpublished), from its Edit DataModel and playtests.
     output: HashMap<(u64, Option<String>), VecDeque<OutputLine>>,
     output_seq: u64,
+    /// Pulls waiting for their bridge's capture, by the id the capture command named; the value is
+    /// the capture (base64 .rbxm) once it arrived.
+    captures: HashMap<u64, Option<String>>,
+    /// The Studio process each project's place was last opened hidden in, so it can be shown
+    /// before its bridge reports.
+    opened_hidden: HashMap<String, u32>,
 }
 
 /// One line of Studio's Output, numbered across all places so a reader can ask for newer lines.
@@ -363,6 +385,24 @@ struct BridgeReport {
     /// The auto-connect server offered to it.
     offered: Option<u16>,
     seen: Instant,
+    /// Its Studio process, found once through the poll's connection.
+    pid: Option<u32>,
+    /// When something last happened in its Studio: an edit, a selection, a sync, Output, a command
+    /// from an agent, or the user being in its window.
+    active: Instant,
+    /// Being closed for being idle, or its user was told that its bridge is too old for that.
+    closing: bool,
+    /// Its Studio's window is hidden, as of its last poll.
+    hidden: bool,
+}
+
+/// What a bridge's poll says besides Rojo's state.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PollExtra {
+    /// The poll's (client port, server port).
+    pub connection: Option<(u16, u16)>,
+    /// Seconds since something last happened in its Studio.
+    pub idle: Option<u64>,
 }
 
 impl State {
@@ -392,6 +432,15 @@ impl State {
                 && report.seen.elapsed() < BRIDGE_TTL;
             let summary = || rojo.get("pending").and_then(|pending| SyncSummary::deserialize(pending).ok());
             waiting.then(|| PendingSync { instance: id.to_string(), summary: summary() })
+        })
+    }
+
+    /// The Studio windows that have this project's place open, by their bridges' recent polls.
+    fn place_bridges<'a>(&'a self, project: &'a config::Project) -> impl Iterator<Item = (u64, &'a BridgeReport)> {
+        self.bridges.iter().filter_map(move |(id, report)| {
+            let open = report.seen.elapsed() < BRIDGE_TTL
+                && project.place.as_ref()?.matches(report.place_id, report.place_name.as_deref());
+            open.then_some((*id, report))
         })
     }
 
@@ -710,6 +759,9 @@ impl Engine {
             sourcemap: p.sourcemap,
             lane: p.lane.clone(),
             pending_sync: state.pending_sync(p),
+            idle_close: p.idle_close,
+            studio_open: state.place_bridges(p).next().is_some(),
+            studio_hidden: state.place_bridges(p).any(|(_, report)| report.hidden),
             backups: state.backups.get(&p.name).cloned().unwrap_or_default(),
             experience: p
                 .place
@@ -1143,23 +1195,85 @@ impl Engine {
     /// sync prompt; the bridge connects when that offer first appears, so turning auto-connect on or
     /// starting the server connects an open place.
     pub fn report_bridge(
-        &self,
+        self: &Arc<Self>,
         id: u64,
         place_id: u64,
         place_name: Option<String>,
         port: u16,
         rojo: Value,
+        extra: PollExtra,
     ) -> Option<(u16, bool)> {
-        let (target, previous, accept) = {
+        // The Studio process is looked up once per bridge, from the connection its poll came in on.
+        let known = self.lock().bridges.get(&id).and_then(|report| report.pid);
+        let pid = known.or_else(|| {
+            let (client, server) = extra.connection?;
+            localnet::connection_owner(client, server).filter(|pid| studio_process::is_studio(*pid))
+        });
+        let hidden = pid.and_then(studio_process::hidden).unwrap_or(false);
+        let foreground = pid.is_some_and(studio_process::foreground);
+        let now = Instant::now();
+        let (target, previous, accept, idle, outdated) = {
             let mut state = self.lock();
             let place_name = place_name.filter(|name| place_id == 0 && name.len() <= MAX_PLACE_NAME);
             let target = state.auto_connect_target(place_id, place_name.as_deref());
             let offered = target.as_ref().map(|(_, port)| *port);
-            let report = BridgeReport { place_id, place_name, port, rojo, offered, seen: Instant::now() };
-            (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept)
+            let before = state.bridges.get(&id);
+            let reported = extra.idle.and_then(|idle| now.checked_sub(Duration::from_secs(idle)));
+            let active = match (foreground, before.map(|report| report.active), reported) {
+                (true, _, _) => now,
+                (false, Some(before), Some(reported)) => before.max(reported),
+                (false, before, reported) => before.or(reported).unwrap_or(now),
+            };
+            let closing = before.is_some_and(|report| report.closing);
+            let project = state
+                .config
+                .projects
+                .iter()
+                .find(|p| p.place.as_ref().is_some_and(|place| place.matches(place_id, place_name.as_deref())))
+                .map(|p| (p.name.clone(), p.idle_close));
+            // The bridge names the process from here on, so the one remembered from opening the
+            // place hidden is dropped before that number can come to mean another Studio.
+            if let (Some(_), Some((name, _))) = (pid, &project) {
+                state.opened_hidden.remove(name);
+            }
+            // A Studio running a command is in use, however long ago its last one came.
+            let idle = project.and_then(|(name, minutes)| Some((name, minutes?))).filter(|(_, minutes)| {
+                let limit = Duration::from_secs(u64::from(*minutes) * 60);
+                !closing && active.elapsed() >= limit && !self.link.busy(id)
+            });
+            // Only a bridge that says how long its Studio has been idle (13 and later) has it
+            // closed: an older one's edits and syncs go unseen here, so its user is told instead.
+            let (idle, outdated) = if extra.idle.is_some() { (idle, None) } else { (None, idle) };
+            let report = BridgeReport {
+                place_id,
+                place_name,
+                port,
+                rojo,
+                offered,
+                seen: now,
+                pid,
+                active,
+                closing: closing || idle.is_some() || outdated.is_some(),
+                hidden,
+            };
+            (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept, idle, outdated)
         };
+        if let Some((name, _)) = outdated {
+            self.alert(format!(
+                "{name}: its Studio looks idle but stays open, because its bridge is too old to tell. Restart that \
+                 Studio to load the new bridge."
+            ));
+        }
         if previous.as_ref().map(|report| report.port) != Some(port) {
             self.wake_watcher();
+        }
+        if previous.as_ref().map(|report| report.hidden) != Some(hidden) {
+            self.changed();
+        }
+        if let Some((name, minutes)) = idle {
+            let engine = Arc::clone(self);
+            std::thread::spawn(move || engine.close_idle(&name, id, minutes));
+            return None; // no auto-connect for a Studio that is closing
         }
         let offered_before = previous.as_ref().and_then(|report| report.offered);
         // The window shows a sync waiting for confirmation, and what it would do.
@@ -1205,8 +1319,8 @@ impl Engine {
         report.seen.elapsed() < BRIDGE_TTL || self.link.busy(id)
     }
 
-    /// The Studio windows whose bridge polled recently: {instanceId, placeId, placeName, rojo}, with
-    /// placeName only for an unpublished place.
+    /// The Studio windows whose bridge polled recently: {instanceId, placeId, placeName, rojo, hidden},
+    /// with placeName only for an unpublished place and hidden only when its window is.
     pub fn studio_instances(&self) -> Vec<Value> {
         let state = self.lock();
         let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
@@ -1216,6 +1330,9 @@ impl Engine {
             let mut instance = json!({ "instanceId": id.to_string(), "placeId": report.place_id, "rojo": report.rojo });
             if let Some(name) = &report.place_name {
                 instance["placeName"] = json!(name);
+            }
+            if report.hidden {
+                instance["hidden"] = json!(true);
             }
             instance
         };
@@ -1235,7 +1352,84 @@ impl Engine {
             "connect" if args.get("wait") == Some(&Value::Bool(true)) => Duration::from_secs(40),
             _ => Duration::from_secs(15),
         };
+        self.touch(id);
         self.link.run(id, action, args, timeout).map_err(|error| ControlError::new(error, 409))
+    }
+
+    /// Something was just done with this Studio, so it is not idle.
+    fn touch(&self, id: u64) {
+        if let Some(report) = self.lock().bridges.get_mut(&id) {
+            report.active = Instant::now();
+        }
+    }
+
+    /// The Studio processes that have this project's place open: those whose bridge reports it, the
+    /// one it was opened hidden in, and on Windows those whose window title starts with a local
+    /// place's path, which covers a Studio whose bridge has not loaded.
+    fn place_processes(&self, project: &config::Project) -> Vec<u32> {
+        let mut pids: Vec<u32> = {
+            let state = self.lock();
+            let reported = state.place_bridges(project).filter_map(|(_, report)| report.pid);
+            reported.chain(state.opened_hidden.get(&project.name).copied()).collect()
+        };
+        if let Some(path) = local_place(project) {
+            pids.extend(localnet::window_owners(&format!("{} - ", path.display())));
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids.retain(|pid| studio_process::is_studio(*pid));
+        pids
+    }
+
+    /// End the Studio windows that have the project's place open. Returns how many closed; one
+    /// that would not close is an error. Unsaved changes there are lost.
+    fn close_place(&self, project: &config::Project) -> Result<usize, String> {
+        let pids = self.place_processes(project);
+        for pid in &pids {
+            studio_process::close(*pid).map_err(|e| format!("Could not close Studio (process {pid}): {e}"))?;
+        }
+        let mut state = self.lock();
+        state.opened_hidden.remove(&project.name);
+        state.bridges.retain(|_, report| report.pid.is_none_or(|pid| !pids.contains(&pid)));
+        Ok(pids.len())
+    }
+
+    /// Close the Studio of the idle bridge `id` after `minutes` with nothing happening in it, and
+    /// stop its project's server unless it autostarts or another Studio is connected to it. The
+    /// project, its place, and other Studios with the place open stay.
+    fn close_idle(self: &Arc<Self>, name: &str, id: u64, minutes: u32) {
+        let (project, pid) = {
+            let state = self.lock();
+            (state.config.project(name).cloned(), state.bridges.get(&id).and_then(|report| report.pid))
+        };
+        let Some(project) = project else { return };
+        let Some(pid) = pid else {
+            // Said once: the bridge stays marked as closing.
+            return self.alert(format!("{name}: its Studio is idle, but its process was not found to close it."));
+        };
+        // Rojo is disconnected first, so the server it leaves does not see a dropped connection.
+        let _ = self.link.run(id, "disconnect", json!({}), Duration::from_secs(5));
+        match studio_process::close(pid).map_err(|e| format!("Could not close Studio (process {pid}): {e}")) {
+            Ok(()) => {
+                let connected = {
+                    let mut state = self.lock();
+                    state.bridges.remove(&id);
+                    state.bridges.values().any(|report| report.port == project.port)
+                };
+                if !project.autostart && !connected {
+                    self.stop(name);
+                }
+                self.notice(format!("{name}: closed its Studio after {minutes} min idle"));
+            }
+            Err(error) => {
+                if let Some(report) = self.lock().bridges.get_mut(&id) {
+                    report.closing = false;
+                    report.active = Instant::now(); // try again after another idle period
+                }
+                self.alert(format!("{name}: {error}"));
+            }
+        }
+        self.changed();
     }
 
     /// Store a backup a bridge sent, under the project whose server's patch removed the instances.
@@ -1299,6 +1493,10 @@ impl Engine {
         let mut guard = self.lock();
         let state = &mut *guard;
         let name = output.place_name.filter(|name| output.place_id == 0 && name.len() <= MAX_PLACE_NAME);
+        // A Studio that prints is in use, such as one running a playtest.
+        let now = Instant::now();
+        let place = state.bridges.values_mut().filter(|r| r.place_id == output.place_id && r.place_name == name);
+        place.for_each(|report| report.active = now);
         let buffer = state.output.entry((output.place_id, name)).or_default();
         for line in output.lines {
             let mut text = line.text;
@@ -1374,15 +1572,18 @@ impl Engine {
                 self.sleep_watcher(Duration::from_secs(1));
                 continue;
             };
+            let mut changed = false;
             let (projects, mut launching, bridged) = {
                 let mut state = self.lock();
+                let bridges = state.bridges.len();
                 state.bridges.retain(|id, report| self.bridge_live(*id, report));
+                // A Studio that closed no longer shows as open on its project.
+                changed |= state.bridges.len() != bridges;
                 // The ports live bridges report as connected; None when no bridge runs.
                 let bridged: Option<HashSet<u16>> = (!state.bridges.is_empty())
                     .then(|| state.bridges.values().map(|report| report.port).filter(|&port| port != 0).collect());
                 (state.config.projects.clone(), !state.starting.is_empty() || !state.restarting.is_empty(), bridged)
             };
-            let mut changed = false;
             for project in projects {
                 let (name, port) = (project.name.clone(), project.port);
                 let exited = {
@@ -1542,6 +1743,7 @@ impl Engine {
             place: local.then(|| PlaceLink::Local(LocalPlace::new(&name))),
             sourcemap: false,
             lane,
+            idle_close: None,
         });
         config::save(&config)?;
         state.config = config;
@@ -1581,6 +1783,9 @@ impl Engine {
         }
         if project.lane.is_some() && !matches!(linked, Some(PlaceLink::Local(_))) {
             return Err("A lane keeps its local place.".into());
+        }
+        if update.idle_close.is_some_and(|minutes| minutes > config::MAX_IDLE_CLOSE) {
+            return Err(format!("Idle close is at most {} minutes; 0 turns it off.", config::MAX_IDLE_CLOSE));
         }
         if new_name != name {
             if new_name.is_empty() {
@@ -1627,6 +1832,7 @@ impl Engine {
         p.place = linked;
         p.name = new_name.clone();
         p.sourcemap = update.sourcemap.unwrap_or(p.sourcemap);
+        p.idle_close = update.idle_close.map_or(p.idle_close, |minutes| (minutes > 0).then_some(minutes));
         // Lanes made from it follow the new name.
         for lane in config.projects.iter_mut().filter_map(|p| p.lane.as_mut()).filter(|lane| lane.parent == name) {
             lane.parent = new_name.clone();
@@ -1644,6 +1850,21 @@ impl Engine {
             }
             if let Some(seen) = state.states.remove(name) {
                 state.states.insert(new_name.clone(), seen);
+            }
+            if let Some(pid) = state.opened_hidden.remove(name) {
+                state.opened_hidden.insert(new_name.clone(), pid);
+            }
+        }
+        // A new idle time counts from now, so a Studio already idle that long is not closed at once.
+        if update.idle_close.is_some() {
+            let open: Vec<u64> = state
+                .config
+                .project(&new_name)
+                .map_or_else(Vec::new, |p| state.place_bridges(p).map(|(id, _)| id).collect());
+            for id in open {
+                if let Some(report) = state.bridges.get_mut(&id) {
+                    report.active = Instant::now();
+                }
             }
         }
         let view = Self::view(&state, &new_name).ok_or_else(|| missing(&new_name))?;
@@ -1805,7 +2026,8 @@ impl Engine {
     }
 
     /// Stop the project's server if it runs, then drop the project. Its folder is kept, but its local
-    /// place file goes with it, and a lane's Studio window is closed first.
+    /// place file goes with it. A lane's Studio window is closed first; another project's Studio stays
+    /// open, and is shown when it was hidden.
     pub fn remove(&self, name: &str) -> Result<(), String> {
         let lane = self.lock().config.project(name).is_some_and(|p| p.lane.is_some());
         match lane {
@@ -1819,10 +2041,7 @@ impl Engine {
     pub fn remove_lane(&self, name: &str) -> Result<usize, String> {
         let project = self.lock().config.project(name).filter(|p| p.lane.is_some()).cloned();
         let project = project.ok_or_else(|| format!("No lane named {name}"))?;
-        let closed = match local_place(&project) {
-            Some(path) => studio::close_place_file(&path)?,
-            None => 0,
-        };
+        let closed = self.close_place(&project)?;
         self.remove_project(name)?;
         Ok(closed)
     }
@@ -1858,10 +2077,16 @@ impl Engine {
     }
 
     fn remove_project(&self, name: &str) -> Result<(), String> {
-        let (busy, port) = {
+        let (busy, port, project) = {
             let state = self.lock();
-            (state.busy(name), state.port(name)?)
+            (state.busy(name), state.port(name)?, state.config.project(name).cloned())
         };
+        // A hidden Studio is shown first: without its project, nothing is left to show it.
+        for pid in project.iter().flat_map(|project| self.place_processes(project)) {
+            if studio_process::hidden(pid) == Some(true) {
+                let _ = studio_process::set_hidden(pid, false);
+            }
+        }
         if busy || port_in_use(port) {
             self.stop(name);
         }
@@ -1873,9 +2098,12 @@ impl Engine {
         state.config = config;
         state.logs.remove(name);
         state.states.remove(name);
+        state.opened_hidden.remove(name);
         drop(state);
         if let Some(path) = place {
             let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+            // A Studio closed by force leaves auto-recovery copies of the place behind.
+            studio_process::remove_recovery(&path);
             let _ = std::fs::remove_file(path);
         }
         self.changed();
@@ -1883,13 +2111,32 @@ impl Engine {
     }
 
     /// Open the project's place in Studio. A local place is built first when its file is missing,
-    /// so what Studio saves into it is kept.
-    pub fn open_studio(&self, name: &str) -> Result<PlaceLink, String> {
+    /// so what Studio saves into it is kept. With `hidden`, Studio opens without showing a window
+    /// (Windows only). A Studio that already has the place open is shown or hidden instead, where
+    /// that is supported.
+    pub fn open_studio(&self, name: &str, hidden: bool) -> Result<PlaceLink, String> {
         let project = self.lock().config.project(name).cloned().ok_or_else(|| missing(name))?;
         let place = project.place.clone();
         let place = place.ok_or_else(|| format!("{name} has no linked place. Set one in Rojo Manager."))?;
-        let opened = match &place {
-            PlaceLink::Published(place) => studio::open_place(place),
+        let open = self.place_processes(&project);
+        if !studio_process::CAN_HIDE && hidden && !open.is_empty() {
+            return Err("Hiding Studio is Windows only for now.".into());
+        }
+        if studio_process::CAN_HIDE && !open.is_empty() {
+            for pid in &open {
+                studio_process::set_hidden(*pid, hidden)?;
+            }
+            for report in
+                self.lock().bridges.values_mut().filter(|report| report.pid.is_some_and(|p| open.contains(&p)))
+            {
+                report.hidden = hidden;
+                report.active = Instant::now();
+            }
+            self.changed();
+            return Ok(place);
+        }
+        let target = match &place {
+            PlaceLink::Published(place) => studio::launch_uri(place),
             PlaceLink::Local(local) => {
                 let path = local.path();
                 if !path.is_file() {
@@ -1898,11 +2145,126 @@ impl Engine {
                 // A lock left by a Studio that crashed or was closed by force keeps Studio from
                 // opening the file. A running Studio holds its lock open, so only a stale one goes.
                 let _ = std::fs::remove_file(format!("{}.lock", path.display()));
-                crate::shell::open(&path.to_string_lossy())
+                path.to_string_lossy().into_owned()
             }
         };
-        opened.map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
+        let pid = studio_process::open(&target, hidden).map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
+        if let Some(pid) = pid {
+            self.lock().opened_hidden.insert(name.to_string(), pid);
+        }
         Ok(place)
+    }
+
+    /// Write what Studio holds for the project's synced instances into its files, or with `preview`
+    /// list what that would change. The place must be open in a Studio with the bridge.
+    pub fn pull(self: &Arc<Self>, name: &str, preview: bool) -> Result<Pulled, String> {
+        let project = self.lock().config.project(name).cloned().ok_or_else(|| missing(name))?;
+        let folder = PathBuf::from(&project.path);
+        let file = std::fs::read(folder.join(&project.project_file))
+            .map_err(|e| format!("Could not read {}: {e}", project.project_file))?;
+        let file: Value =
+            serde_json::from_slice(&file).map_err(|e| format!("{} is not JSON: {e}", project.project_file))?;
+        let roots = pull::capture_roots(&file)?;
+        let instance = self.project_instance(&project).ok_or_else(|| {
+            format!("{name} is not open in Studio. Open its place, then pull; Pull reads the open place.")
+        })?;
+        let bridge = self.lock().bridges.get(&instance).and_then(|r| r.rojo.get("bridge")?.as_u64()).unwrap_or(0);
+        if bridge < PULL_BRIDGE {
+            return Err("This Studio's bridge is too old to pull. Update the bridge in Rojo Manager, then restart \
+                Studio."
+                .into());
+        }
+        pull::check_tools(&folder)?;
+        let mut id = [0u8; 6];
+        getrandom::fill(&mut id).map_err(|e| e.to_string())?;
+        let capture = id.iter().fold(0u64, |id, byte| id << 8 | u64::from(*byte)); // fits a Luau number
+        self.lock().captures.insert(capture, None);
+        self.touch(instance);
+        let result = self.link.run(instance, "capture", json!({ "id": capture, "roots": roots }), CAPTURE_TIMEOUT);
+        let data = self.lock().captures.remove(&capture).flatten();
+        let result = result?;
+        let entries: Vec<pull::Entry> = match result.get("entries") {
+            Some(entries) if entries.is_array() => {
+                serde_json::from_value(entries.clone()).map_err(|_| "The bridge sent an unreadable capture")?
+            }
+            _ => Vec::new(), // an empty Luau table arrives as {}
+        };
+        let missing: Vec<String> = result
+            .get("missing")
+            .and_then(Value::as_array)
+            .map(|paths| paths.iter().filter_map(Value::as_str).take(200).map(str::to_string).collect())
+            .unwrap_or_default();
+        // The bridge is untrusted: only the instances this project syncs may be replaced.
+        if entries.iter().any(|entry| !roots.contains(&entry.path)) {
+            return Err("The bridge sent instances the project does not sync".into());
+        }
+        let data = match (data, entries.iter().any(|entry| entry.count > 0)) {
+            (Some(data), _) => BASE64.decode(data.as_bytes()).map_err(|_| "The bridge sent a damaged capture")?,
+            (None, false) => Vec::new(),
+            (None, true) => return Err("Studio's instances did not arrive".into()),
+        };
+        let prepared = pull::prepare(&folder, &project.project_file, &data, &entries)?;
+        let mut pulled = prepared.syncback(true)?;
+        if !preview && !pulled.is_empty() {
+            // Rojo is kept away while the files are written: its server can crash when folders are
+            // removed under it, and a connected Rojo would add the new files as instances beside
+            // the ones they came from. So that Studio's session ends and the server stops; then
+            // both come back, and connecting again matches the instances by name.
+            let session = {
+                let state = self.lock();
+                let connected = state.bridges.get(&instance).is_some_and(|report| report.port == project.port);
+                connected
+                    || state.pending_sync(&project).is_some_and(|pending| pending.instance == instance.to_string())
+            };
+            let serving =
+                self.project(name).is_some_and(|p| !matches!(p.state, ServerState::Off | ServerState::Blocked));
+            let connect = || {
+                let args = json!({ "port": project.port, "wait": true });
+                match self.link.run(instance, "connect", args, Duration::from_secs(40)) {
+                    Ok(status) => status.get("status").and_then(Value::as_str).unwrap_or("Unknown").to_string(),
+                    Err(error) => error,
+                }
+            };
+            if session {
+                self.link.run(instance, "disconnect", json!({}), Duration::from_secs(15))?;
+            }
+            if serving {
+                self.stop(name);
+                self.wait_for_server(name, "stop");
+                if port_in_use(project.port) {
+                    if session {
+                        connect();
+                    }
+                    return Err(format!("{name}'s server did not stop, so nothing was written."));
+                }
+            }
+            let written = prepared.syncback(false);
+            let mut rojo = None;
+            if serving {
+                let _ = self.start(name);
+                self.wait_for_server(name, "start");
+                if !port_in_use(project.port) {
+                    rojo = Some("The server did not start again; see its log.".to_string());
+                }
+            }
+            if session && rojo.is_none() {
+                rojo = Some(connect()).filter(|status| status != "Connected");
+            }
+            pulled = written?;
+            pulled.rojo = rojo;
+            let (written, removed) = (pulled.written.len(), pulled.removed.len());
+            self.log(name, &format!("[pulled from Studio: {written} written, {removed} removed]"));
+        }
+        pulled.preview = preview;
+        pulled.missing = missing;
+        Ok(pulled)
+    }
+
+    /// A bridge's capture for a pull that waits for it; anything else is dropped.
+    pub fn save_capture(&self, id: u64, data: String) {
+        if let Some(slot) = self.lock().captures.get_mut(&id) {
+            *slot = Some(data);
+        }
     }
 
     /// Build the project into a place file with `rojo build`; its output goes to the project's log.
@@ -2323,9 +2685,24 @@ impl ControlHandler for Control {
             }
             "open-studio" => {
                 let status = if view.place.is_none() { 409 } else { 500 };
-                engine.open_studio(name).map_err(|e| ControlError::new(e, status))?;
+                let hidden = match body.get("hidden") {
+                    None | Some(Value::Null) => false,
+                    Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("hidden must be a bool"))?,
+                };
+                engine.open_studio(name, hidden).map_err(|e| ControlError::new(e, status))?;
                 engine.notice(format!("{name}: open studio requested by an agent"));
                 reply(name)
+            }
+            "pull" => {
+                let preview = match body.get("preview") {
+                    None | Some(Value::Null) => false,
+                    Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("preview must be a bool"))?,
+                };
+                let pulled = engine.pull(name, preview).map_err(|e| ControlError::new(e, 409))?;
+                if !preview {
+                    engine.notice(format!("{name}: pulled from Studio by an agent"));
+                }
+                serde_json::to_value(pulled).map_err(|e| ControlError::new(e.to_string(), 500))
             }
             _ => Err(ControlError::new(format!("Unknown action {action}"), 404)),
         }
@@ -2396,8 +2773,13 @@ impl ControlHandler for Control {
         Ok(self.0.settings_value())
     }
 
-    fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value {
-        let offer = self.0.report_bridge(id, poll.place_id, poll.place_name, poll.port, poll.rojo);
+    fn save_capture(&self, id: u64, data: String) {
+        self.0.save_capture(id, data);
+    }
+
+    fn poll_bridge(&self, id: u64, poll: BridgePoll, connection: Option<(u16, u16)>) -> Value {
+        let extra = PollExtra { connection, idle: poll.idle };
+        let offer = self.0.report_bridge(id, poll.place_id, poll.place_name, poll.port, poll.rojo, extra);
         let result = poll.result.map(|result| {
             let outcome = match result.ok {
                 true => Ok(result.value),
@@ -2433,7 +2815,8 @@ impl ControlHandler for Control {
         };
         if !valid {
             return Err(ControlError::bad(
-                "Pass action status, disconnect, accept, abort, connect (with port), luau (with code), or output",
+                "Pass action status, disconnect, accept, abort, connect (with port), luau (with code), output, \
+                 show, or hide",
             ));
         }
         self.0.studio_command(instance, action, Value::Object(body.clone()))
@@ -2478,10 +2861,10 @@ fn parse_output_query(body: &Map<String, Value>) -> Result<(u64, usize, OutputKi
     Ok((since, count as usize, level))
 }
 
-/// Read an agent's update body (name, port, autostart, autoConnect, place, sourcemap) or link-place body
-/// (place). The place text comes back separately, still to be looked up.
+/// Read an agent's update body (name, port, autostart, autoConnect, place, sourcemap, idleClose) or
+/// link-place body (place). The place text comes back separately, still to be looked up.
 fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Option<String>), ControlError> {
-    const FIELDS: &str = "name, port, autostart, autoConnect, place, sourcemap";
+    const FIELDS: &str = "name, port, autostart, autoConnect, place, sourcemap, idleClose";
     if action == "link-place" {
         let place = body.get("place").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
         let place = place.ok_or_else(|| ControlError::bad("Pass a place ID or link, or local"))?;
@@ -2504,6 +2887,10 @@ fn parse_update(action: &str, body: &Map<String, Value>) -> Result<(Update, Opti
             "autostart" => update.autostart = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
             "autoConnect" => update.auto_connect = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
             "sourcemap" => update.sourcemap = Some(value.as_bool().ok_or_else(|| wrong("bool"))?),
+            "idleClose" => {
+                let minutes = value.as_u64().and_then(|minutes| u32::try_from(minutes).ok());
+                update.idle_close = Some(minutes.ok_or_else(|| wrong("number of minutes (0 for off)"))?);
+            }
             _ => return Err(ControlError::bad(format!("Unknown field {key}. Fields: {FIELDS}"))),
         }
     }
@@ -2536,9 +2923,12 @@ mod tests {
     #[test]
     fn studio_output_is_read_after_a_cursor_by_level_and_needs_a_new_bridge() {
         let engine = Engine::new(Config::default(), PathBuf::new(), |_| {});
-        engine.report_bridge(1, 100, None, 0, json!({"bridge": OUTPUT_BRIDGE}));
-        engine.report_bridge(2, 200, None, 0, json!({"bridge": OUTPUT_BRIDGE - 1}));
-        engine.report_bridge(3, 0, Some("Lane-1.rbxl".into()), 0, json!({"bridge": OUTPUT_BRIDGE}));
+        let report = |id, place_id, name: Option<&str>, rojo| {
+            engine.report_bridge(id, place_id, name.map(Into::into), 0, rojo, PollExtra::default())
+        };
+        report(1, 100, None, json!({"bridge": OUTPUT_BRIDGE}));
+        report(2, 200, None, json!({"bridge": OUTPUT_BRIDGE - 1}));
+        report(3, 0, Some("Lane-1.rbxl"), json!({"bridge": OUTPUT_BRIDGE}));
         let line = |text: &str, kind| crate::control::OutputReport { text: text.into(), kind };
         engine.report_output(StudioOutput {
             place_id: 0,
@@ -2589,6 +2979,7 @@ mod tests {
             place: None,
             sourcemap: false,
             lane: None,
+            idle_close: None,
         };
         let day = 24 * 60 * 60;
         let mut config = Config { projects: vec![project], first_run: 10 * day, ..Config::default() };
@@ -2612,11 +3003,13 @@ mod tests {
             place: Some(PlaceLink::Local(LocalPlace { file: "Lane-1.rbxl".into() })),
             sourcemap: false,
             lane: Some(Lane { parent: "MyGame".into(), holder: None }),
+            idle_close: None,
         };
         let engine = Engine::new(Config { projects: vec![local], ..Config::default() }, PathBuf::new(), |_| {});
         engine.lock().states.insert("Lane".into(), ServerState::Serving);
-        let offer =
-            |place_id, name: Option<&str>| engine.report_bridge(1, place_id, name.map(Into::into), 0, json!({}));
+        let offer = |place_id, name: Option<&str>| {
+            engine.report_bridge(1, place_id, name.map(Into::into), 0, json!({}), PollExtra::default())
+        };
         assert_eq!(offer(0, Some("Lane-1.rbxl")), Some((FIRST_PORT, true)));
         assert_eq!(offer(0, Some("Lane-2.rbxl")), None);
         assert_eq!(offer(0, None), None); // an older bridge does not name the place
@@ -2691,15 +3084,17 @@ mod tests {
             place: Some(PlaceLink::Published(Place { place_id: 100, universe_id: 1 })),
             sourcemap: false,
             lane: None,
+            idle_close: None,
         };
         let engine = Engine::new(Config { projects: vec![project], ..Config::default() }, PathBuf::new(), |_| {});
         let pending = || engine.project("MyGame").unwrap().pending_sync;
-        engine.report_bridge(7, 100, None, 0, json!({"status": "Confirming", "port": "34999"}));
+        let report = |rojo| engine.report_bridge(7, 100, None, 0, rojo, PollExtra::default());
+        report(json!({"status": "Confirming", "port": "34999"}));
         assert_eq!(pending(), None); // connecting to another server
         let paths: Vec<String> = (0..30).map(|n| format!("Workspace.Part{n}")).collect();
         let summary = json!({"removed": {"count": 30, "paths": paths}, "added": {"count": 0, "paths": {}},
                              "changed": {"count": 1, "paths": ["ServerScriptService.Main", 5]}});
-        engine.report_bridge(7, 100, None, 0, json!({"status": "Confirming", "port": "34880", "pending": summary}));
+        report(json!({"status": "Confirming", "port": "34880", "pending": summary}));
         let shown = pending().unwrap();
         let summary = shown.summary.unwrap();
         assert_eq!(shown.instance, "7");
@@ -2707,10 +3102,44 @@ mod tests {
         assert_eq!(summary.changed.paths, ["ServerScriptService.Main"]);
         assert!(summary.added.paths.is_empty());
         // An older bridge: waiting, with nothing to show about it.
-        engine.report_bridge(7, 100, None, 0, json!({"status": "Confirming", "port": "34880"}));
+        report(json!({"status": "Confirming", "port": "34880"}));
         assert_eq!(pending().unwrap().summary, None);
-        engine.report_bridge(7, 100, None, 0, json!({"status": "Connected", "port": "34880"}));
+        report(json!({"status": "Connected", "port": "34880"}));
         assert_eq!(pending(), None);
+    }
+
+    #[test]
+    fn an_idle_studio_with_an_old_bridge_stays_open_and_its_user_is_told_once() {
+        let project = config::Project {
+            name: "MyGame".into(),
+            path: "C:\\Games\\MyGame".into(),
+            project_file: "default.project.json".into(),
+            port: 34880,
+            autostart: false,
+            auto_connect: false,
+            place: Some(PlaceLink::Published(Place { place_id: 100, universe_id: 1 })),
+            sourcemap: false,
+            lane: None,
+            idle_close: Some(1),
+        };
+        let alerts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&alerts);
+        let engine =
+            Engine::new(Config { projects: vec![project], ..Config::default() }, PathBuf::new(), move |event| {
+                if let Event::Alert(message) = event {
+                    seen.lock().unwrap().push(message);
+                }
+            });
+        // A bridge older than 13 does not say how long its Studio has been idle.
+        let report = || engine.report_bridge(7, 100, None, 0, json!({}), PollExtra::default());
+        report();
+        assert!(alerts.lock().unwrap().is_empty());
+        engine.lock().bridges.get_mut(&7).unwrap().active =
+            Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+        report();
+        report();
+        assert_eq!(alerts.lock().unwrap().len(), 1);
+        assert!(alerts.lock().unwrap()[0].starts_with("MyGame: its Studio looks idle but stays open"));
     }
 
     #[test]

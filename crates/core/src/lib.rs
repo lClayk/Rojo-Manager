@@ -9,12 +9,14 @@ pub mod control;
 pub mod https;
 pub mod localnet;
 pub mod manager;
+pub mod pull;
 pub mod rojo_api;
 pub mod scaffold;
 pub mod shell;
 pub mod startup;
 pub mod studio;
 pub mod studio_link;
+pub mod studio_process;
 pub mod tooling;
 pub mod updates;
 

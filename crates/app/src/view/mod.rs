@@ -37,6 +37,7 @@ pub enum Field {
     Name,
     Port,
     Place,
+    IdleClose,
 }
 
 struct Editing {
@@ -258,7 +259,11 @@ impl MainView {
 
     /// Start editing a project field in place: the input takes focus with its text selected.
     fn edit(&mut self, project: &str, field: Field, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        let placeholder = if field == Field::Place { "Place ID, Roblox link, or local" } else { "" };
+        let placeholder = match field {
+            Field::Place => "Place ID, Roblox link, or local",
+            Field::IdleClose => "Minutes",
+            Field::Name | Field::Port => "",
+        };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(placeholder));
         let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_edit(window, cx),

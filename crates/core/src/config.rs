@@ -104,7 +104,14 @@ pub struct Project {
     pub sourcemap: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
+    /// Close the place's Studio, and stop the server unless it autostarts, after this many minutes
+    /// with nothing happening in that Studio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_close: Option<u32>,
 }
+
+/// The longest idle time a project can be given: a week.
+pub const MAX_IDLE_CLOSE: u32 = 7 * 24 * 60;
 
 /// App preferences. Field names are the JSON keys agents use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,6 +355,13 @@ pub fn validate(value: &Value) -> Result<Config, String> {
                 Some(Lane { parent: parent.to_string(), holder })
             }
         };
+        let idle_close = match item.get("idleClose") {
+            None | Some(Value::Null) => None,
+            Some(minutes) => {
+                let minutes = minutes.as_u64().filter(|m| (1..=u64::from(MAX_IDLE_CLOSE)).contains(m));
+                Some(minutes.ok_or("Project idleClose must be 1 to 10080 minutes")? as u32)
+            }
+        };
         projects.push(Project {
             name: name.to_string(),
             path: path.to_string(),
@@ -358,6 +372,7 @@ pub fn validate(value: &Value) -> Result<Config, String> {
             place,
             sourcemap,
             lane,
+            idle_close,
         });
     }
     // Only a window preference, so a bad entry is dropped instead of refusing the file.
@@ -415,7 +430,7 @@ mod tests {
                           "place": {"placeId": 1, "universeId": 2}, "sourcemap": true},
                          {"name": "Lobby", "path": FOLDER, "projectFile": "default.project.json",
                           "port": 34873, "autostart": false, "place": {"file": "Lobby-0123abcd.rbxl"},
-                          "lane": {"parent": "Game", "holder": "lane B"}}],
+                          "lane": {"parent": "Game", "holder": "lane B"}, "idleClose": 30}],
             "settings": {"tray": false, "unknown": 1}
         });
         let config = validate(&stored).unwrap();
@@ -447,6 +462,9 @@ mod tests {
         assert!(validate(&json!({"projects": [local("A", 1, "a.rbxl"), local("B", 2, "A.rbxl")]})).is_err());
         let lane = json!({"name": "A", "path": FOLDER, "port": 1, "lane": {"parent": "Game"}});
         assert!(validate(&json!({"projects": [lane]})).is_err()); // a lane needs a local place
+        let idle = |minutes: u64| json!({"name": "A", "path": FOLDER, "port": 1, "idleClose": minutes});
+        assert!(validate(&json!({"projects": [idle(0)]})).is_err());
+        assert!(validate(&json!({"projects": [idle(10081)]})).is_err());
         assert_eq!(validate(&json!({})).unwrap(), Config::default());
     }
 }

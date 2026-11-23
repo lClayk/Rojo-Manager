@@ -21,7 +21,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const ACTIONS: [&str; 8] = ["start", "stop", "restart", "open-studio", "link-place", "update", "remove", "restore"];
+pub const ACTIONS: [&str; 9] =
+    ["start", "stop", "restart", "open-studio", "link-place", "update", "remove", "restore", "pull"];
 pub const MAX_BODY: usize = 16384;
 /// A bridge poll can carry a command's result, such as the output of agent Luau.
 pub const MAX_BRIDGE_BODY: usize = 1024 * 1024;
@@ -66,9 +67,10 @@ impl std::fmt::Display for ControlError {
 /// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
 /// - POST /lanes, POST /lanes/<name>/remove  lane(None, body) or lane(Some(name), body)
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
-/// - POST /bridge/<id>               poll_bridge(id, body) (AutoConnectServer, no token)
+/// - POST /bridge/<id>               poll_bridge(id, body, connection) (AutoConnectServer, no token)
 /// - POST /output                    report_output(body) (AutoConnectServer, no token)
 /// - POST /backup                    save_backup(body) (AutoConnectServer, no token)
+/// - POST /capture/<id>              save_capture(id, body's data) (AutoConnectServer, no token)
 ///
 /// Bodies are JSON objects ({} when empty). Errors reply {"error": message} with their status.
 pub trait ControlHandler: Send + Sync + 'static {
@@ -85,7 +87,11 @@ pub trait ControlHandler: Send + Sync + 'static {
     fn report_rojo_plugins(&self, count: u32);
     /// A bridge's poll. Answers {"port", "accept"}: the place's auto-connect server (null for none)
     /// and whether to accept Rojo's sync prompt, plus "command" once one is queued for this bridge.
-    fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value;
+    /// `connection` is the poll's (client port, server port), which names the Studio process.
+    fn poll_bridge(&self, id: u64, poll: BridgePoll, connection: Option<(u16, u16)>) -> Value;
+    /// The instances a bridge captured for a pull, as base64 `.rbxm`; `id` is the one the capture
+    /// command named.
+    fn save_capture(&self, id: u64, data: String);
     /// New lines of Studio's Output from a bridge.
     fn report_output(&self, output: StudioOutput);
     /// {"bridge", "instances"}: whether the bridge is installed and the Studio windows it reports from;
@@ -112,6 +118,9 @@ pub struct BridgePoll {
     pub rojo: Value,
     #[serde(default)]
     pub result: Option<CommandResult>,
+    /// Seconds since something last happened in this Studio (bridge 13 and later).
+    #[serde(default)]
+    pub idle: Option<u64>,
 }
 
 /// A command's outcome: its return value, or the error message when not `ok`.
@@ -227,6 +236,7 @@ impl AutoConnectServer {
     pub fn start(handler: Arc<dyn ControlHandler>, port: u16) -> io::Result<AutoConnectServer> {
         // std sets no SO_REUSEADDR on Windows, so binding a taken port fails here.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+        let port = listener.local_addr()?.port();
         // Each open Studio holds one worker with its poll, so this serves more at once.
         let served = Served::start(listener, 16, move |request| {
             if header(request, "Origin").is_some() {
@@ -269,11 +279,22 @@ impl AutoConnectServer {
                     let poll = body(request, MAX_BRIDGE_BODY).and_then(|body| {
                         serde_json::from_value(Value::Object(body)).map_err(|e| ControlError::bad(e.to_string()))
                     });
+                    let connection = request.remote_addr().map(|client| (client.port(), port));
                     match poll {
-                        Ok(poll) => (200, handler.poll_bridge(id, poll)),
+                        Ok(poll) => (200, handler.poll_bridge(id, poll, connection)),
                         Err(error) => (error.status, json!({ "error": error.message })),
                     }
                 }
+                (true, "capture", Some(id)) => match body(request, MAX_BACKUP_BODY) {
+                    Ok(mut body) => match body.remove("data") {
+                        Some(Value::String(data)) => {
+                            handler.save_capture(id, data);
+                            (200, json!({}))
+                        }
+                        _ => (400, json!({ "error": "Pass data" })),
+                    },
+                    Err(error) => (error.status, json!({ "error": error.message })),
+                },
                 _ => (404, json!({})),
             }
         })?;
@@ -559,7 +580,14 @@ mod tests {
             self.calls.lock().unwrap().push(json!(["rojo-plugins", count]));
         }
 
-        fn poll_bridge(&self, id: u64, poll: BridgePoll) -> Value {
+        fn save_capture(&self, id: u64, data: String) {
+            self.calls.lock().unwrap().push(json!(["capture", id, data]));
+        }
+
+        fn poll_bridge(&self, id: u64, poll: BridgePoll, connection: Option<(u16, u16)>) -> Value {
+            // The poll comes from this test process.
+            let owner = connection.and_then(|(client, server)| crate::localnet::connection_owner(client, server));
+            assert_eq!(owner, Some(std::process::id()));
             self.calls.lock().unwrap().push(json!(["bridge", id, poll.place_id, poll.port]));
             match poll.place_id {
                 42 => json!({"port": 34880, "accept": true}),
@@ -698,6 +726,9 @@ mod tests {
         assert_eq!(send("POST", "/backup", Some(&backup), &[]).0, 200);
         assert_eq!(fake.calls.lock().unwrap().last(), Some(&json!(["backup", 34880, ["Workspace.Map"], data])));
         assert_eq!(send("POST", "/backup", Some(&json!({"paths": []})), &[]).0, 400);
+        assert_eq!(send("POST", "/capture/5", Some(&json!({"data": "QQ=="})), &[]).0, 200);
+        assert_eq!(fake.calls.lock().unwrap().last(), Some(&json!(["capture", 5, "QQ=="])));
+        assert_eq!(send("POST", "/capture/5", Some(&json!({"data": 1})), &[]).0, 400);
         let error = AutoConnectServer::start(Arc::new(Fake::default()), port).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         server.close();

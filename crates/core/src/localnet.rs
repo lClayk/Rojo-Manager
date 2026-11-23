@@ -15,7 +15,7 @@ mod platform;
 #[path = "localnet_windows.rs"]
 mod platform;
 
-pub use platform::{kill_process, listeners, process_name, tcp_snapshot};
+pub use platform::{connection_owner, kill_process, listeners, process_name, tcp_snapshot};
 
 /// The processes owning a top-level window whose title starts with `prefix`. Windows only.
 #[cfg(windows)]
@@ -187,6 +187,10 @@ mod tests {
             let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
             let _accepted = server.accept().unwrap();
             assert_eq!(tcp_snapshot(true).unwrap().1.get(&port), Some(&2)); // client and server ends
+            let client = _client.local_addr().unwrap().port();
+            assert_eq!(connection_owner(client, port), Some(std::process::id()));
+            assert_eq!(connection_owner(port, client), Some(std::process::id())); // the accepted end
+            assert_eq!(connection_owner(client, client), None);
         }
         let exe = std::env::current_exe().unwrap();
         let name = exe.file_name().unwrap().to_string_lossy().into_owned();

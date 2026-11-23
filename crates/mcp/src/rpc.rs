@@ -21,15 +21,22 @@ const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Ro
 - open_place opens a project's place in Roblox Studio; connect_rojo=true also starts the server and connects Rojo.
   Passing both project and place links that place to the project first. place=local gives a project a local
   place: an unpublished file Rojo Manager builds from the project with rojo build, named by its placeFile.
+  hidden=true opens it without a Studio window (Windows only), for work the user does not need to watch;
+  hidden=false shows that window again, as Open Studio in Rojo Manager does. idle_close=<minutes> has Rojo
+  Manager close that Studio once nothing has happened in it for that long, losing unsaved changes there;
+  manage_project update changes it later, and 0 turns it off. Set it on a Studio you opened for yourself.
 - rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
   waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort. Its pending
   field counts what accepting adds, changes, and removes; removed instances exist only in Studio and are deleted.
   Rojo Manager backs those up first (also when Rojo removes them without asking): rojo_session backups lists
-  them and restore puts one back.
+  them and restore puts one back. rojo_session pull writes what Studio has for the project's synced folders
+  into its files (rojo syncback), for edits made in Studio such as UI built there; preview=true lists the
+  files it would write and remove. Studio's version wins, so preview first when the files may be newer than
+  Studio. It needs Rojo 7.7 or later, Lune, and a place project.
 - manage_project adds project folders, makes new projects (create runs rojo init; convert turns a .rbxl place's
   code services into files and keeps the place, map and all, as the project's local place), changes a project's
-  name, port, autostart, auto_connect, sourcemap, or linked place, or removes a project from the list (its files
-  are kept, except a local place file).
+  name, port, autostart, auto_connect, sourcemap, idle_close, or linked place, or removes a project from the
+  list (its files are kept, except a local place file).
 - lane create gives this agent an isolated Studio for parallel work: a project from a copy of a project (such
   as a git worktree), with a local place of its own, opened in Studio and synced. It stays across restarts; lane
   remove closes it, and deleting its folder ends it. Use one instead of sharing the main project's Studio with
