@@ -67,15 +67,16 @@ mod platform {
         })
     }
 
-    /// Open a file or link without showing its window; answers the process it started, if it started one.
-    pub fn open_hidden(target: &str) -> io::Result<Option<u32>> {
+    /// Open a file or link, without showing its window when `hidden`; answers the process it started,
+    /// if it started one.
+    pub fn launch(target: &str, hidden: bool) -> io::Result<Option<u32>> {
         let target = HSTRING::from(target);
         let mut info = SHELLEXECUTEINFOW {
             cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_NOCLOSEPROCESS,
             lpVerb: w!("open"),
             lpFile: windows::core::PCWSTR(target.as_ptr()),
-            nShow: SW_HIDE.0,
+            nShow: if hidden { SW_HIDE.0 } else { SW_SHOW.0 },
             ..Default::default()
         };
         // SAFETY: `info` is fully set up and its strings outlive the call.
@@ -164,19 +165,22 @@ mod platform {
 }
 
 /// Open `target`, a place file or a roblox-studio: link, in Studio. With `hidden`, Studio shows no
-/// window, and its splash and startup dialogs are hidden too; the answer is its process when one
-/// was started hidden. Where hiding is not supported, Studio opens visible.
+/// window, and its splash and startup dialogs are hidden too. The answer is the process it started,
+/// when Windows says (so not off Windows). Where hiding is not supported, Studio opens visible.
 pub fn open(target: &str, hidden: bool) -> io::Result<Option<u32>> {
     #[cfg(windows)]
-    if hidden {
-        let pid = platform::open_hidden(target)?;
-        if let Some(pid) = pid {
+    {
+        let pid = platform::launch(target, hidden)?;
+        if let Some(pid) = pid.filter(|_| hidden) {
             platform::hide_while_starting(pid, std::time::Instant::now() + STARTUP);
         }
-        return Ok(pid);
+        Ok(pid)
     }
-    let _ = hidden;
-    crate::shell::open(target).map(|()| None)
+    #[cfg(not(windows))]
+    {
+        let _ = hidden;
+        crate::shell::open(target).map(|()| None)
+    }
 }
 
 /// Whether hiding Studio's windows is supported here.

@@ -382,6 +382,8 @@ pub fn run(launch: Launch) {
             let _ = tx.send(ipc::line(&ToWindow::Event(event)));
         }
     });
+    // Before agents can reach the engine, so a baseplate one opens now is not swept away.
+    engine.sweep_places();
     let handler: Arc<dyn ControlHandler> = Arc::new(Control(Arc::clone(&engine)));
     let control = ControlServer::start(Arc::clone(&handler))
         .inspect_err(|error| engine.notice(format!("Agent control is unavailable: {error}")))

@@ -26,6 +26,7 @@ use crate::widgets::{Button, Callback, Dialog, TITLE_BAR, TITLE_BAR_INSET, Varia
 pub use logs::Logs;
 mod add;
 mod backups;
+mod setup;
 use settings::AgentHelp;
 
 const NOTICE: Duration = Duration::from_secs(6);
@@ -83,6 +84,11 @@ pub struct MainView {
     adding: Option<&'static str>,
     /// Manual setup steps for an agent, over Settings.
     agent_help: Option<AgentHelp>,
+    /// The setup's page, while Snapshot::setup shows it.
+    setup_step: setup::Step,
+    /// The agents with Rojo Manager's MCP server set up, read from their config files when the
+    /// window opens and after adding it to one.
+    mcp_agents: Vec<&'static str>,
     list_scroll: ScrollHandle,
     settings_scroll: ScrollHandle,
 }
@@ -110,6 +116,8 @@ impl MainView {
             flash: None,
             adding: None,
             agent_help: None,
+            setup_step: setup::Step::Plugin,
+            mcp_agents: rojo_manager_core::studio::rojo_manager_agents(),
             list_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
         };
@@ -302,8 +310,10 @@ impl MainView {
             && self.logs.take().is_none()
             && self.backups.take().is_none()
             && !std::mem::take(&mut self.add_open)
+            && !std::mem::take(&mut self.settings_open)
+            && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.setup)
         {
-            self.settings_open = false;
+            self.finish_setup(cx);
         }
         cx.notify();
     }
@@ -415,38 +425,17 @@ impl MainView {
             .child(action)
     }
 
-    /// A small card in the top right with one question, until answered: another Studio MCP already
-    /// gives agents execute_luau, so offer to hide Rojo Manager's copy; or, once the app has been in
-    /// use for a while, ask for a star on GitHub.
+    /// A small card in the top right, until answered: once the app has been in use for a while, ask
+    /// for a star on GitHub.
     fn render_prompt(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
-        let (title, message, (no_id, no), (yes_id, yes), answer): (
-            _,
-            _,
-            _,
-            _,
-            fn(&mut Self, bool, &mut Context<Self>),
-        ) = if let Some(server) = &snapshot.studio_tools_prompt {
-            (
-                "Duplicate Studio tools",
-                format!("{server} has them too. Hide Rojo Manager's copy?"),
-                ("studio-tools-keep", "Keep"),
-                ("studio-tools-hide", "Hide"),
-                |this, hide, cx| this.answer_studio_tools(!hide, cx),
-            )
-        } else if snapshot.star_prompt {
-            (
-                "Enjoying Rojo Manager?",
-                "A star on GitHub helps other Roblox developers find it.".to_string(),
-                ("star-never", "Don't ask again"),
-                ("star-open", "Star on GitHub"),
-                |this, star, cx| this.answer_star(star, cx),
-            )
-        } else {
+        if !snapshot.star_prompt {
             return None;
-        };
-        let on_click = |choice: bool| cx.listener(move |this: &mut Self, _, _, cx| answer(this, choice, cx));
+        }
+        let (title, message) = ("Enjoying Rojo Manager?", "A star on GitHub helps other Roblox developers find it.");
+        let ((no_id, no), (yes_id, yes)) = (("star-never", "Don't ask again"), ("star-open", "Star on GitHub"));
+        let on_click = |star: bool| cx.listener(move |this: &mut Self, _, _, cx| this.answer_star(star, cx));
         // As wide as the card's buttons need (the font is bundled), so its text is no wider than they are.
-        let width = if snapshot.studio_tools_prompt.is_some() { 280. } else { 257. };
+        let width = 257.;
         Some(
             div()
                 .absolute()
@@ -481,8 +470,9 @@ impl MainView {
         )
     }
 
-    fn answer_studio_tools(&mut self, keep: bool, cx: &mut Context<Self>) {
-        self.run(cx, move |engine| engine.answer_studio_tools(keep), |_, (), _| {});
+    /// The setup was finished or skipped; what it set up was saved as it went.
+    fn finish_setup(&mut self, cx: &mut Context<Self>) {
+        self.run(cx, |engine| engine.finish_setup(), |_, (), _| {});
     }
 
     /// Either answer ends the star prompt; `star` also opens the repository.
@@ -525,6 +515,21 @@ impl MainView {
                     .variant(Variant::Primary)
                     .disabled(snapshot.tool_job.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.tool_job(Job::Bridge { tool: "Rojo".into() }, cx))),
+            ));
+        }
+        // A hidden Studio that no project row can show, such as one an agent opened for a place ID.
+        for studio in &snapshot.hidden_studios {
+            let instance = studio.instance.clone();
+            banners.push(Self::banner(
+                "eye-off",
+                MUTED,
+                format!("Studio with {} is open without a window", studio.place),
+                Button::new(format!("show-studio-{instance}")).label("Show").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let instance = instance.clone();
+                        this.run(cx, move |engine| engine.show_studio(&instance), |_, (), _| {});
+                    },
+                )),
             ));
         }
         let update = &snapshot.app_update;
@@ -783,7 +788,7 @@ impl Render for MainView {
             3
         } else if self.tools_open {
             2
-        } else if self.settings_open {
+        } else if self.settings_open || snapshot.setup {
             1
         } else {
             0
@@ -803,6 +808,10 @@ impl Render for MainView {
             .child(self.render_footer(&snapshot))
             .children((top == 0).then(|| self.render_prompt(&snapshot, cx)).flatten())
             .when(self.settings_open, |root| root.child(tabbable(top == 1, || settings::render(self, &snapshot, cx))))
+            // Once, over the list; Settings has the same controls.
+            .when(snapshot.setup && !self.settings_open, |root| {
+                root.child(tabbable(top == 1, || setup::render(self, &snapshot, cx)))
+            })
             .when(self.tools_open, |root| {
                 root.child(tabbable(top == 2, || settings::render_tools(self, &snapshot, cx)))
             })

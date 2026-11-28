@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use rojo_manager_core::config::Place;
+use rojo_manager_core::config::{Place, Settings};
 use rojo_manager_core::control::RequestError;
 use rojo_manager_core::studio::ResolveError;
 use serde_json::{Value, json};
@@ -35,8 +35,8 @@ pub struct Fake {
     pub instances: Script<Value>,
     /// What Studio commands return.
     pub studio: Script<Value>,
-    /// The studio_tools setting.
-    pub studio_tools: bool,
+    /// Rojo Manager's settings.
+    pub settings: Settings,
     /// Read with [`Fake::calls`].
     pub calls: Mutex<Vec<String>>,
 }
@@ -48,14 +48,14 @@ impl Default for Fake {
             reply: |_, _| json!({"project": project("serving", true)}),
             instances: Script::new([json!({"bridge": true, "instances": []})]),
             studio: Script::new([json!({"status": "Connected"})]),
-            studio_tools: true,
+            settings: Settings::default(),
             calls: Mutex::default(),
         }
     }
 }
 
 impl Fake {
-    /// Control requests ("METHOD path body"), launches, place lookups, and Studio launches, in order;
+    /// Control requests ("METHOD path body"), launches, and place lookups, in order;
     /// GET /studio is left out.
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -118,18 +118,13 @@ impl Backend for Fake {
         Ok(())
     }
 
-    fn studio_tools(&self) -> bool {
-        self.studio_tools
+    fn settings(&self) -> Settings {
+        self.settings
     }
 
     fn resolve_place(&self, text: &str) -> Result<Place, ResolveError> {
         self.record(format!("resolve {text}"));
         Ok(Place { place_id: 2, universe_id: 1 })
-    }
-
-    fn open_place(&self, place: &Place) -> io::Result<()> {
-        self.record(format!("open {}", place.place_id));
-        Ok(())
     }
 
     fn sleep(&self, _duration: Duration) {}

@@ -3,6 +3,7 @@
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use rojo_manager_core::config::KeepCursor;
 use rojo_manager_core::manager::Snapshot;
 use rojo_manager_core::tooling::{Job, RojoState, StudioPlugin};
 use rojo_manager_core::updates::UpdateState;
@@ -25,7 +26,7 @@ pub struct AgentHelp {
 }
 
 impl AgentHelp {
-    fn other(path: &str) -> Self {
+    pub(super) fn other(path: &str) -> Self {
         AgentHelp {
             title: "Other MCP clients".into(),
             message: "Add this to your MCP client's config file. If the file already has \"mcpServers\", \
@@ -61,7 +62,8 @@ const CLIENTS: [(&str, &str); 3] = [
     ("Windsurf", "~/.codeium/windsurf/mcp_config.json"),
 ];
 
-const STARTUP_LABEL: &str = if cfg!(target_os = "macos") { "Open at login" } else { "Launch at Windows startup" };
+pub(super) const STARTUP_LABEL: &str =
+    if cfg!(target_os = "macos") { "Open at login" } else { "Launch at Windows startup" };
 
 /// Read a setting from the snapshot; launch_at_startup lives in the registry, not config.json.
 fn value(snapshot: &Snapshot, key: &str) -> bool {
@@ -76,8 +78,12 @@ impl MainView {
         self.run(cx, move |engine| engine.set_setting(key, value), |_, (), _| {});
     }
 
+    fn set_keep_cursor(&mut self, choice: KeepCursor, cx: &mut Context<Self>) {
+        self.run(cx, move |engine| engine.set_keep_cursor(choice), |_, (), _| {});
+    }
+
     /// Run the agent's `mcp add` off the UI thread; if that cannot work, show the command to run instead.
-    fn add_to_agent(&mut self, key: &'static str, agent: Agent, cx: &mut Context<Self>) {
+    pub(super) fn add_to_agent(&mut self, key: &'static str, agent: Agent, cx: &mut Context<Self>) {
         let Some(path) = self.snapshot.as_ref().map(|s| s.mcp_path.clone()) else { return };
         self.adding = Some(key);
         cx.notify();
@@ -91,6 +97,7 @@ impl MainView {
                 this.adding = None;
                 match result {
                     Ok(()) => {
+                        this.mcp_agents = rojo_manager_core::studio::rojo_manager_agents();
                         this.flash(key, "Added", cx);
                         this.notify(format!("Added to {}. Start a new session to use it.", agent.name()), cx);
                     }
@@ -111,7 +118,7 @@ impl MainView {
     }
 }
 
-fn toggle(
+pub(super) fn toggle(
     snapshot: &Snapshot,
     key: &'static str,
     label: &'static str,
@@ -126,6 +133,91 @@ fn toggle(
         .into_any_element()
 }
 
+/// What each agent tool a user can turn off does (Settings::TOOLS, in order).
+const AGENT_TOOLS: [(&str, &str); 4] = [
+    ("get_connected_instances", "Lists Studio windows"),
+    ("execute_luau", "Runs Luau in Studio"),
+    ("studio_output", "Reads Studio's Output"),
+    ("close_studio", "Closes a Studio window"),
+];
+
+/// A switch per agent tool: its name, what it does, and which other Studio MCPs have it too.
+pub(super) fn tool_toggles(snapshot: &Snapshot, cx: &mut Context<MainView>) -> Vec<AnyElement> {
+    AGENT_TOOLS
+        .iter()
+        .map(|&(tool, does)| {
+            let on = value(snapshot, tool);
+            let flip = cx.listener(move |this, _: &ClickEvent, _, cx| this.set_setting(tool, !on, cx));
+            let text = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(div().font_family(MONO).text_size(TEXT_BASE).text_color(rgb(TEXT)).child(tool))
+                .child(div().mt(px(2.)).text_size(TEXT_SM).text_color(rgb(MUTED)).child(does))
+                .when_some(logic::overlap(tool, &snapshot.studio_mcps), |d, overlap| {
+                    d.child(div().mt(px(2.)).text_size(TEXT_SM).text_color(rgb(BLUE)).child(overlap))
+                });
+            tab_stop(div().id(tool).rounded(px(11.)))
+                .on_click(flip)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(16.))
+                        .px(px(16.))
+                        .py(px(12.))
+                        .child(text)
+                        .child(switch(format!("{tool}-switch"), on)),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// The Studio plugin row with its install button, and a warning when the Creator Store Rojo runs too.
+pub(super) fn plugin_rows(snapshot: &Snapshot, cx: &mut Context<MainView>) -> Vec<AnyElement> {
+    let bridge = matches!(snapshot.studio_plugin, StudioPlugin::Bridge { .. });
+    let rojo = snapshot.tool_versions.get("Rojo").cloned().flatten();
+    let plugin = logic::plugin_row(&snapshot.studio_plugin, rojo.as_deref(), installing_bridge(snapshot));
+    let mut rows = vec![
+        tinted_row(
+            "Studio plugin with agent bridge",
+            Some(plugin.hint.into()),
+            if plugin.warn { YELLOW } else { MUTED },
+            Button::new("bridge")
+                .label(plugin.button)
+                .variant(if plugin.primary { Variant::Primary } else { Variant::Outline })
+                .disabled(snapshot.tool_job.is_some())
+                .on_click(cx.listener(|this, _, _, cx| this.tool_job(Job::Bridge { tool: "Rojo".into() }, cx))),
+        )
+        .into_any_element(),
+    ];
+    // The bridge reports how many Rojo plugins Studio runs; until it has, the Creator Store copy
+    // being installed (it may be turned off) is only worth a reminder.
+    match snapshot.studio_rojo_plugins {
+        Some(count) if bridge && count > 1 => rows.push(
+            tinted_row(
+                "Two Rojo plugins are running",
+                Some("Turn off the Creator Store Rojo in Studio under Plugins > Manage Plugins.".into()),
+                YELLOW,
+                icon("triangle-alert", 16., YELLOW),
+            )
+            .into_any_element(),
+        ),
+        None if bridge && snapshot.creator_store_rojo => rows.push(
+            row(
+                "Creator Store Rojo",
+                Some("Also installed. Keep it off in Studio under Plugins > Manage Plugins.".into()),
+                div(),
+            )
+            .into_any_element(),
+        ),
+        _ => {}
+    }
+    rows
+}
+
 /// Whether the running tool job builds the Studio plugin; updating Rojo rebuilds the bridge too.
 pub fn installing_bridge(snapshot: &Snapshot) -> bool {
     let bridge = matches!(snapshot.studio_plugin, StudioPlugin::Bridge { .. });
@@ -136,12 +228,7 @@ pub fn installing_bridge(snapshot: &Snapshot) -> bool {
 }
 
 pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) -> Div {
-    let busy = snapshot.tool_job.is_some();
     let update = &snapshot.app_update;
-    let bridge = matches!(snapshot.studio_plugin, StudioPlugin::Bridge { .. });
-    let installing = installing_bridge(snapshot);
-    let rojo = snapshot.tool_versions.get("Rojo").cloned().flatten();
-    let plugin = logic::plugin_row(&snapshot.studio_plugin, rojo.as_deref(), installing);
     let shortcuts = [
         ("show_wally", "Wally install button", "On projects with wally.toml"),
         ("show_rokit", "Rokit install button", "On projects with rokit.toml"),
@@ -168,48 +255,9 @@ pub fn render(view: &MainView, snapshot: &Snapshot, cx: &mut Context<MainView>) 
         toggle(snapshot, "auto_update", "Install updates on launch", Some("The app and the Studio bridge"), cx),
     ]);
 
-    let mut agents = vec![
-        tinted_row(
-            "Studio plugin with agent bridge",
-            Some(plugin.hint.into()),
-            if plugin.warn { YELLOW } else { MUTED },
-            Button::new("bridge")
-                .label(plugin.button)
-                .variant(if plugin.primary { Variant::Primary } else { Variant::Outline })
-                .disabled(busy)
-                .on_click(cx.listener(|this, _, _, cx| this.tool_job(Job::Bridge { tool: "Rojo".into() }, cx))),
-        )
-        .into_any_element(),
-    ];
-    // The bridge reports how many Rojo plugins Studio runs; until it has, the Creator Store copy
-    // being installed (it may be turned off) is only worth a reminder.
-    match snapshot.studio_rojo_plugins {
-        Some(count) if bridge && count > 1 => agents.push(
-            tinted_row(
-                "Two Rojo plugins are running",
-                Some("Turn off the Creator Store Rojo in Studio under Plugins > Manage Plugins.".into()),
-                YELLOW,
-                icon("icons/triangle-alert.svg", 16., YELLOW),
-            )
-            .into_any_element(),
-        ),
-        None if bridge && snapshot.creator_store_rojo => agents.push(
-            row(
-                "Creator Store Rojo",
-                Some("Also installed. Keep it off in Studio under Plugins > Manage Plugins.".into()),
-                div(),
-            )
-            .into_any_element(),
-        ),
-        _ => {}
-    }
-    agents.push(toggle(
-        snapshot,
-        "studio_tools",
-        "Studio tools for agents",
-        Some("execute_luau and get_connected_instances. Turn off if another Studio MCP has them"),
-        cx,
-    ));
+    let mut agents = plugin_rows(snapshot, cx);
+    agents.extend(tool_toggles(snapshot, cx));
+    agents.push(keep_cursor_row(snapshot, cx));
     let setup = |key: &'static str, label: &'static str, agent: Agent| {
         let label = if view.adding == Some(key) { "Adding…" } else { view.flashed(key).unwrap_or(label) };
         Button::new(key)
@@ -549,4 +597,57 @@ pub fn render_agent_help(view: &MainView, help: &AgentHelp, cx: &mut Context<Mai
         tall: false,
     }
     .render("agent-help", close)
+}
+
+/// The keep_cursor choice, shared by Settings and the setup: left to the agent that opened the
+/// hidden Studio, always, or never.
+pub(super) fn keep_cursor_row(snapshot: &Snapshot, cx: &mut Context<MainView>) -> AnyElement {
+    let current = snapshot.settings.keep_cursor;
+    let choices = KeepCursor::ALL.map(|choice| {
+        let (id, label) = match choice {
+            KeepCursor::Agent => ("keep-cursor-agent", "Agent decides"),
+            KeepCursor::Always => ("keep-cursor-always", "Always"),
+            KeepCursor::Never => ("keep-cursor-never", "Never"),
+        };
+        Button::new(id)
+            .label(label)
+            .variant(if choice == current { Variant::Primary } else { Variant::Outline })
+            .on_click(cx.listener(move |this, _, _, cx| this.set_keep_cursor(choice, cx)))
+    });
+    // The choices go on a line of their own, so the label and hint have the full width.
+    let label = div().flex().items_center().gap(px(8.)).child("Stop hidden Studio from moving your cursor").child(
+        div()
+            .px(px(5.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(rgb(YELLOW))
+            .text_size(TEXT_SM)
+            .text_color(rgb(YELLOW))
+            .child("Experimental"),
+    );
+    let how = "In a hidden Studio's playtest, the bridge adds an invisible modal button,\nwhich tells Roblox \
+        to leave the mouse unlocked. Nothing is saved to your place,\nand the button goes away once the window \
+        is shown.";
+    let header = div()
+        .id("keep-cursor-info")
+        .flex()
+        .flex_col()
+        .px(px(16.))
+        .pt(px(12.))
+        .pb(px(8.))
+        .tooltip(crate::widgets::tooltip(how))
+        .child(div().text_size(TEXT_BASE).text_color(rgb(TEXT)).child(label))
+        .child(
+            div()
+                .mt(px(2.))
+                .text_size(TEXT_SM)
+                .text_color(rgb(MUTED))
+                .child("Hidden playtests in first person or shift lock grab your cursor"),
+        );
+    div()
+        .flex()
+        .flex_col()
+        .child(header)
+        .child(div().flex().gap(px(4.)).px(px(16.)).pb(px(12.)).children(choices))
+        .into_any_element()
 }

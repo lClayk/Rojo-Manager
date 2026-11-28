@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use rojo_manager_core::config::PlaceLink;
+use rojo_manager_core::config::{KeepCursor, PlaceLink};
 use rojo_manager_core::manager::{Engine, Event, ProjectView, Snapshot, Update};
 use rojo_manager_core::pull::Pulled;
 use rojo_manager_core::tooling::Job;
@@ -85,8 +85,13 @@ pub enum Call {
         universe_id: u64,
         collapsed: bool,
     },
-    AnswerStudioTools {
-        keep: bool,
+    /// Show a hidden Studio window that belongs to no project.
+    ShowStudio {
+        instance: String,
+    },
+    FinishSetup,
+    SetKeepCursor {
+        choice: KeepCursor,
     },
     AnswerStar,
     CheckRojo,
@@ -165,7 +170,9 @@ pub fn serve(engine: &Arc<Engine>, call: Call) -> Result<Value, String> {
         Call::OpenFolder { name } => json(engine.open_folder(&name)),
         Call::SetSetting { key, value } => json(engine.set_setting(&key, value)),
         Call::SetCollapsed { universe_id, collapsed } => json(engine.set_collapsed(universe_id, collapsed)),
-        Call::AnswerStudioTools { keep } => json(engine.answer_studio_tools(keep)),
+        Call::ShowStudio { instance } => json(engine.set_studio_hidden(&instance, false).map_err(|e| e.message)),
+        Call::FinishSetup => json(engine.finish_setup()),
+        Call::SetKeepCursor { choice } => json(engine.set_keep_cursor(choice)),
         Call::AnswerStar => json(engine.answer_star()),
         Call::RunToolJob { job } => json(engine.run_tool_job(job)),
         Call::InstallAppUpdate => json(engine.install_app_update()),
@@ -314,8 +321,14 @@ impl Client {
     pub fn set_collapsed(&self, universe_id: u64, collapsed: bool) -> Result<(), String> {
         self.call(Call::SetCollapsed { universe_id, collapsed })
     }
-    pub fn answer_studio_tools(&self, keep: bool) -> Result<(), String> {
-        self.call(Call::AnswerStudioTools { keep })
+    pub fn show_studio(&self, instance: &str) -> Result<(), String> {
+        self.call(Call::ShowStudio { instance: instance.into() })
+    }
+    pub fn finish_setup(&self) -> Result<(), String> {
+        self.call(Call::FinishSetup)
+    }
+    pub fn set_keep_cursor(&self, choice: KeepCursor) -> Result<(), String> {
+        self.call(Call::SetKeepCursor { choice })
     }
     pub fn answer_star(&self) -> Result<(), String> {
         self.call(Call::AnswerStar)
