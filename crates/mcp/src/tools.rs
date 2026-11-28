@@ -184,7 +184,8 @@ pub fn specs(settings: Settings) -> Value {
             "name": "get_connected_instances",
             "description": "Use to discover the Studio windows Rojo Manager's bridge reaches, with each one's \
                 instanceId, placeId (0 for a file or saved version; see placeName), project, Rojo status, \
-                whether it is hidden, and the idle_close and keep_cursor set on it.",
+                whether it is hidden, the place file Rojo Manager opened in it, and the idle_close and \
+                keep_cursor set on it.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
         },
         {
@@ -1079,6 +1080,8 @@ struct ConnectedInstance {
     idle_close: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_cursor: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
 }
 
 /// get_connected_instances: every Studio window the bridge reports from, with its linked project.
@@ -1098,6 +1101,7 @@ fn connected_instances(backend: &dyn Backend) -> Result<Value, String> {
             hidden: instance.hidden,
             idle_close: instance.idle_close,
             keep_cursor: instance.keep_cursor,
+            file: instance.file,
         })
         .collect();
     Ok(json!({ "instances": instances }))

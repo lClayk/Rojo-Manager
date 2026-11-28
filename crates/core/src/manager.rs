@@ -392,6 +392,53 @@ struct State {
     opened_hidden: HashMap<String, u32>,
     /// Place files open_target opened without a project, until a bridge reports from them.
     launched_files: Vec<LaunchedFile>,
+    /// What agents set on Studio windows before Rojo Manager last restarted, by bridge id, until
+    /// each bridge reports again (see studios.json).
+    restored: HashMap<u64, KeptStudio>,
+}
+
+/// What an agent set on one Studio window, kept in studios.json so a restart of Rojo Manager, such
+/// as for an update, keeps it while that Studio stays open.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct KeptStudio {
+    pid: Option<u32>,
+    idle_close: Option<u32>,
+    keep_cursor: Option<bool>,
+    file: Option<PathBuf>,
+}
+
+fn studios_path() -> PathBuf {
+    config::data_dir().join("studios.json")
+}
+
+/// Write what agents set on the Studio windows, with those still waiting to report after a restart.
+fn save_studios(state: &State) {
+    let mut kept = state.restored.clone();
+    for (id, report) in &state.bridges {
+        if report.idle_close.is_some() || report.keep_cursor.is_some() || report.file.is_some() {
+            let studio = KeptStudio {
+                pid: report.pid,
+                idle_close: report.idle_close,
+                keep_cursor: report.keep_cursor,
+                file: report.file.clone(),
+            };
+            kept.insert(*id, studio);
+        }
+    }
+    let _ = match kept.is_empty() {
+        true => std::fs::remove_file(studios_path()),
+        false => serde_json::to_vec(&kept).map_err(std::io::Error::other).and_then(|data| {
+            std::fs::create_dir_all(config::data_dir())?;
+            std::fs::write(studios_path(), data)
+        }),
+    };
+}
+
+/// The windows studios.json kept whose Studio still runs; the file is only for the next start.
+fn restore_studios() -> HashMap<u64, KeptStudio> {
+    let text = std::fs::read(studios_path()).unwrap_or_default();
+    let kept: HashMap<u64, KeptStudio> = serde_json::from_slice(&text).unwrap_or_default();
+    kept.into_iter().filter(|(_, studio)| studio.pid.is_some_and(studio_process::is_studio)).collect()
 }
 
 /// A place file Studio was asked to open, with its process when it was opened hidden.
@@ -676,7 +723,7 @@ impl Engine {
     /// An engine for settings loaded with `config::load`; `app_dir` holds the companion executables.
     pub fn new(config: Config, app_dir: PathBuf, emit: impl Fn(Event) + Send + Sync + 'static) -> Arc<Engine> {
         Arc::new(Engine {
-            state: Mutex::new(State { config, ..State::default() }),
+            state: Mutex::new(State { config, restored: restore_studios(), ..State::default() }),
             emit: Box::new(emit),
             app_dir,
             closing: AtomicBool::new(false),
@@ -1310,12 +1357,18 @@ impl Engine {
                 (false, before, reported) => before.or(reported).unwrap_or(now),
             };
             let closing = before.is_some_and(|report| report.closing);
-            let own_idle_close = before.and_then(|report| report.idle_close);
-            let keep_cursor = before.and_then(|report| report.keep_cursor);
+            // A bridge that reported before Rojo Manager restarted gets back what an agent set on it.
+            let restored = if before.is_none() { state.restored.remove(&id) } else { None };
+            let before = state.bridges.get(&id);
+            let own_idle_close =
+                before.and_then(|report| report.idle_close).or(restored.as_ref().and_then(|r| r.idle_close));
+            let keep_cursor =
+                before.and_then(|report| report.keep_cursor).or(restored.as_ref().and_then(|r| r.keep_cursor));
             // A bridge without a file claims the file launch it came from: by its process, on any poll
             // once that is known; a launch without a process (off Windows) only by a new bridge with
             // the file name Studio gives the place.
-            let (claimed, new) = (before.and_then(|report| report.file.clone()), before.is_none());
+            let known = before.and_then(|report| report.file.clone()).or(restored.and_then(|r| r.file));
+            let (claimed, new, had_file) = (known.clone(), before.is_none(), known.is_some());
             let file = claimed.or_else(|| {
                 let name = place_name.as_deref().filter(|_| place_id == 0);
                 let launched = |launch: &LaunchedFile| {
@@ -1364,7 +1417,12 @@ impl Engine {
                 keep_cursor,
                 file,
             };
-            (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept, idle, outdated)
+            let claimed_now = !had_file && report.file.is_some();
+            let previous = state.bridges.insert(id, report);
+            if claimed_now {
+                save_studios(&state);
+            }
+            (target, previous, state.config.settings.auto_connect_accept, idle, outdated)
         };
         if let Some((name, _)) = outdated {
             let name = name.unwrap_or_else(|| "A Studio opened by an agent".into());
@@ -1535,7 +1593,11 @@ impl Engine {
         let _ = self.link.run(id, "disconnect", json!({}), Duration::from_secs(5));
         studio_process::close(pid)
             .map_err(|e| ControlError::new(format!("Could not close Studio (process {pid}): {e}"), 500))?;
-        self.lock().bridges.remove(&id);
+        {
+            let mut state = self.lock();
+            state.bridges.remove(&id);
+            save_studios(&state);
+        }
         self.changed();
         Ok(())
     }
@@ -1561,6 +1623,7 @@ impl Engine {
             report.idle_close = (minutes > 0).then_some(minutes);
             report.active = Instant::now();
         }
+        save_studios(&state);
         Ok(())
     }
 
@@ -1571,6 +1634,7 @@ impl Engine {
         let mut state = self.lock();
         let report = state.bridges.get_mut(&id).ok_or_else(|| ControlError::new("That Studio closed", 404))?;
         report.keep_cursor = Some(keep);
+        save_studios(&state);
         Ok(())
     }
 
@@ -3571,10 +3635,17 @@ mod tests {
         assert!(engine.lock().launched_files.is_empty());
         // A launch whose process is known goes only to a bridge from that process, so another
         // window with a file of the same name, reporting first, does not take it.
-        engine.lock().launched_files.push(LaunchedFile { path, pid: Some(4242), at: Instant::now() });
+        engine.lock().launched_files.push(LaunchedFile { path: path.clone(), pid: Some(4242), at: Instant::now() });
         report(9);
         assert_eq!(engine.studio_instances()[2]["file"], Value::Null);
         assert_eq!(engine.lock().launched_files.len(), 1);
+        // After a restart of Rojo Manager, a bridge that reports again gets back what an agent set.
+        let kept = KeptStudio { pid: None, idle_close: Some(30), keep_cursor: Some(false), file: Some(path.clone()) };
+        engine.lock().restored.insert(10, kept);
+        report(10);
+        let restored = &engine.studio_instances()[3];
+        assert_eq!((&restored["idleClose"], &restored["keepCursor"]), (&json!(30), &json!(false)));
+        assert_eq!(restored["file"], json!(path));
         // Once a bridge's process is known, a later poll claims its launch.
         engine.lock().bridges.get_mut(&9).unwrap().pid = Some(4242);
         report(9);
