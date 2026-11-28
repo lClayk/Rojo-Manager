@@ -16,9 +16,9 @@ Questions, feedback, and release updates are on the [DevForum thread](https://de
 
 ## Download and run
 
-**Windows 10 or 11, x64.** Download **RojoManager-1.1.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest), extract it, and double-click **RojoManager.exe**. There is no installer and no administrator access is needed. The download is not code signed yet, so Windows SmartScreen may block the first run: click **More info**, then **Run anyway**. Or ask an agent to install it, as described under [Agents](#agents).
+**Windows 10 or 11, x64.** Download **RojoManager-1.2.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest), extract it, and double-click **RojoManager.exe**. There is no installer and no administrator access is needed. The download is not code signed yet, so Windows SmartScreen may block the first run: click **More info**, then **Run anyway**. Or ask an agent to install it, as described under [Agents](#agents).
 
-**macOS 11 or later (beta).** Download **RojoManager-1.1.0-macos.zip**, open it, and move **Rojo Manager.app** to Applications. It runs in the menu bar. The app is not notarized yet, so macOS blocks the first launch: open **System Settings > Privacy & Security** and click **Open Anyway**.
+**macOS 11 or later (beta).** Download **RojoManager-1.2.0-macos.zip**, open it, and move **Rojo Manager.app** to Applications. It runs in the menu bar. The app is not notarized yet, so macOS blocks the first launch: open **System Settings > Privacy & Security** and click **Open Anyway**.
 
 ## Projects
 
