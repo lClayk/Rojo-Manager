@@ -3252,20 +3252,50 @@ impl ControlHandler for Control {
         Ok(json!({ "file": file }))
     }
 
-    fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {
-        if let Some(target) = install {
-            return self.0.install_update(target);
+    fn setup(&self, action: Option<&str>) -> Result<Value, ControlError> {
+        match action {
+            Some("done") => {
+                self.0.finish_setup().map_err(|e| ControlError::new(e, 500))?;
+                return Ok(json!({ "setupDone": true }));
+            }
+            Some(target) => return self.0.install_update(target),
+            None => {}
         }
         let app = updates::inspect_update(true, crate::VERSION);
-        let bridge = match (tooling::studio_plugin(), self.0.bridge_update()) {
+        let plugin = tooling::studio_plugin();
+        let installed = matches!(plugin, tooling::StudioPlugin::Bridge { .. });
+        let bridge = match (installed, self.0.bridge_update()) {
             (_, Some(message)) => json!({ "state": "outdated", "message": message }),
-            (tooling::StudioPlugin::Bridge { .. }, None) => json!({ "state": "current" }),
-            (_, None) => json!({ "state": "missing", "message": "The Studio bridge is not installed." }),
+            (true, None) => json!({ "state": "current" }),
+            (false, None) => json!({ "state": "missing", "message": "The Studio bridge is not installed." }),
         };
-        Ok(json!({
+        // The servers need Rojo; installing the bridge installs it.
+        let rojo = tooling::tool_version("Rojo", None).ok();
+        let (plugins, setup_done) = {
+            let state = self.0.lock();
+            (state.studio_rojo_plugins, state.config.setup_done)
+        };
+        // As in Settings: the bridge's count of running Rojo plugins, else whether the Creator Store copy is there.
+        let warning = match plugins {
+            Some(count) if installed && count > 1 => Some(
+                "Two Rojo plugins run in Studio. Ask the user to turn off the Creator Store Rojo under Plugins > Manage Plugins.",
+            ),
+            None if installed && tooling::creator_store_rojo_installed() => Some(
+                "The Creator Store Rojo is also installed. It must stay off in Studio (Plugins > Manage Plugins); ask the user to check.",
+            ),
+            _ => None,
+        };
+        let mut answer = json!({
             "app": { "installed": crate::VERSION, "state": app.state, "message": app.message },
             "bridge": bridge,
-        }))
+            "rojo": rojo,
+            "agents": studio::rojo_manager_agents(),
+            "setupDone": setup_done,
+        });
+        if let Some(warning) = warning {
+            answer["warning"] = json!(warning);
+        }
+        Ok(answer)
     }
 }
 

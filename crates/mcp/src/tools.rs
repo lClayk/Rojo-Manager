@@ -22,8 +22,9 @@ use crate::backend::Backend;
 pub type Args = Map<String, Value>;
 
 const RUNNING: [&str; 3] = ["serving", "connected", "external"];
-const BRIDGE_MISSING: &str = "The Rojo Manager bridge is not installed. Install it from Rojo Manager \
-    (Settings > Agents), turn off the Creator Store Rojo plugin, then restart Studio.";
+const BRIDGE_MISSING: &str = "The Rojo Manager bridge is not installed. With the user's OK, install it \
+    with setup install=bridge (or the user can, in Rojo Manager's Settings > Agents); then the Creator Store Rojo \
+    plugin must be off and Studio restarted.";
 /// Longer than the manager waits for Luau to finish in Studio.
 const LUAU_CALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// control.request's default, used for GET /projects.
@@ -164,12 +165,15 @@ pub fn specs(settings: Settings) -> Value {
                 "level": {"type": "string", "enum": ["all", "warning", "error"], "default": "all"}}},
         },
         {
-            "name": "updates",
-            "description": "Check whether Rojo Manager and its Studio bridge are up to date. Install only when the \
-                user asks: app restarts Rojo Manager and its servers (reconnect Rojo after); bridge needs Studio \
-                restarted to load it.",
+            "name": "setup",
+            "description": "What is set up: Rojo Manager and its Studio bridge (current, outdated, or missing), Rojo, \
+                the agents Rojo Manager is added to, and a warning when the user must fix something in Studio. \
+                Install only when the user asks: app restarts Rojo Manager and its servers (reconnect Rojo \
+                after); bridge also installs Rojo, Lune, and Rokit when missing, and Studio must restart to load it.",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
-                "install": {"type": "string", "enum": ["app", "bridge"]}}},
+                "install": {"type": "string", "enum": ["app", "bridge"]},
+                "done": {"type": "boolean", "description": "true once you set Rojo Manager up for the user, so its \
+                    window skips its first-run setup"}}},
         },
         {
             "name": "app_settings",
@@ -209,6 +213,42 @@ pub fn specs(settings: Settings) -> Value {
         list.retain(|spec| settings.get(spec["name"].as_str().unwrap_or_default()) != Some(false));
     }
     specs
+}
+
+/// A tool's arguments from the command line's key=value pairs. String arguments stay text, so
+/// place=123456 is a place ID; others are read as JSON (true, 30). An object argument takes one
+/// entry per pair, with no quotes for a shell to strip: changes.tray=false.
+pub fn cli_args(settings: Settings, name: &str, pairs: &[String]) -> Result<Args, String> {
+    let specs = specs(settings);
+    let spec = specs.as_array().into_iter().flatten().find(|spec| spec["name"] == name);
+    let properties = spec.ok_or_else(|| format!("Unknown tool {name}"))?["inputSchema"]["properties"].clone();
+    let mut args = Args::new();
+    for pair in pairs {
+        let (key, text) = pair.split_once('=').ok_or_else(|| format!("Pass arguments as key=value, not {pair}"))?;
+        let (key, entry) = key.split_once('.').map_or((key, None), |(key, entry)| (key, Some(entry)));
+        let kind = properties.get(key).ok_or_else(|| {
+            let mut keys: Vec<&str> =
+                properties.as_object().into_iter().flatten().map(|(key, _)| key.as_str()).collect();
+            keys.sort_unstable();
+            format!("{name} has no argument {key}. Its arguments: {}", keys.join(", "))
+        })?["type"]
+            .as_str();
+        let value = match kind {
+            Some("string") => Value::String(text.into()),
+            _ => serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.into())),
+        };
+        match (kind, entry) {
+            (Some("object"), Some(entry)) => {
+                let object = args.entry(key).or_insert_with(|| json!({}));
+                object.as_object_mut().ok_or_else(|| format!("{key} is set twice"))?.insert(entry.into(), value);
+            }
+            (_, Some(_)) => return Err(format!("{key} is not an object, so pass {key}=<value>")),
+            (_, None) => {
+                args.insert(key.into(), value);
+            }
+        }
+    }
+    Ok(args)
 }
 
 /// Run one tool: its result as compact JSON text, or an error message for the agent.
@@ -272,7 +312,7 @@ pub fn run(backend: &dyn Backend, name: &str, args: &Args) -> Result<String, Str
         "server_logs" => text(&server_logs(backend, args)?),
         "manage_project" => text(&manage_project(backend, args)?),
         "lane" => text(&lane(backend, args)?),
-        "updates" => text(&updates(backend, args)?),
+        "setup" => text(&setup(backend, args)?),
         "app_settings" => text(&app_settings(backend, args)?),
         "get_connected_instances" => text(&connected_instances(backend)?),
         "execute_luau" => text(&execute_luau(backend, args)?),
@@ -812,7 +852,7 @@ fn open_place(
             let hint = match place {
                 PlaceLink::Published(_) => "",
                 PlaceLink::Local(_) => {
-                    " A local place needs bridge version 9 or newer: check and install it with the updates tool."
+                    " A local place needs bridge version 9 or newer: check and install it with the setup tool."
                 }
             };
             // Whatever keeps a hidden Studio from loading, such as a dialog, should be seen.
@@ -1328,12 +1368,21 @@ fn app_settings(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
 /// Installing waits for the download, or for the bridge installer and any prompt in its terminal.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-fn updates(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
+/// setup: the state of everything Rojo Manager needs, or one install, or finishing the window's setup.
+fn setup(backend: &dyn Backend, args: &Args) -> Result<Value, String> {
     let install = optional_string(args, "install")?;
+    let done = match args.get("done") {
+        None | Some(Value::Null) => false,
+        Some(value) => value.as_bool().ok_or("done must be true or false")?,
+    };
+    if install.is_some() && done {
+        return Err("Pass install or done, not both".into());
+    }
     manager_projects(backend)?; // starts the manager if needed
     match install.as_deref() {
-        None => call(backend, "GET", &["updates"], None, PROJECTS_TIMEOUT),
-        Some(target @ ("app" | "bridge")) => call(backend, "POST", &["updates", target], None, INSTALL_TIMEOUT),
+        None if done => call(backend, "POST", &["setup", "done"], None, CALL_TIMEOUT),
+        None => call(backend, "GET", &["setup"], None, PROJECTS_TIMEOUT),
+        Some(target @ ("app" | "bridge")) => call(backend, "POST", &["setup", target], None, INSTALL_TIMEOUT),
         Some(_) => Err("install must be app or bridge".into()),
     }
 }
@@ -1493,14 +1542,46 @@ mod tests {
     }
 
     #[test]
-    fn updates_check_or_install_one() {
+    fn cli_args_keep_strings_as_text_and_read_the_rest_as_json() {
+        let pairs = |list: &[&str]| list.iter().map(|pair| pair.to_string()).collect::<Vec<_>>();
+        let settings = Settings::default();
+        let parsed = cli_args(settings, "open_place", &pairs(&["place=123456", "hidden=true", "idle_close=30"]));
+        assert_eq!(Value::Object(parsed.unwrap()), json!({"place": "123456", "hidden": true, "idle_close": 30}));
+        assert_eq!(
+            cli_args(settings, "setup", &pairs(&["install"])).unwrap_err(),
+            "Pass arguments as key=value, not install"
+        );
+        assert_eq!(
+            cli_args(settings, "setup", &pairs(&["force=1"])).unwrap_err(),
+            "setup has no argument force. Its arguments: done, install"
+        );
+        assert_eq!(cli_args(settings, "nope", &[]).unwrap_err(), "Unknown tool nope");
+        let changes = cli_args(settings, "app_settings", &pairs(&["changes.tray=false", "changes.auto_update=true"]));
+        assert_eq!(Value::Object(changes.unwrap()), json!({"changes": {"tray": false, "auto_update": true}}));
+    }
+
+    #[test]
+    fn setup_checks_installs_one_or_finishes() {
         let fake = Fake { reply: |_, _| json!({"message": "done"}), ..Fake::default() };
-        updates(&fake, &Args::new()).unwrap();
-        assert_eq!(updates(&fake, &args(json!({"install": "bridge"}))).unwrap(), json!({"message": "done"}));
-        assert_eq!(updates(&fake, &args(json!({"install": "rojo"}))).unwrap_err(), "install must be app or bridge");
+        setup(&fake, &Args::new()).unwrap();
+        assert_eq!(setup(&fake, &args(json!({"install": "bridge"}))).unwrap(), json!({"message": "done"}));
+        setup(&fake, &args(json!({"done": true}))).unwrap();
+        assert_eq!(setup(&fake, &args(json!({"install": "rojo"}))).unwrap_err(), "install must be app or bridge");
+        assert_eq!(
+            setup(&fake, &args(json!({"install": "app", "done": true}))).unwrap_err(),
+            "Pass install or done, not both"
+        );
         assert_eq!(
             fake.calls(),
-            ["GET projects", "GET updates", "GET projects", "POST updates/bridge", "GET projects"]
+            [
+                "GET projects",
+                "GET setup",
+                "GET projects",
+                "POST setup/bridge",
+                "GET projects",
+                "POST setup/done",
+                "GET projects"
+            ]
         );
     }
 

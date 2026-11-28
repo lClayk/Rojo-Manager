@@ -63,7 +63,7 @@ impl std::fmt::Display for ControlError {
 /// - GET  /projects/<name>/logs      logs(name)
 /// - GET  /projects/<name>/backups   backups(name)
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
-/// - GET  /updates, POST /updates/<target>  updates(None) or updates(Some(target)), target app or bridge
+/// - GET  /setup, POST /setup/<action>      setup(None) or setup(Some(action)), action app, bridge, or done
 /// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
 /// - POST /studio                    open_studio(body): a place, revision, file, or baseplate, without a project
 /// - POST /lanes, POST /lanes/<name>/remove  lane(None, body) or lane(Some(name), body)
@@ -105,8 +105,9 @@ pub trait ControlHandler: Send + Sync + 'static {
     /// Opens Studio for {"placeId", "universeId", "version"?}, {"file"}, or {"baseplate": true}, with
     /// "hidden"; answers {"file"}, the place file it opened (null for a published place).
     fn open_studio(&self, body: &Map<String, Value>) -> Result<Value, ControlError>;
-    /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
-    fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
+    /// {"app", "bridge", "rojo", "agents", "warning"?, "setupDone"}: what is set up; or runs one
+    /// action: "app" or "bridge" installs that and says what happened, "done" finishes the window's setup.
+    fn setup(&self, action: Option<&str>) -> Result<Value, ControlError>;
     /// Makes a lane ({"from", "path", "holder"}), answering {"project"}; or removes one.
     fn lane(&self, name: Option<&str>, body: &Map<String, Value>) -> Result<Value, ControlError>;
 }
@@ -417,8 +418,8 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
         (true, ["studio"]) => handler.studio(None),
         (false, ["studio"]) => handler.open_studio(&body(request, MAX_BODY)?),
         (false, ["studio", instance]) => handler.studio(Some((instance, &body(request, MAX_BRIDGE_BODY)?))),
-        (true, ["updates"]) => handler.updates(None),
-        (false, ["updates", target]) => handler.updates(Some(target)),
+        (true, ["setup"]) => handler.setup(None),
+        (false, ["setup", action]) => handler.setup(Some(action)),
         (false, ["lanes"]) => handler.lane(None, &body(request, MAX_BODY)?),
         (false, ["lanes", name, "remove"]) => handler.lane(Some(name), &body(request, MAX_BODY)?),
         _ => Err(ControlError::new("Unknown route", 404)),
@@ -628,8 +629,8 @@ mod tests {
             Ok(json!({}))
         }
 
-        fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {
-            self.calls.lock().unwrap().push(json!(["updates", install]));
+        fn setup(&self, action: Option<&str>) -> Result<Value, ControlError> {
+            self.calls.lock().unwrap().push(json!(["setup", action]));
             Ok(json!({}))
         }
 

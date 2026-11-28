@@ -16,7 +16,7 @@ Questions, feedback, and release updates are on the [DevForum thread](https://de
 
 ## Download and run
 
-**Windows 10 or 11, x64.** Download **RojoManager-1.1.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest), extract it, and double-click **RojoManager.exe**. There is no installer and no administrator access is needed. The download is not code signed yet, so Windows SmartScreen may block the first run: click **More info**, then **Run anyway**.
+**Windows 10 or 11, x64.** Download **RojoManager-1.1.0-windows-x64.zip** from [Releases](https://github.com/lClayk/Rojo-Manager/releases/latest), extract it, and double-click **RojoManager.exe**. There is no installer and no administrator access is needed. The download is not code signed yet, so Windows SmartScreen may block the first run: click **More info**, then **Run anyway**. Or ask an agent to install it, as described under [Agents](#agents).
 
 **macOS 11 or later (beta).** Download **RojoManager-1.1.0-macos.zip**, open it, and move **Rojo Manager.app** to Applications. It runs in the menu bar. The app is not notarized yet, so macOS blocks the first launch: open **System Settings > Privacy & Security** and click **Open Anyway**.
 
@@ -46,6 +46,12 @@ AI agents can run your Rojo servers, open places in Studio, connect the Rojo plu
 1. In **Settings > Agents**, click **Install** next to **Studio plugin with agent bridge**, then restart Studio. Turn off the Creator Store Rojo in Studio so only one Rojo runs.
 2. Under **Add to an agent**, click **Claude Code** or **Codex**, or **Other** for the config to paste into any other MCP client.
 
+**Or let an agent set it up.** Ask an agent that runs shell commands, such as Claude Code or Codex, to "install Rojo Manager from github.com/lClayk/Rojo-Manager and set it up". It follows these steps:
+
+1. `irm https://raw.githubusercontent.com/lClayk/Rojo-Manager/main/install.ps1 | iex` downloads the latest release, checks it against `SHA256SUMS.txt`, extracts it to `%LOCALAPPDATA%\Programs\RojoManager` (or uses the copy that is running), starts it, and adds the MCP server to Claude Code and Codex.
+2. `RojoManagerMCP.exe setup` shows what is installed and what is missing. Every tool runs this way with `key=value` arguments, so the agent can finish before its session loads the MCP server: `setup install=bridge` installs the bridge plugin (with Rojo, Lune, and Rokit when they are missing), `app_settings changes.tray=true` changes a setting, and `setup done=true` closes the window's first-run setup.
+3. You restart Studio, turn off the Creator Store Rojo if `setup` warns about it, and start a new agent session to load the tools.
+
 | Tool | What it does |
 | --- | --- |
 | `list_projects` | Projects with their server state, port, linked place, and Rojo's status in Studio |
@@ -56,7 +62,7 @@ AI agents can run your Rojo servers, open places in Studio, connect the Rojo plu
 | `server_logs` | Reads a project's recent Rojo output |
 | `studio_output` | Reads Studio's Output for an open place |
 | `manage_project` | Adds, creates, converts, changes, or removes projects |
-| `updates` | Checks for and installs app and bridge updates |
+| `setup` | Shows what is installed and what needs the user, installs app and bridge updates, and finishes the first-run setup |
 | `app_settings` | Reads or changes the app's settings |
 | `get_connected_instances` | Lists the Studio windows the bridge reaches |
 | `close_studio` | Closes a Studio window, losing unsaved changes there |
