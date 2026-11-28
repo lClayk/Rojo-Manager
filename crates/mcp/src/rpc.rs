@@ -26,8 +26,10 @@ Studio. It owns every Rojo process, so never run rojo serve yourself.
   work beside another agent, use lane create instead of sharing a Studio.
 Server states: off, starting, serving (no Studio connected), connected (a Studio is syncing), external (started
 outside Rojo Manager, still controllable), blocked (another app owns the port).
-Studio is reached through the Rojo Manager bridge, installed from Settings > Agents. instanceId values are Rojo
-Manager's; to use another Studio MCP's tools, match its Studio windows by placeId.";
+- setup shows what is installed and what the user must do. Use it when Studio cannot be reached or the user asks
+  you to set Rojo Manager up.
+Studio is reached through the Rojo Manager bridge, installed from Settings > Agents or with setup. instanceId values
+are Rojo Manager's; to use another Studio MCP's tools, match its Studio windows by placeId.";
 
 /// Read requests until `input` closes. Tool calls run on their own threads so pings stay responsive;
 /// finished ones are dropped, and those still running at the end are waited for.
@@ -170,7 +172,7 @@ mod tests {
             "studio_output",
             "manage_project",
             "lane",
-            "updates",
+            "setup",
             "app_settings",
             "get_connected_instances",
             "close_studio",
