@@ -5,7 +5,7 @@ use std::io;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use rojo_manager_core::config::{self, Place};
+use rojo_manager_core::config::{self, Place, Settings};
 use rojo_manager_core::control::{self, RequestError};
 use rojo_manager_core::studio::{self, ResolveError};
 use serde_json::Value;
@@ -21,12 +21,10 @@ pub trait Backend: Sync {
     ) -> Result<Value, RequestError>;
     /// Start Rojo Manager hidden, detached from this process.
     fn launch_manager(&self) -> io::Result<()>;
-    /// Whether agents get get_connected_instances and execute_luau (the studio_tools setting).
-    fn studio_tools(&self) -> bool;
+    /// Rojo Manager's settings, which say which agent tools are on (Settings::TOOLS).
+    fn settings(&self) -> Settings;
     /// Look up the place and universe IDs for a place ID or link.
     fn resolve_place(&self, text: &str) -> Result<Place, ResolveError>;
-    /// Hand a place to Roblox Studio.
-    fn open_place(&self, place: &Place) -> io::Result<()>;
     /// Wait between polls.
     fn sleep(&self, duration: Duration);
 }
@@ -64,16 +62,12 @@ impl Backend for Core {
     }
 
     /// Read from the settings file, so listing tools does not start the manager.
-    fn studio_tools(&self) -> bool {
-        config::load().ok().is_none_or(|config| config.settings.studio_tools)
+    fn settings(&self) -> Settings {
+        config::load().map(|config| config.settings).unwrap_or_default()
     }
 
     fn resolve_place(&self, text: &str) -> Result<Place, ResolveError> {
         studio::resolve_place(text)
-    }
-
-    fn open_place(&self, place: &Place) -> io::Result<()> {
-        studio::open_place(place)
     }
 
     fn sleep(&self, duration: Duration) {

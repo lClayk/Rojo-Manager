@@ -14,41 +14,18 @@ use crate::tools;
 
 /// Supported MCP versions, newest first; the newest is offered when a client asks for another.
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Roblox projects.
-- list_projects shows each project's server state, linked place, and whether that place is open in Studio.
-- rojo_server starts, stops, or restarts a project's Rojo server, and waits until it answers or is gone, so there
-  is no need to poll list_projects; rojo_session connect likewise waits until Rojo connects or asks to confirm.
-- open_place opens a project's place in Roblox Studio; connect_rojo=true also starts the server and connects Rojo.
-  Passing both project and place links that place to the project first. place=local gives a project a local
-  place: an unpublished file Rojo Manager builds from the project with rojo build, named by its placeFile.
-  hidden=true opens it without a Studio window (Windows only), for work the user does not need to watch;
-  hidden=false shows that window again, as Open Studio in Rojo Manager does. idle_close=<minutes> has Rojo
-  Manager close that Studio once nothing has happened in it for that long, losing unsaved changes there;
-  manage_project update changes it later, and 0 turns it off. Set it on a Studio you opened for yourself.
-- rojo_session connects or disconnects the Rojo plugin in an open place. When it reports Confirming, Rojo is
-  waiting for the initial sync to be approved: use accept to apply the project to Studio, or abort. Its pending
-  field counts what accepting adds, changes, and removes; removed instances exist only in Studio and are deleted.
-  Rojo Manager backs those up first (also when Rojo removes them without asking): rojo_session backups lists
-  them and restore puts one back. rojo_session pull writes what Studio has for the project's synced folders
-  into its files (rojo syncback), for edits made in Studio such as UI built there; preview=true lists the
-  files it would write and remove. Studio's version wins, so preview first when the files may be newer than
-  Studio. It needs Rojo 7.7 or later, Lune, and a place project.
-- manage_project adds project folders, makes new projects (create runs rojo init; convert turns a .rbxl place's
-  code services into files and keeps the place, map and all, as the project's local place), changes a project's
-  name, port, autostart, auto_connect, sourcemap, idle_close, or linked place, or removes a project from the
-  list (its files are kept, except a local place file).
-- lane create gives this agent an isolated Studio for parallel work: a project from a copy of a project (such
-  as a git worktree), with a local place of its own, opened in Studio and synced. It stays across restarts; lane
-  remove closes it, and deleting its folder ends it. Use one instead of sharing the main project's Studio with
-  another agent, and pass holder to label it.
-- server_logs reads a project's recent Rojo output, such as sync errors or a broken project file.
-- studio_output reads Studio's Output for an open place: prints, warnings, and errors from Edit mode and a
-  playtest's server.
-- updates checks whether Rojo Manager and its Studio bridge are up to date, and installs either when the user asks.
-- get_connected_instances lists the Studio windows Rojo Manager's bridge reaches, and execute_luau runs Luau in one
-  (plugin permissions, Edit mode). The user can turn these two off when another Studio MCP provides them.
-Server states: off; starting; serving (running, no Studio connected); connected (a Studio is syncing);
-external (running but started outside Rojo Manager, still controllable); blocked (another app owns the port).
+const INSTRUCTIONS: &str = "Rojo Manager runs the Rojo servers for the user's Roblox projects and opens their places in
+Studio. It owns every Rojo process, so never run rojo serve yourself.
+- Usual loop: list_projects, then open_place with project and connect_rojo=true. Edit the project's files and
+  Rojo syncs them; studio_output shows errors. Tools that start or connect something wait for the result, so
+  there is no need to poll.
+- A project with no linked place: pass place to open_place, or place=local for one built from its files.
+- rojo_session reporting Confirming means Rojo waits for its first sync to be approved: accept or abort. Edits
+  made in Studio, such as UI, go back to files with rojo_session pull.
+- For work the user need not watch, open_place hidden=true, with idle_close so it closes once unused. For
+  work beside another agent, use lane create instead of sharing a Studio.
+Server states: off, starting, serving (no Studio connected), connected (a Studio is syncing), external (started
+outside Rojo Manager, still controllable), blocked (another app owns the port).
 Studio is reached through the Rojo Manager bridge, installed from Settings > Agents. instanceId values are Rojo
 Manager's; to use another Studio MCP's tools, match its Studio windows by placeId.";
 
@@ -109,7 +86,7 @@ fn handle(backend: &dyn Backend, message: &Map<String, Value>) -> Option<Value> 
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools::specs(backend.studio_tools()) }),
+        "tools/list" => json!({ "tools": tools::specs(backend.settings()) }),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
             let no_args = Map::new();
@@ -196,6 +173,7 @@ mod tests {
             "updates",
             "app_settings",
             "get_connected_instances",
+            "close_studio",
             "execute_luau",
         ];
         assert_eq!(names, HashSet::from(expected));

@@ -135,8 +135,12 @@ pub struct Settings {
     pub auto_connect_accept: bool,
     /// List places of one experience under a shared, collapsible header.
     pub group_experiences: bool,
-    /// Offer agents get_connected_instances and execute_luau; off when another Studio MCP has them.
-    pub studio_tools: bool,
+    /// Agent tools the user can turn off, as when another Studio MCP has them. Each is named for its
+    /// tool (see TOOLS).
+    pub get_connected_instances: bool,
+    pub execute_luau: bool,
+    pub studio_output: bool,
+    pub close_studio: bool,
     /// Back up instances that exist only in Studio before Rojo removes them (see backups.rs).
     pub backups: bool,
     /// Let projects close their Studio when it is idle. Off, no Studio is closed for it and no
@@ -145,6 +149,33 @@ pub struct Settings {
     /// Delete Studio's auto-recovery copies of a local place together with that place. Off unless
     /// the user turns it on, so a removal never takes what Studio kept to recover from.
     pub remove_recovery: bool,
+    /// Whether playtests of a Studio Rojo Manager hides keep the mouse unlocked, so Studio does not
+    /// move the user's cursor to the hidden window. Only the user changes this, never an agent.
+    pub keep_cursor: KeepCursor,
+}
+
+/// The keep_cursor setting: the agent that opened a hidden Studio decides (keeping the cursor unless
+/// it says otherwise), or every hidden Studio always or never keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeepCursor {
+    #[default]
+    Agent,
+    Always,
+    Never,
+}
+
+impl KeepCursor {
+    pub const ALL: [KeepCursor; 3] = [KeepCursor::Agent, KeepCursor::Always, KeepCursor::Never];
+
+    /// Whether a hidden Studio keeps the cursor, given what its agent chose, if anything.
+    pub fn keeps(self, agent: Option<bool>) -> bool {
+        match self {
+            KeepCursor::Agent => agent.unwrap_or(true),
+            KeepCursor::Always => true,
+            KeepCursor::Never => false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -154,7 +185,7 @@ impl Default for Settings {
             start_hidden: false,
             version_check: true,
             app_version_check: true,
-            auto_update: false,
+            auto_update: true,
             show_wally: true,
             show_rokit: true,
             show_aftman: true,
@@ -163,16 +194,26 @@ impl Default for Settings {
             restart_crashed: true,
             auto_connect_accept: true,
             group_experiences: true,
-            studio_tools: true,
+            get_connected_instances: true,
+            execute_luau: true,
+            studio_output: true,
+            close_studio: true,
             backups: true,
             idle_close: true,
             remove_recovery: false,
+            keep_cursor: KeepCursor::Agent,
         }
     }
 }
 
 impl Settings {
-    pub const KEYS: [&'static str; 17] = [
+    /// The agent tools a setting turns off, each under its own name.
+    pub const TOOLS: [&'static str; 4] = ["get_connected_instances", "execute_luau", "studio_output", "close_studio"];
+
+    /// Settings agents can read but only the user changes, in the window.
+    pub const USER_ONLY: [&'static str; 2] = ["idle_close", "keep_cursor"];
+
+    pub const KEYS: [&'static str; 20] = [
         "tray",
         "start_hidden",
         "version_check",
@@ -186,7 +227,10 @@ impl Settings {
         "restart_crashed",
         "auto_connect_accept",
         "group_experiences",
-        "studio_tools",
+        "get_connected_instances",
+        "execute_luau",
+        "studio_output",
+        "close_studio",
         "backups",
         "idle_close",
         "remove_recovery",
@@ -207,7 +251,10 @@ impl Settings {
             "restart_crashed" => &mut self.restart_crashed,
             "auto_connect_accept" => &mut self.auto_connect_accept,
             "group_experiences" => &mut self.group_experiences,
-            "studio_tools" => &mut self.studio_tools,
+            "get_connected_instances" => &mut self.get_connected_instances,
+            "execute_luau" => &mut self.execute_luau,
+            "studio_output" => &mut self.studio_output,
+            "close_studio" => &mut self.close_studio,
             "backups" => &mut self.backups,
             "idle_close" => &mut self.idle_close,
             "remove_recovery" => &mut self.remove_recovery,
@@ -233,9 +280,9 @@ pub struct Config {
     /// Experiences (universe IDs) whose places the window shows collapsed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<u64>,
-    /// The window asked whether to keep the Studio tools beside another Studio MCP.
+    /// The window's setup (Studio plugin, agents, agent tools) was finished or skipped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub studio_tools_asked: bool,
+    pub setup_done: bool,
     /// When this profile first ran (Unix seconds), so the star prompt waits until the app is in use.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub first_run: u64,
@@ -298,6 +345,11 @@ pub fn validate(value: &Value) -> Result<Config, String> {
     match object.get("settings") {
         None => {}
         Some(Value::Object(stored)) => {
+            // Before 1.2, one studio_tools setting turned off both of these.
+            if stored.get("studio_tools") == Some(&Value::Bool(false)) {
+                settings.get_connected_instances = false;
+                settings.execute_luau = false;
+            }
             for key in Settings::KEYS {
                 match stored.get(key) {
                     None => {}
@@ -306,6 +358,10 @@ pub fn validate(value: &Value) -> Result<Config, String> {
                     }
                     Some(_) => return Err(format!("Setting {key} must be true or false")),
                 }
+            }
+            if let Some(value) = stored.get("keep_cursor") {
+                settings.keep_cursor = serde_json::from_value(value.clone())
+                    .map_err(|_| "Setting keep_cursor must be agent, always, or never".to_string())?;
             }
         }
         Some(_) => return Err("Settings must be an object".into()),
@@ -392,10 +448,10 @@ pub fn validate(value: &Value) -> Result<Config, String> {
         Some(Value::Array(ids)) => ids.iter().filter_map(Value::as_u64).filter(|id| *id > 0).collect(),
         _ => Vec::new(),
     };
-    let studio_tools_asked = object.get("studio_tools_asked").and_then(Value::as_bool).unwrap_or(false);
+    let setup_done = object.get("setup_done").and_then(Value::as_bool).unwrap_or(false);
     let first_run = object.get("first_run").and_then(Value::as_u64).unwrap_or(0);
     let star_asked = object.get("star_asked").and_then(Value::as_bool).unwrap_or(false);
-    Ok(Config { projects, settings, collapsed, studio_tools_asked, first_run, star_asked })
+    Ok(Config { projects, settings, collapsed, setup_done, first_run, star_asked })
 }
 
 /// Read config.json; a missing file is an empty config. A malformed file is reported, never overwritten.
@@ -453,6 +509,18 @@ mod tests {
         assert!(saved.get("collapsed").is_none());
         let collapsed = validate(&json!({"collapsed": [2, "x", 0]})).unwrap().collapsed;
         assert_eq!(collapsed, [2]);
+        // The studio_tools setting before 1.2 turned off two tools; a tool's own setting wins.
+        let old = validate(&json!({"settings": {"studio_tools": false, "execute_luau": true}})).unwrap().settings;
+        assert!(!old.get_connected_instances && old.execute_luau && old.studio_output);
+        // keep_cursor is one of three choices, not a switch.
+        let never = validate(&json!({"settings": {"keep_cursor": "never"}})).unwrap().settings;
+        assert_eq!(never.keep_cursor, KeepCursor::Never);
+        assert!(validate(&json!({"settings": {"keep_cursor": true}})).is_err());
+        // Left to agents, a Studio keeps the cursor unless its agent said not to; the others override.
+        let keeps = |choice: KeepCursor| [None, Some(true), Some(false)].map(|agent| choice.keeps(agent));
+        assert_eq!(keeps(KeepCursor::Agent), [true, true, false]);
+        assert_eq!(keeps(KeepCursor::Always), [true; 3]);
+        assert_eq!(keeps(KeepCursor::Never), [false; 3]);
     }
 
     #[test]

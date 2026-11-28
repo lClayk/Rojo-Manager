@@ -29,19 +29,19 @@ Click **Add project** to add a folder with a `*.project.json` file, make a new p
 - **Accept** and **Abort** show when Rojo waits for its first sync to be confirmed, with what accepting would add, change, and remove.
 - **Pull** writes what Studio has back into the project's files with `rojo syncback`, for work done in Studio. It lists the files first. Studio's version wins, so files for instances Studio does not have are removed. Needs Rojo 7.7 or later and Lune.
 - **Idle close** closes the place's Studio after that many minutes with nothing happening in it. Unsaved changes there are lost. Settings can turn it off for every project and for agents.
-- **Show Studio** shows a Studio window that an agent opened hidden.
+- **Show Studio** shows a Studio window that an agent opened hidden. One that belongs to no project gets a **Show** banner instead. Playtests in a hidden Studio keep the mouse unlocked, so Studio can't move your cursor to it in first person or shift lock. **Settings > Agents** leaves that to the agent that opened it (it keeps the cursor unless the agent needs mouse lock), or makes it always or never happen.
 - A **history icon** restores instances Rojo removed from Studio. The last 20 backups are kept per project.
 - **Autostart** starts the server with the manager, and **Sourcemap** keeps `sourcemap.json` current for [luau-lsp](https://github.com/JohnnyMorganz/luau-lsp).
 - **Wally**, **Rokit**, and **Aftman** install the project's packages and pinned tools. **Settings > Tools** installs and updates global tools through Rokit.
 - **Remove** takes the project off the list and keeps its files, except a local place file the manager built.
 
-The sync preview, Pull, Idle close, and backups need the bridge plugin described under [Agents](#agents).
+The sync preview, Pull, Idle close, backups, and keeping your cursor need the bridge plugin described under [Agents](#agents).
 
 Closing the window leaves the manager and its servers running in the tray. A dot on the tray icon is yellow while a server runs, green while Studio is connected, and red when a port is taken. **Quit** in the tray menu stops the servers.
 
 ## Agents
 
-AI agents can run your Rojo servers, open places in Studio, connect the Rojo plugin, and run Luau in Studio through the MCP server that ships with the app.
+AI agents can run your Rojo servers, open places in Studio, connect the Rojo plugin, and run Luau in Studio through the MCP server that ships with the app. A short setup on first launch walks through the steps below, and **Settings > Agents** has them too.
 
 1. In **Settings > Agents**, click **Install** next to **Studio plugin with agent bridge**, then restart Studio. Turn off the Creator Store Rojo in Studio so only one Rojo runs.
 2. Under **Add to an agent**, click **Claude Code** or **Codex**, or **Other** for the config to paste into any other MCP client.
@@ -50,7 +50,7 @@ AI agents can run your Rojo servers, open places in Studio, connect the Rojo plu
 | --- | --- |
 | `list_projects` | Projects with their server state, port, linked place, and Rojo's status in Studio |
 | `rojo_server` | Starts, stops, or restarts a project's server |
-| `open_place` | Opens a place in Studio, optionally connecting Rojo, without a window (Windows only), or with an idle close |
+| `open_place` | Opens a project's place, a place ID, a saved version of a place, a `.rbxl` file, or a new baseplate in Studio, optionally connecting Rojo, without a window (Windows only), or with an idle close |
 | `rojo_session` | Connects or disconnects Rojo, accepts or aborts the first sync, restores backups, and pulls from Studio |
 | `lane` | Gives an agent its own copy of a project, with its own server and Studio, for parallel work |
 | `server_logs` | Reads a project's recent Rojo output |
@@ -59,7 +59,10 @@ AI agents can run your Rojo servers, open places in Studio, connect the Rojo plu
 | `updates` | Checks for and installs app and bridge updates |
 | `app_settings` | Reads or changes the app's settings |
 | `get_connected_instances` | Lists the Studio windows the bridge reaches |
+| `close_studio` | Closes a Studio window, losing unsaved changes there |
 | `execute_luau` | Runs Luau in a Studio window with plugin permissions |
+
+`get_connected_instances`, `close_studio`, `execute_luau`, and `studio_output` can each be turned off in **Settings > Agents**, for when another Studio MCP already gives your agents the same tools. Settings and the setup note which of your agents' Studio MCPs have them.
 
 Rojo Manager owns every server, so the window always shows what an agent did. Agents reach it through a local API protected by a random token. The bridge is the official Rojo plugin with a [small module](rojo_bridge/RojoManagerBridge.luau) added on your machine, and it talks to the manager on `localhost:34871`.
 

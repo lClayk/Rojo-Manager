@@ -65,9 +65,11 @@ impl std::fmt::Display for ControlError {
 /// - GET  /settings, POST /settings  settings(None) or settings(Some(body))
 /// - GET  /updates, POST /updates/<target>  updates(None) or updates(Some(target)), target app or bridge
 /// - GET  /studio, POST /studio/<instanceId>  studio(None) or studio(Some((instanceId, body)))
+/// - POST /studio                    open_studio(body): a place, revision, file, or baseplate, without a project
 /// - POST /lanes, POST /lanes/<name>/remove  lane(None, body) or lane(Some(name), body)
 /// - GET  /rojo-plugins/<count>      report_rojo_plugins(count) (AutoConnectServer, no token)
 /// - POST /bridge/<id>               poll_bridge(id, body, connection) (AutoConnectServer, no token)
+/// - GET  /keep-cursor               {"keep": keep_cursor(connection)} (AutoConnectServer, no token)
 /// - POST /output                    report_output(body) (AutoConnectServer, no token)
 /// - POST /backup                    save_backup(body) (AutoConnectServer, no token)
 /// - POST /capture/<id>              save_capture(id, body's data) (AutoConnectServer, no token)
@@ -89,6 +91,9 @@ pub trait ControlHandler: Send + Sync + 'static {
     /// and whether to accept Rojo's sync prompt, plus "command" once one is queued for this bridge.
     /// `connection` is the poll's (client port, server port), which names the Studio process.
     fn poll_bridge(&self, id: u64, poll: BridgePoll, connection: Option<(u16, u16)>) -> Value;
+    /// Whether a playtest should keep the user's cursor where it is: the Studio its `connection`
+    /// comes from is hidden, and the keep_cursor setting is on. A playtest's server asks.
+    fn keep_cursor(&self, connection: Option<(u16, u16)>) -> bool;
     /// The instances a bridge captured for a pull, as base64 `.rbxm`; `id` is the one the capture
     /// command named.
     fn save_capture(&self, id: u64, data: String);
@@ -97,6 +102,9 @@ pub trait ControlHandler: Send + Sync + 'static {
     /// {"bridge", "instances"}: whether the bridge is installed and the Studio windows it reports from;
     /// or runs one command ({"action", ...}) in one of them and returns its result.
     fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError>;
+    /// Opens Studio for {"placeId", "universeId", "version"?}, {"file"}, or {"baseplate": true}, with
+    /// "hidden"; answers {"file"}, the place file it opened (null for a published place).
+    fn open_studio(&self, body: &Map<String, Value>) -> Result<Value, ControlError>;
     /// {"app", "bridge"}: whether each is up to date, or installs one and says what happened.
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError>;
     /// Makes a lane ({"from", "path", "holder"}), answering {"project"}; or removes one.
@@ -246,6 +254,7 @@ impl AutoConnectServer {
             let url = request_path(request).trim_matches('/').to_string();
             let (route, rest) = url.split_once('/').unwrap_or((url.as_str(), ""));
             let number = rest.bytes().all(|b| b.is_ascii_digit()).then(|| rest.parse::<u64>().ok()).flatten();
+            let connection = request.remote_addr().map(|client| (client.port(), port));
             match (post, route, number) {
                 (false, "rojo-plugins", Some(count)) => {
                     handler.report_rojo_plugins(u32::try_from(count).unwrap_or(u32::MAX));
@@ -279,11 +288,13 @@ impl AutoConnectServer {
                     let poll = body(request, MAX_BRIDGE_BODY).and_then(|body| {
                         serde_json::from_value(Value::Object(body)).map_err(|e| ControlError::bad(e.to_string()))
                     });
-                    let connection = request.remote_addr().map(|client| (client.port(), port));
                     match poll {
                         Ok(poll) => (200, handler.poll_bridge(id, poll, connection)),
                         Err(error) => (error.status, json!({ "error": error.message })),
                     }
+                }
+                (false, "keep-cursor", None) if rest.is_empty() => {
+                    (200, json!({ "keep": handler.keep_cursor(connection) }))
                 }
                 (true, "capture", Some(id)) => match body(request, MAX_BACKUP_BODY) {
                     Ok(mut body) => match body.remove("data") {
@@ -404,6 +415,7 @@ fn route(handler: &dyn ControlHandler, token: &str, request: &mut tiny_http::Req
         (true, ["settings"]) => handler.settings(None),
         (false, ["settings"]) => handler.settings(Some(&body(request, MAX_BODY)?)),
         (true, ["studio"]) => handler.studio(None),
+        (false, ["studio"]) => handler.open_studio(&body(request, MAX_BODY)?),
         (false, ["studio", instance]) => handler.studio(Some((instance, &body(request, MAX_BRIDGE_BODY)?))),
         (true, ["updates"]) => handler.updates(None),
         (false, ["updates", target]) => handler.updates(Some(target)),
@@ -595,6 +607,12 @@ mod tests {
             }
         }
 
+        fn keep_cursor(&self, connection: Option<(u16, u16)>) -> bool {
+            // The request comes from this test process, which is not Studio.
+            let owner = connection.and_then(|(client, server)| crate::localnet::connection_owner(client, server));
+            owner == Some(std::process::id())
+        }
+
         fn report_output(&self, output: StudioOutput) {
             let lines: Vec<(&str, OutputKind)> = output.lines.iter().map(|l| (l.text.as_str(), l.kind)).collect();
             self.calls.lock().unwrap().push(json!(["output", output.place_id, output.context, lines]));
@@ -602,6 +620,11 @@ mod tests {
 
         fn studio(&self, command: Option<(&str, &Map<String, Value>)>) -> Result<Value, ControlError> {
             self.calls.lock().unwrap().push(json!(["studio", command]));
+            Ok(json!({}))
+        }
+
+        fn open_studio(&self, body: &Map<String, Value>) -> Result<Value, ControlError> {
+            self.calls.lock().unwrap().push(json!(["open-studio", body]));
             Ok(json!({}))
         }
 
@@ -657,6 +680,7 @@ mod tests {
         request("POST", &["settings"], Some(&json!({"tray": false})), TIMEOUT).unwrap();
         request("POST", &["lanes"], Some(&json!({"from": "Game/Lobby", "path": "C:/Lane"})), TIMEOUT).unwrap();
         request("POST", &["lanes", "Lobby 2", "remove"], None, TIMEOUT).unwrap();
+        request("POST", &["studio"], Some(&json!({"baseplate": true})), TIMEOUT).unwrap();
         match request("POST", &["projects", "Missing", "start"], None, TIMEOUT) {
             Err(RequestError::Refused(error)) => assert_eq!(error, ControlError::new("No project named Missing", 404)),
             other => panic!("{other:?}"),
@@ -675,6 +699,7 @@ mod tests {
                 json!(["settings", {"tray": false}]),
                 json!(["lane", null, {"from": "Game/Lobby", "path": "C:/Lane"}]),
                 json!(["lane", "Lobby 2", {}]),
+                json!(["open-studio", {"baseplate": true}]),
                 json!(["Missing", "start", {}]),
             ]
         );
@@ -713,6 +738,8 @@ mod tests {
         assert_eq!(send("POST", "/bridge/9", Some(&json!({"port": 0})), &[]).0, 400);
         assert_eq!(send("POST", "/bridge/9", Some(&poll), &[("Origin", "https://example.invalid")]).0, 404);
         assert_eq!(send("GET", "/bridge/9/42/0", None, &[]).0, 404);
+        // The Fake answers keep when the request's connection names this process.
+        assert_eq!(send("GET", "/keep-cursor", None, &[]), (200, json!({"keep": true})));
         let output = json!({"placeId": 42, "context": "server", "lines": [{"text": "boom", "kind": "error"}]});
         assert_eq!(send("POST", "/output", Some(&output), &[]).0, 200);
         assert_eq!(

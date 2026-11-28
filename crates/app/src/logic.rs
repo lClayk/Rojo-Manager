@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use rojo_manager_core::config::{MAX_IDLE_CLOSE, PlaceLink, Settings};
 use rojo_manager_core::manager::{ProjectView, ServerState, SyncSummary};
 use rojo_manager_core::pull::Pulled;
+use rojo_manager_core::studio::FoundMcp;
 use rojo_manager_core::tooling::{StudioPlugin, bridge_outdated};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,10 +370,40 @@ pub fn version_number(output: &str) -> &str {
     output.split_once(char::is_whitespace).map_or(output, |(_, rest)| rest.trim_start())
 }
 
+/// Which of the other Studio MCPs agents have offer a tool like Rojo Manager's agent tool `tool`:
+/// "Also in robloxstudio-mcp", or "Also in both" (or "all") when every one does. None when none does.
+pub fn overlap(tool: &str, mcps: &[FoundMcp]) -> Option<String> {
+    let names: Vec<&str> =
+        mcps.iter().filter(|found| found.mcp.counterpart(tool).is_some()).map(|found| found.mcp.name()).collect();
+    match names.len() {
+        0 => None,
+        count if count == mcps.len() && count > 1 => {
+            Some(format!("Also in {}", if count == 2 { "both" } else { "all" }))
+        }
+        _ => Some(format!("Also in {}", names.join(" and "))),
+    }
+}
+
+/// The other Studio MCPs agents have, for a sentence, grouped by agent: "robloxstudio-mcp and
+/// Studio's built-in MCP in Claude Code". None when there are none.
+pub fn found_mcps(mcps: &[FoundMcp]) -> Option<String> {
+    let mut agents: Vec<(&str, Vec<&str>)> = Vec::new();
+    for found in mcps {
+        match agents.iter_mut().find(|(agent, _)| *agent == found.agent) {
+            Some((_, names)) => names.push(found.mcp.name()),
+            None => agents.push((&found.agent, vec![found.mcp.name()])),
+        }
+    }
+    let parts: Vec<String> =
+        agents.iter().map(|(agent, names)| format!("{} in {agent}", names.join(" and "))).collect();
+    (!parts.is_empty()).then(|| parts.join(", and "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rojo_manager_core::config::{Lane, LocalPlace, Place};
+    use rojo_manager_core::studio::StudioMcp;
     use rojo_manager_core::tooling::BRIDGE_VERSION;
 
     fn project(state: ServerState) -> ProjectView {
@@ -570,5 +601,22 @@ mod tests {
     fn version_drops_the_tool_name() {
         assert_eq!(version_number("Rojo 7.4.4\n"), "7.4.4");
         assert_eq!(version_number("7.4.4"), "7.4.4");
+    }
+
+    #[test]
+    fn overlaps_name_the_other_studio_mcps_with_the_tool() {
+        let found = |mcp| FoundMcp { mcp, agent: "Codex".into() };
+        let both = [found(StudioMcp::RobloxstudioMcp), found(StudioMcp::BuiltIn)];
+        assert_eq!(overlap("studio_output", &both).as_deref(), Some("Also in both"));
+        assert_eq!(overlap("studio_output", &both[..1]).as_deref(), Some("Also in robloxstudio-mcp"));
+        assert_eq!(overlap("close_studio", &both).as_deref(), Some("Also in robloxstudio-mcp"));
+        assert_eq!(overlap("close_studio", &both[1..]), None);
+        assert_eq!(found_mcps(&both).as_deref(), Some("robloxstudio-mcp and Studio's built-in MCP in Codex"));
+        let claude = FoundMcp { mcp: StudioMcp::BuiltIn, agent: "Claude Code".into() };
+        assert_eq!(
+            found_mcps(&[both[0].clone(), claude]).as_deref(),
+            Some("robloxstudio-mcp in Codex, and Studio's built-in MCP in Claude Code")
+        );
+        assert_eq!(found_mcps(&[]), None);
     }
 }

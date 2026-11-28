@@ -1,9 +1,9 @@
-//! Open cloud places in Roblox Studio through its registered roblox-studio: protocol, the same
-//! link the Creator Hub's Edit in Studio button uses.
+//! Roblox places and Studio: place ID lookups, the roblox-studio: links that open published places
+//! in Studio, and the other Studio MCPs agents may have set up.
 
-use std::io;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Place;
@@ -96,44 +96,120 @@ pub fn experience_name(universe_id: u64) -> Result<String, HttpsError> {
         .ok_or_else(|| HttpsError::Transport("The experience has no name".into()))
 }
 
-/// Another Studio MCP server set up in Claude Code or Codex, as "<server> in <agent>", such as
-/// "robloxstudio-mcp in Codex". It gives agents tools like Rojo Manager's Studio tools.
-pub fn other_studio_mcp() -> Option<String> {
-    let home = std::env::home_dir()?;
+/// Another Studio MCP server. Some of its tools do what Rojo Manager's do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StudioMcp {
+    /// Roblox Studio's own (Roblox/mcp.bat, StudioMCP.exe).
+    BuiltIn,
+    RobloxstudioMcp,
+}
+
+impl StudioMcp {
+    pub fn name(self) -> &'static str {
+        match self {
+            StudioMcp::BuiltIn => "Studio's built-in MCP",
+            StudioMcp::RobloxstudioMcp => "robloxstudio-mcp",
+        }
+    }
+
+    /// Its tool that does what Rojo Manager's tool `tool` (one of Settings::TOOLS) does, if any.
+    pub fn counterpart(self, tool: &str) -> Option<&'static str> {
+        Some(match (self, tool) {
+            (_, "execute_luau") => "execute_luau",
+            (StudioMcp::BuiltIn, "get_connected_instances") => "list_roblox_studios",
+            (StudioMcp::BuiltIn, "studio_output") => "get_console_output",
+            (StudioMcp::RobloxstudioMcp, "get_connected_instances") => "get_connected_instances",
+            (StudioMcp::RobloxstudioMcp, "studio_output") => "get_runtime_logs",
+            (StudioMcp::RobloxstudioMcp, "close_studio") => "manage_instance",
+            _ => return None,
+        })
+    }
+}
+
+/// A Studio MCP set up in an agent: Claude Code or Codex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundMcp {
+    pub mcp: StudioMcp,
+    pub agent: String,
+}
+
+/// The MCP servers set up in Claude Code (for the user, then each folder) and Codex: each agent's
+/// name and server entries.
+fn agent_servers() -> Vec<(&'static str, serde_json::Map<String, Value>)> {
+    let Some(home) = std::env::home_dir() else { return Vec::new() };
+    let mut found = Vec::new();
     let claude: Option<Value> =
         std::fs::read(home.join(".claude.json")).ok().and_then(|data| serde_json::from_slice(&data).ok());
-    if let Some(claude) = claude.as_ref() {
-        // User servers, then each folder's own.
+    if let Some(claude) = claude {
         let projects = claude.get("projects").and_then(Value::as_object).into_iter().flat_map(|p| p.values());
-        for servers in std::iter::once(claude).chain(projects).filter_map(|t| t.get("mcpServers")?.as_object()) {
-            if let Some(server) = servers.iter().find_map(|(name, server)| studio_server(name, server)) {
-                return Some(format!("{server} in Claude Code"));
-            }
+        for servers in std::iter::once(&claude).chain(projects).filter_map(|t| t.get("mcpServers")?.as_object()) {
+            found.push(("Claude Code", servers.clone()));
         }
     }
     let codex = std::fs::read_to_string(home.join(".codex").join("config.toml")).ok();
     let codex: Option<Value> = codex.and_then(|text| toml::from_str(&text).ok());
-    let servers = codex.as_ref().and_then(|codex| codex.get("mcp_servers")?.as_object())?;
-    let server = servers.iter().find_map(|(name, server)| studio_server(name, server))?;
-    Some(format!("{server} in Codex"))
+    if let Some(servers) = codex.as_ref().and_then(|codex| codex.get("mcp_servers")?.as_object()) {
+        found.push(("Codex", servers.clone()));
+    }
+    found
 }
 
-/// Which Studio MCP an MCP server entry runs, if any: Roblox's built-in one (Roblox/mcp.bat) or
-/// robloxstudio-mcp, judged by its name, command, and arguments.
-fn studio_server(name: &str, server: &Value) -> Option<&'static str> {
+/// The other Studio MCPs set up in agents, each once, with the first agent found to have it.
+pub fn studio_mcps() -> Vec<FoundMcp> {
+    let mut found: Vec<FoundMcp> = Vec::new();
+    for (agent, servers) in agent_servers() {
+        for mcp in servers.iter().filter_map(|(name, server)| studio_server(name, server)) {
+            if !found.iter().any(|known| known.mcp == mcp) {
+                found.push(FoundMcp { mcp, agent: agent.into() });
+            }
+        }
+    }
+    found
+}
+
+/// The agents ("Claude Code", "Codex") that have this copy's MCP server set up. One set up for a
+/// moved or deleted copy does not count, so it can be added again.
+pub fn rojo_manager_agents() -> Vec<&'static str> {
+    let path = |text: &str| text.to_lowercase().replace('\\', "/");
+    let Ok(exe) = std::env::current_exe() else { return Vec::new() };
+    let ours = path(&exe.with_file_name(crate::executable("RojoManagerMCP")).to_string_lossy());
+    let set_up = |server: &Value| {
+        server.get("enabled") != Some(&Value::Bool(false))
+            && server.get("command").and_then(Value::as_str).is_some_and(|command| path(command) == ours)
+    };
+    let mut found: Vec<&'static str> = Vec::new();
+    for (agent, servers) in agent_servers() {
+        if servers.values().any(set_up) && !found.contains(&agent) {
+            found.push(agent);
+        }
+    }
+    found
+}
+
+/// An MCP server entry's name, command, and arguments, lowercased with dashes and underscores left
+/// out and forward slashes, for telling servers apart.
+fn server_text(name: &str, server: &Value) -> String {
     let args = server.get("args").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
     let parts: Vec<&str> =
         std::iter::once(name).chain(server.get("command").and_then(Value::as_str)).chain(args).collect();
-    let text = parts.join(" ").to_lowercase().replace('\\', "/").replace(['-', '_'], "");
+    parts.join(" ").to_lowercase().replace('\\', "/").replace(['-', '_'], "")
+}
+
+/// Which Studio MCP an MCP server entry runs, if any.
+fn studio_server(name: &str, server: &Value) -> Option<StudioMcp> {
+    let text = server_text(name, server);
     if text.contains("rojomanager") {
         None
     } else if text.contains("roblox/mcp") {
-        Some("Roblox Studio's built-in MCP")
+        Some(StudioMcp::BuiltIn)
+    } else if text.contains("robloxstudio") {
+        Some(StudioMcp::RobloxstudioMcp)
     } else {
-        text.contains("robloxstudio").then_some("robloxstudio-mcp")
+        text.contains("studiomcp").then_some(StudioMcp::BuiltIn)
     }
 }
 
+/// The Creator Hub's Edit in Studio link.
 pub fn launch_uri(place: &Place) -> String {
     format!(
         "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{}+universeId:{}",
@@ -141,10 +217,17 @@ pub fn launch_uri(place: &Place) -> String {
     )
 }
 
-/// Hand the place to Studio. Errors when Studio is not installed.
-pub fn open_place(place: &Place) -> io::Result<()> {
-    crate::shell::open(&launch_uri(place))
+/// A link that opens one saved version of a published place, as Studio's version history does.
+/// Studio names that place "<name> (Version <n>)", with place ID 0.
+pub fn revision_uri(place: &Place, version: u64) -> String {
+    format!(
+        "roblox-studio:1+launchmode:edit+task:EditPlaceRevision+placeId:{}+universeId:{}+placeVersion:{version}",
+        place.place_id, place.universe_id
+    )
 }
+
+/// An empty place with a baseplate and a spawn, written for Rojo Manager, as an XML place file.
+pub const BASEPLATE: &str = include_str!("baseplate.rbxlx");
 
 #[cfg(test)]
 mod tests {
@@ -203,15 +286,22 @@ mod tests {
             launch_uri(&Place { place_id: 2, universe_id: 1 }),
             "roblox-studio:1+launchmode:edit+task:EditPlace+placeId:2+universeId:1"
         );
+        // Checked in Studio: it opens the revision as "<name> (Version 3)".
+        assert_eq!(
+            revision_uri(&Place { place_id: 2, universe_id: 1 }, 3),
+            "roblox-studio:1+launchmode:edit+task:EditPlaceRevision+placeId:2+universeId:1+placeVersion:3"
+        );
     }
 
     #[test]
     fn studio_mcp_servers_are_recognized_by_name_or_command() {
-        let mcp = Some("robloxstudio-mcp");
+        let mcp = Some(StudioMcp::RobloxstudioMcp);
         assert_eq!(studio_server("tools", &json!({"command": "C:/bin/robloxstudio-mcp.exe"})), mcp);
         assert_eq!(studio_server("Roblox_Studio", &json!({})), mcp);
         let built_in = json!({"command": r"C:\Users\a\AppData\Local/Roblox/mcp.bat"});
-        assert_eq!(studio_server("roblox-studio", &built_in), Some("Roblox Studio's built-in MCP"));
+        assert_eq!(studio_server("roblox-studio", &built_in), Some(StudioMcp::BuiltIn));
+        let exe = json!({"command": r"C:\Users\a\AppData\Local\Roblox\Versions\version-1\StudioMCP.exe"});
+        assert_eq!(studio_server("studio", &exe), Some(StudioMcp::BuiltIn));
         let own = json!({"command": r"C:\Roblox\RojoManager\RojoManagerMCP.exe"});
         assert_eq!(studio_server("rojo-manager", &own), None);
         assert_eq!(studio_server("blender", &json!({"command": "uvx", "args": ["blender-mcp"]})), None);

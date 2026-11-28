@@ -49,6 +49,8 @@ const PULL_BRIDGE: u64 = 13;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest unpublished place name kept from a bridge; local place files are much shorter.
 const MAX_PLACE_NAME: usize = 255;
+/// How long a file launch waits for its bridge to report, as long as open_place waits.
+const LAUNCH_CLAIM: Duration = Duration::from_secs(180);
 /// Rojo's port when its port field in Studio is empty.
 const ROJO_DEFAULT_PORT: u16 = 34872;
 /// Paths kept per kind of change in a pending sync, and characters kept per path.
@@ -157,11 +159,37 @@ pub struct Snapshot {
     pub mcp_path: String,
     /// Experiences (universe IDs) the window shows collapsed.
     pub collapsed: Vec<u64>,
-    /// Another Studio MCP set up in an agent ("robloxstudio in Codex"), while the Studio tools are on
-    /// and the window has not asked whether to keep them.
-    pub studio_tools_prompt: Option<String>,
+    /// The other Studio MCPs set up in agents, found at launch.
+    pub studio_mcps: Vec<studio::FoundMcp>,
+    /// Show the setup: the Studio plugin, adding Rojo Manager to agents, and which agent tools to
+    /// keep (Settings::TOOLS). Once per profile, new or updated, until finished or skipped.
+    pub setup: bool,
     /// Ask for a star on GitHub; see `star_due`.
     pub star_prompt: bool,
+    /// Studio windows open hidden that belong to no project, such as one an agent opened for a
+    /// place ID; the window offers to show them.
+    pub hidden_studios: Vec<HiddenStudio>,
+}
+
+/// A hidden Studio window that belongs to no project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HiddenStudio {
+    /// Its bridge's instanceId.
+    pub instance: String,
+    /// "place 123", or the name of an unpublished place.
+    pub place: String,
+}
+
+/// What an agent opens in Studio without a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StudioTarget {
+    Place(Place),
+    /// A saved version of a published place.
+    Revision(Place, u64),
+    /// A place file anywhere on this computer.
+    File(PathBuf),
+    /// A new empty place, kept in the places folder until Rojo Manager next starts.
+    Baseplate,
 }
 
 fn version() -> &'static str {
@@ -349,8 +377,10 @@ struct State {
     experiences: HashMap<u64, String>,
     /// Each project's backups, newest first; read from disk at launch and kept in step.
     backups: HashMap<String, Vec<Backup>>,
-    /// Another Studio MCP set up in an agent, found at launch.
-    other_studio_mcp: Option<String>,
+    /// The other Studio MCPs set up in agents, found at launch.
+    studio_mcps: Vec<studio::FoundMcp>,
+    /// The setup was due at launch, so the star prompt waits for another one: one question a run.
+    setup_this_run: bool,
     /// Studio's recent Output by place (ID, and name when unpublished), from its Edit DataModel and playtests.
     output: HashMap<(u64, Option<String>), VecDeque<OutputLine>>,
     output_seq: u64,
@@ -360,6 +390,62 @@ struct State {
     /// The Studio process each project's place was last opened hidden in, so it can be shown
     /// before its bridge reports.
     opened_hidden: HashMap<String, u32>,
+    /// Place files open_target opened without a project, until a bridge reports from them.
+    launched_files: Vec<LaunchedFile>,
+    /// What agents set on Studio windows before Rojo Manager last restarted, by bridge id, until
+    /// each bridge reports again (see studios.json).
+    restored: HashMap<u64, KeptStudio>,
+}
+
+/// What an agent set on one Studio window, kept in studios.json so a restart of Rojo Manager, such
+/// as for an update, keeps it while that Studio stays open.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct KeptStudio {
+    pid: Option<u32>,
+    idle_close: Option<u32>,
+    keep_cursor: Option<bool>,
+    file: Option<PathBuf>,
+}
+
+fn studios_path() -> PathBuf {
+    config::data_dir().join("studios.json")
+}
+
+/// Write what agents set on the Studio windows, with those still waiting to report after a restart.
+fn save_studios(state: &State) {
+    let mut kept = state.restored.clone();
+    for (id, report) in &state.bridges {
+        if report.idle_close.is_some() || report.keep_cursor.is_some() || report.file.is_some() {
+            let studio = KeptStudio {
+                pid: report.pid,
+                idle_close: report.idle_close,
+                keep_cursor: report.keep_cursor,
+                file: report.file.clone(),
+            };
+            kept.insert(*id, studio);
+        }
+    }
+    let _ = match kept.is_empty() {
+        true => std::fs::remove_file(studios_path()),
+        false => serde_json::to_vec(&kept).map_err(std::io::Error::other).and_then(|data| {
+            std::fs::create_dir_all(config::data_dir())?;
+            std::fs::write(studios_path(), data)
+        }),
+    };
+}
+
+/// The windows studios.json kept whose Studio still runs; the file is only for the next start.
+fn restore_studios() -> HashMap<u64, KeptStudio> {
+    let text = std::fs::read(studios_path()).unwrap_or_default();
+    let kept: HashMap<u64, KeptStudio> = serde_json::from_slice(&text).unwrap_or_default();
+    kept.into_iter().filter(|(_, studio)| studio.pid.is_some_and(studio_process::is_studio)).collect()
+}
+
+/// A place file Studio was asked to open, with its process when it was opened hidden.
+struct LaunchedFile {
+    path: PathBuf,
+    pid: Option<u32>,
+    at: Instant,
 }
 
 /// One line of Studio's Output, numbered across all places so a reader can ask for newer lines.
@@ -394,6 +480,25 @@ struct BridgeReport {
     closing: bool,
     /// Its Studio's window is hidden, as of its last poll.
     hidden: bool,
+    /// Minutes of nothing happening after which its Studio is closed, set by an agent for a Studio
+    /// whose place no project links (a project's own idle close applies to the others).
+    idle_close: Option<u32>,
+    /// Whether the agent that opened this Studio wants its hidden playtests to keep the user's
+    /// cursor; None when it did not say (see KeepCursor).
+    keep_cursor: Option<bool>,
+    /// The place file Rojo Manager opened in this Studio without a project, so an agent opening that
+    /// file again reuses this window and not one with another file of the same name.
+    file: Option<PathBuf>,
+}
+
+impl BridgeReport {
+    /// "place 123", or the name of an unpublished place.
+    fn describe(&self) -> String {
+        match &self.place_name {
+            Some(name) if self.place_id == 0 => name.clone(),
+            _ => format!("place {}", self.place_id),
+        }
+    }
 }
 
 /// What a bridge's poll says besides Rojo's state.
@@ -406,6 +511,11 @@ pub struct PollExtra {
 }
 
 impl State {
+    /// The project linked to the place a bridge reports, if any.
+    fn project_for(&self, place_id: u64, place_name: Option<&str>) -> Option<&config::Project> {
+        self.config.projects.iter().find(|p| p.place.as_ref().is_some_and(|place| place.matches(place_id, place_name)))
+    }
+
     /// The running server whose project auto-connects to this place: (project name, port).
     fn auto_connect_target(&self, place_id: u64, place_name: Option<&str>) -> Option<(String, u16)> {
         let project = self.config.projects.iter().find(|p| {
@@ -585,6 +695,18 @@ fn end_server(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// The baseplates open_target made, one file name a line, so the next start deletes those and no
+/// other .rbxlx file a user saves beside them.
+fn baseplate_list() -> PathBuf {
+    config::data_dir().join("places").join("baseplates.txt")
+}
+
+fn record_baseplate(name: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut list = std::fs::OpenOptions::new().create(true).append(true).open(baseplate_list())?;
+    writeln!(list, "{name}")
+}
+
 /// The project's local place file, which Rojo Manager made and which goes with the project.
 fn local_place(project: &config::Project) -> Option<PathBuf> {
     match &project.place {
@@ -601,7 +723,7 @@ impl Engine {
     /// An engine for settings loaded with `config::load`; `app_dir` holds the companion executables.
     pub fn new(config: Config, app_dir: PathBuf, emit: impl Fn(Event) + Send + Sync + 'static) -> Arc<Engine> {
         Arc::new(Engine {
-            state: Mutex::new(State { config, ..State::default() }),
+            state: Mutex::new(State { config, restored: restore_studios(), ..State::default() }),
             emit: Box::new(emit),
             app_dir,
             closing: AtomicBool::new(false),
@@ -615,8 +737,11 @@ impl Engine {
     pub fn run(self: &Arc<Self>) {
         let engine = Arc::clone(self);
         std::thread::spawn(move || engine.watch());
+        {
+            let mut state = self.lock();
+            state.setup_this_run = !state.config.setup_done;
+        }
         self.record_first_run();
-        self.sweep_places();
         {
             let mut state = self.lock();
             let names: Vec<String> = state.config.projects.iter().map(|p| p.name.clone()).collect();
@@ -637,8 +762,8 @@ impl Engine {
         self.look_up_experiences();
         let engine = Arc::clone(self);
         std::thread::spawn(move || {
-            let found = studio::other_studio_mcp();
-            engine.lock().other_studio_mcp = found;
+            let found = studio::studio_mcps();
+            engine.lock().studio_mcps = found;
             engine.changed();
         });
         let names: Vec<String> =
@@ -776,10 +901,15 @@ impl Engine {
     pub fn snapshot(&self) -> Snapshot {
         let state = self.lock();
         let projects = state.config.projects.iter().filter_map(|p| Self::view(&state, &p.name)).collect();
-        let studio_tools_prompt = state
-            .other_studio_mcp
-            .clone()
-            .filter(|_| state.config.settings.studio_tools && !state.config.studio_tools_asked);
+        let setup = !state.config.setup_done;
+        let mut hidden_studios: Vec<(u64, HiddenStudio)> = state
+            .bridges
+            .iter()
+            .filter(|(id, report)| report.hidden && self.bridge_live(**id, report))
+            .filter(|(_, report)| state.project_for(report.place_id, report.place_name.as_deref()).is_none())
+            .map(|(id, report)| (*id, HiddenStudio { instance: id.to_string(), place: report.describe() }))
+            .collect();
+        hidden_studios.sort_by_key(|(id, _)| *id);
         Snapshot {
             version: crate::VERSION,
             projects,
@@ -807,9 +937,11 @@ impl Engine {
             studio_rojo_plugins: state.studio_rojo_plugins,
             mcp_path: self.app_dir.join(crate::executable("RojoManagerMCP")).display().to_string(),
             collapsed: state.config.collapsed.clone(),
+            studio_mcps: state.studio_mcps.clone(),
             // One question at a time.
-            star_prompt: studio_tools_prompt.is_none() && star_due(&state.config, unix_now()),
-            studio_tools_prompt,
+            star_prompt: !state.setup_this_run && star_due(&state.config, unix_now()),
+            setup,
+            hidden_studios: hidden_studios.into_iter().map(|(_, studio)| studio).collect(),
         }
     }
 
@@ -1225,23 +1357,48 @@ impl Engine {
                 (false, before, reported) => before.or(reported).unwrap_or(now),
             };
             let closing = before.is_some_and(|report| report.closing);
-            let idle_close = state.config.settings.idle_close;
-            let project = state
-                .config
-                .projects
-                .iter()
-                .find(|p| p.place.as_ref().is_some_and(|place| place.matches(place_id, place_name.as_deref())))
-                .map(|p| (p.name.clone(), p.idle_close.filter(|_| idle_close)));
+            // A bridge that reported before Rojo Manager restarted gets back what an agent set on it.
+            let restored = if before.is_none() { state.restored.remove(&id) } else { None };
+            let before = state.bridges.get(&id);
+            let own_idle_close =
+                before.and_then(|report| report.idle_close).or(restored.as_ref().and_then(|r| r.idle_close));
+            let keep_cursor =
+                before.and_then(|report| report.keep_cursor).or(restored.as_ref().and_then(|r| r.keep_cursor));
+            // A bridge without a file claims the file launch it came from: by its process, on any poll
+            // once that is known; a launch without a process (off Windows) only by a new bridge with
+            // the file name Studio gives the place.
+            let known = before.and_then(|report| report.file.clone()).or(restored.and_then(|r| r.file));
+            let (claimed, new, had_file) = (known.clone(), before.is_none(), known.is_some());
+            let file = claimed.or_else(|| {
+                let name = place_name.as_deref().filter(|_| place_id == 0);
+                let launched = |launch: &LaunchedFile| {
+                    let ours = match launch.pid {
+                        Some(launched) => pid == Some(launched),
+                        None => new,
+                    };
+                    ours && launch.at.elapsed() < LAUNCH_CLAIM
+                        && launch.path.file_name().is_some_and(|file| Some(&*file.to_string_lossy()) == name)
+                };
+                let index = state.launched_files.iter().position(launched);
+                index.map(|index| state.launched_files.remove(index).path)
+            });
+            let project = state.project_for(place_id, place_name.as_deref()).map(|p| (p.name.clone(), p.idle_close));
             // The bridge names the process from here on, so the one remembered from opening the
             // place hidden is dropped before that number can come to mean another Studio.
             if let (Some(_), Some((name, _))) = (pid, &project) {
                 state.opened_hidden.remove(name);
             }
+            let minutes = match &project {
+                Some((_, minutes)) => *minutes,
+                None => own_idle_close,
+            };
             // A Studio running a command is in use, however long ago its last one came.
-            let idle = project.and_then(|(name, minutes)| Some((name, minutes?))).filter(|(_, minutes)| {
+            let idle = minutes.filter(|minutes| {
                 let limit = Duration::from_secs(u64::from(*minutes) * 60);
-                !closing && active.elapsed() >= limit && !self.link.busy(id)
+                state.config.settings.idle_close && !closing && active.elapsed() >= limit && !self.link.busy(id)
             });
+            let name = project.map(|(name, _)| name);
+            let idle = idle.map(|minutes| (name.clone(), minutes));
             // Only a bridge that says how long its Studio has been idle (13 and later) has it
             // closed: an older one's edits and syncs go unseen here, so its user is told instead.
             let (idle, outdated) = if extra.idle.is_some() { (idle, None) } else { (None, idle) };
@@ -1256,10 +1413,19 @@ impl Engine {
                 active,
                 closing: closing || idle.is_some() || outdated.is_some(),
                 hidden,
+                idle_close: own_idle_close,
+                keep_cursor,
+                file,
             };
-            (target, state.bridges.insert(id, report), state.config.settings.auto_connect_accept, idle, outdated)
+            let claimed_now = !had_file && report.file.is_some();
+            let previous = state.bridges.insert(id, report);
+            if claimed_now {
+                save_studios(&state);
+            }
+            (target, previous, state.config.settings.auto_connect_accept, idle, outdated)
         };
         if let Some((name, _)) = outdated {
+            let name = name.unwrap_or_else(|| "A Studio opened by an agent".into());
             self.alert(format!(
                 "{name}: its Studio looks idle but stays open, because its bridge is too old to tell. Restart that \
                  Studio to load the new bridge."
@@ -1273,7 +1439,7 @@ impl Engine {
         }
         if let Some((name, minutes)) = idle {
             let engine = Arc::clone(self);
-            std::thread::spawn(move || engine.close_idle(&name, id, minutes));
+            std::thread::spawn(move || engine.close_idle(name.as_deref(), id, minutes));
             return None; // no auto-connect for a Studio that is closing
         }
         let offered_before = previous.as_ref().and_then(|report| report.offered);
@@ -1320,8 +1486,10 @@ impl Engine {
         report.seen.elapsed() < BRIDGE_TTL || self.link.busy(id)
     }
 
-    /// The Studio windows whose bridge polled recently: {instanceId, placeId, placeName, rojo, hidden},
-    /// with placeName only for an unpublished place and hidden only when its window is.
+    /// The Studio windows whose bridge polled recently: {instanceId, placeId, placeName, rojo, hidden,
+    /// idleClose, keepCursor, file}, with placeName only for an unpublished place, hidden only when its
+    /// window is, idleClose and keepCursor only when an agent set them for this window, and file only
+    /// for a place file Rojo Manager opened in it.
     pub fn studio_instances(&self) -> Vec<Value> {
         let state = self.lock();
         let live = state.bridges.iter().filter(|(id, report)| self.bridge_live(**id, report));
@@ -1335,18 +1503,152 @@ impl Engine {
             if report.hidden {
                 instance["hidden"] = json!(true);
             }
+            if let Some(minutes) = report.idle_close {
+                instance["idleClose"] = json!(minutes);
+            }
+            if let Some(keep) = report.keep_cursor {
+                instance["keepCursor"] = json!(keep);
+            }
+            if let Some(file) = &report.file {
+                instance["file"] = json!(file);
+            }
             instance
         };
         instances.into_iter().map(instance).collect()
     }
 
-    /// Run a command in one Studio window through its bridge and wait for the result.
-    pub fn studio_command(&self, instance: &str, action: &str, args: Value) -> Result<Value, ControlError> {
+    /// The live bridge an agent's instanceId names.
+    fn live_bridge(&self, instance: &str) -> Result<u64, ControlError> {
         let id = instance
             .parse::<u64>()
             .ok()
             .filter(|id| self.lock().bridges.get(id).is_some_and(|report| self.bridge_live(*id, report)));
-        let id = id.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))?;
+        id.ok_or_else(|| ControlError::new(format!("No Studio window has instanceId {instance}"), 404))
+    }
+
+    /// The Studio process of a live bridge, checked to still be Studio.
+    fn bridge_process(&self, instance: &str) -> Result<(u64, u32), ControlError> {
+        let id = self.live_bridge(instance)?;
+        let pid =
+            self.lock().bridges.get(&id).and_then(|report| report.pid).filter(|pid| studio_process::is_studio(*pid));
+        let pid = pid.ok_or_else(|| ControlError::new("The Studio process of that window was not found", 409))?;
+        Ok((id, pid))
+    }
+
+    /// Open a Studio without a project. With `hidden`, it shows no window (Windows only); one whose
+    /// bridge has not reported in 3 minutes is shown, as something there, such as a dialog, may need
+    /// the user. Answers the place file it opened, for a file or a baseplate.
+    pub fn open_target(self: &Arc<Self>, target: StudioTarget, hidden: bool) -> Result<Option<PathBuf>, String> {
+        let (link, file) = match target {
+            StudioTarget::Place(place) => (studio::launch_uri(&place), None),
+            StudioTarget::Revision(place, version) => (studio::revision_uri(&place, version), None),
+            StudioTarget::File(path) => (path.to_string_lossy().into_owned(), Some(path)),
+            StudioTarget::Baseplate => {
+                let folder = config::data_dir().join("places");
+                let name = format!("{}x", LocalPlace::new("Baseplate").file); // .rbxlx, an XML place
+                std::fs::create_dir_all(&folder).map_err(|e| format!("Could not make {}: {e}", folder.display()))?;
+                let path = folder.join(&name);
+                std::fs::write(&path, studio::BASEPLATE).map_err(|e| format!("Could not write {name}: {e}"))?;
+                record_baseplate(&name).map_err(|e| format!("Could not record {name}: {e}"))?;
+                (path.to_string_lossy().into_owned(), Some(path))
+            }
+        };
+        if let Some(path) = &file {
+            // As in open_studio: only a stale lock, left by a Studio closed by force, goes.
+            let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+        }
+        let pid = studio_process::open(&link, hidden).map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
+        if let Some(path) = &file {
+            let mut state = self.lock();
+            state.launched_files.retain(|launch| launch.at.elapsed() < LAUNCH_CLAIM);
+            state.launched_files.push(LaunchedFile { path: path.clone(), pid, at: Instant::now() });
+        }
+        if let Some(pid) = pid.filter(|_| hidden) {
+            let engine = Arc::clone(self);
+            std::thread::spawn(move || {
+                let reported = || engine.lock().bridges.values().any(|report| report.pid == Some(pid));
+                if !engine.wait_until(Duration::from_secs(180), reported) && studio_process::is_studio(pid) {
+                    let _ = studio_process::set_hidden(pid, false);
+                }
+            });
+        }
+        Ok(file)
+    }
+
+    /// Hide or show one Studio window.
+    pub fn set_studio_hidden(&self, instance: &str, hidden: bool) -> Result<(), ControlError> {
+        let (id, pid) = self.bridge_process(instance)?;
+        studio_process::set_hidden(pid, hidden).map_err(|e| ControlError::new(e, 409))?;
+        if let Some(report) = self.lock().bridges.get_mut(&id) {
+            report.hidden = hidden;
+            report.active = Instant::now();
+        }
+        self.changed();
+        Ok(())
+    }
+
+    /// Close one Studio window by force, disconnecting its Rojo first. Unsaved changes are lost.
+    pub fn close_studio(&self, instance: &str) -> Result<(), ControlError> {
+        let (id, pid) = self.bridge_process(instance)?;
+        let _ = self.link.run(id, "disconnect", json!({}), Duration::from_secs(5));
+        studio_process::close(pid)
+            .map_err(|e| ControlError::new(format!("Could not close Studio (process {pid}): {e}"), 500))?;
+        {
+            let mut state = self.lock();
+            state.bridges.remove(&id);
+            save_studios(&state);
+        }
+        self.changed();
+        Ok(())
+    }
+
+    /// Close one Studio window after `minutes` with nothing happening in it; 0 turns that off. Only
+    /// for a Studio whose place no project links: a project's own idle close covers the others.
+    pub fn set_studio_idle(&self, instance: &str, minutes: u64) -> Result<(), ControlError> {
+        let id = self.live_bridge(instance)?;
+        let mut state = self.lock();
+        if minutes > 0 && !state.config.settings.idle_close {
+            return Err(ControlError::new("Idle close is turned off in Rojo Manager's Settings.", 403));
+        }
+        let minutes = u32::try_from(minutes).ok().filter(|m| *m <= config::MAX_IDLE_CLOSE);
+        let minutes = minutes.ok_or_else(|| ControlError::bad("idle_close must be 0 to 10080 minutes"))?;
+        let Some(report) = state.bridges.get(&id) else { return Err(ControlError::new("That Studio closed", 404)) };
+        if let Some(project) = state.project_for(report.place_id, report.place_name.as_deref()) {
+            return Err(ControlError::new(
+                format!("That Studio has {}'s place open; set idle_close on the project instead.", project.name),
+                409,
+            ));
+        }
+        if let Some(report) = state.bridges.get_mut(&id) {
+            report.idle_close = (minutes > 0).then_some(minutes);
+            report.active = Instant::now();
+        }
+        save_studios(&state);
+        Ok(())
+    }
+
+    /// Record whether the agent wants this Studio's hidden playtests to keep the user's cursor. The
+    /// keep_cursor setting decides whether that counts.
+    pub fn set_studio_keep_cursor(&self, instance: &str, keep: bool) -> Result<(), ControlError> {
+        let id = self.live_bridge(instance)?;
+        let mut state = self.lock();
+        let report = state.bridges.get_mut(&id).ok_or_else(|| ControlError::new("That Studio closed", 404))?;
+        report.keep_cursor = Some(keep);
+        save_studios(&state);
+        Ok(())
+    }
+
+    /// Whether playtests in this hidden Studio process keep the user's cursor: the keep_cursor
+    /// setting, with the choice of the agent that opened it when the setting leaves it to agents.
+    pub fn keeps_cursor(&self, pid: u32) -> bool {
+        let state = self.lock();
+        let agent = state.bridges.values().find(|report| report.pid == Some(pid)).and_then(|r| r.keep_cursor);
+        state.config.settings.keep_cursor.keeps(agent)
+    }
+
+    /// Run a command in one Studio window through its bridge and wait for the result.
+    pub fn studio_command(&self, instance: &str, action: &str, args: Value) -> Result<Value, ControlError> {
+        let id = self.live_bridge(instance)?;
         let timeout = match action {
             "luau" => LUAU_TIMEOUT,
             // The bridge waits up to 30 seconds for Rojo to connect.
@@ -1395,18 +1697,26 @@ impl Engine {
         Ok(pids.len())
     }
 
-    /// Close the Studio of the idle bridge `id` after `minutes` with nothing happening in it, and
-    /// stop its project's server unless it autostarts or another Studio is connected to it. The
-    /// project, its place, and other Studios with the place open stay.
-    fn close_idle(self: &Arc<Self>, name: &str, id: u64, minutes: u32) {
-        let (project, pid) = {
+    /// Close the Studio of the idle bridge `id` after `minutes` with nothing happening in it. For a
+    /// project's place, also stop the project's server unless it autostarts or another Studio is
+    /// connected to it; the project, its place, and other Studios with the place open stay.
+    fn close_idle(self: &Arc<Self>, name: Option<&str>, id: u64, minutes: u32) {
+        let (project, pid, place) = {
             let state = self.lock();
-            (state.config.project(name).cloned(), state.bridges.get(&id).and_then(|report| report.pid))
+            let report = state.bridges.get(&id);
+            let place = report.map(BridgeReport::describe).unwrap_or_default();
+            (name.and_then(|name| state.config.project(name).cloned()), report.and_then(|report| report.pid), place)
         };
-        let Some(project) = project else { return };
+        if name.is_some() && project.is_none() {
+            return; // removed meanwhile
+        }
+        let (label, closed) = match name {
+            Some(name) => (format!("{name}: its Studio"), format!("{name}: closed its Studio")),
+            None => (format!("Studio with {place}"), format!("Closed Studio with {place}")),
+        };
         let Some(pid) = pid else {
             // Said once: the bridge stays marked as closing.
-            return self.alert(format!("{name}: its Studio is idle, but its process was not found to close it."));
+            return self.alert(format!("{label} is idle, but its process was not found to close it."));
         };
         // Rojo is disconnected first, so the server it leaves does not see a dropped connection.
         let _ = self.link.run(id, "disconnect", json!({}), Duration::from_secs(5));
@@ -1415,19 +1725,19 @@ impl Engine {
                 let connected = {
                     let mut state = self.lock();
                     state.bridges.remove(&id);
-                    state.bridges.values().any(|report| report.port == project.port)
+                    project.as_ref().is_some_and(|p| state.bridges.values().any(|report| report.port == p.port))
                 };
-                if !project.autostart && !connected {
-                    self.stop(name);
+                if let Some(project) = project.filter(|p| !p.autostart && !connected) {
+                    self.stop(&project.name);
                 }
-                self.notice(format!("{name}: closed its Studio after {minutes} min idle"));
+                self.notice(format!("{closed} after {minutes} min idle"));
             }
             Err(error) => {
                 if let Some(report) = self.lock().bridges.get_mut(&id) {
                     report.closing = false;
                     report.active = Instant::now(); // try again after another idle period
                 }
-                self.alert(format!("{name}: {error}"));
+                self.alert(format!("{label}: {error}"));
             }
         }
         self.changed();
@@ -1908,13 +2218,12 @@ impl Engine {
         });
     }
 
-    /// The answer to the window's question, asked once when another Studio MCP is set up: whether
-    /// agents keep Rojo Manager's Studio tools as well.
-    pub fn answer_studio_tools(&self, keep: bool) -> Result<(), String> {
+    /// The window's setup was finished or skipped; it is not shown again. What it set up (the bridge,
+    /// agents, tool settings) was done as it went.
+    pub fn finish_setup(&self) -> Result<(), String> {
         let mut state = self.lock();
         let mut config = state.config.clone();
-        config.settings.studio_tools = keep;
-        config.studio_tools_asked = true;
+        config.setup_done = true;
         config::save(&config)?;
         state.config = config;
         drop(state);
@@ -2068,16 +2377,42 @@ impl Engine {
     }
 
     /// Delete place files in the places folder that no project links, left by a crash or an unlink,
-    /// with the .rbxl.lock files Studio leaves beside them when it is closed by force.
-    fn sweep_places(&self) {
+    /// and the baseplates agents opened, with the .lock files Studio leaves beside them when it is
+    /// closed by force. A file Studio still has open keeps its lock held, so it stays. Run once at
+    /// launch, before the control server starts.
+    pub fn sweep_places(&self) {
         let linked: HashSet<PathBuf> = self.lock().config.projects.iter().filter_map(local_place).collect();
+        let list = baseplate_list();
+        let baseplates = std::fs::read_to_string(&list).unwrap_or_default();
+        let baseplates: HashSet<&str> = baseplates.lines().filter(|line| !line.is_empty()).collect();
         let Ok(entries) = std::fs::read_dir(config::data_dir().join("places")) else { return };
         for path in entries.flatten().map(|entry| entry.path()) {
             let place = path.to_string_lossy().strip_suffix(".lock").map(PathBuf::from).unwrap_or_else(|| path.clone());
-            if place.extension().is_some_and(|ext| ext == "rbxl") && !linked.contains(&place) {
-                let _ = std::fs::remove_file(path);
+            // Local places are .rbxl; of .rbxlx files only the baseplates open_target recorded, so a
+            // place saved beside one stays.
+            let name = place.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            let ours = place.extension().is_some_and(|ext| ext == "rbxl") || baseplates.contains(name.as_str());
+            if !ours || linked.contains(&place) {
+                continue;
             }
+            let lock = PathBuf::from(format!("{}.lock", place.display()));
+            if lock.exists() && std::fs::remove_file(&lock).is_err() {
+                continue;
+            }
+            let _ = std::fs::remove_file(path);
         }
+        let left: Vec<&str> = baseplates.into_iter().filter(|name| list.with_file_name(name).exists()).collect();
+        let _ = match left.is_empty() {
+            true => std::fs::remove_file(&list),
+            false => std::fs::write(
+                &list,
+                left.join(
+                    "
+",
+                ) + "
+",
+            ),
+        };
     }
 
     fn remove_project(&self, name: &str) -> Result<(), String> {
@@ -2156,7 +2491,7 @@ impl Engine {
             }
         };
         let pid = studio_process::open(&target, hidden).map_err(|e| format!("Could not open Roblox Studio: {e}"))?;
-        if let Some(pid) = pid {
+        if let Some(pid) = pid.filter(|_| hidden) {
             self.lock().opened_hidden.insert(name.to_string(), pid);
         }
         Ok(place)
@@ -2340,6 +2675,18 @@ impl Engine {
 
     pub fn settings(&self) -> Settings {
         self.lock().config.settings
+    }
+
+    /// Change the keep_cursor setting; only the window does, never an agent.
+    pub fn set_keep_cursor(&self, choice: config::KeepCursor) -> Result<(), String> {
+        let mut state = self.lock();
+        let mut config = state.config.clone();
+        config.settings.keep_cursor = choice;
+        config::save(&config)?;
+        state.config = config;
+        drop(state);
+        self.changed();
+        Ok(())
     }
 
     // ------------------------------------------------------------- checks and tool jobs
@@ -2760,6 +3107,13 @@ impl ControlHandler for Control {
     fn settings(&self, changes: Option<&Map<String, Value>>) -> Result<Value, ControlError> {
         if let Some(changes) = changes {
             for (key, value) in changes {
+                // Checked first: keep_cursor is not one of the on/off KEYS.
+                if Settings::USER_ONLY.contains(&key.as_str()) {
+                    return Err(ControlError::new(
+                        format!("{key} is the user's to change, in Rojo Manager's Settings."),
+                        403,
+                    ));
+                }
                 if key != "launch_at_startup" && !Settings::KEYS.contains(&key.as_str()) {
                     let keys = Settings::KEYS.join(", ");
                     return Err(ControlError::bad(format!(
@@ -2768,12 +3122,6 @@ impl ControlHandler for Control {
                 }
                 if !value.is_boolean() {
                     return Err(ControlError::bad(format!("{key} must be true or false")));
-                }
-                if key == "idle_close" {
-                    return Err(ControlError::new(
-                        "idle_close is the user's to change, in Rojo Manager's Settings.",
-                        403,
-                    ));
                 }
             }
             for (key, value) in changes {
@@ -2788,6 +3136,13 @@ impl ControlHandler for Control {
 
     fn save_capture(&self, id: u64, data: String) {
         self.0.save_capture(id, data);
+    }
+
+    fn keep_cursor(&self, connection: Option<(u16, u16)>) -> bool {
+        let pid = connection
+            .and_then(|(client, server)| localnet::connection_owner(client, server))
+            .filter(|pid| studio_process::is_studio(*pid) && studio_process::hidden(*pid) == Some(true));
+        pid.is_some_and(|pid| self.0.keeps_cursor(pid))
     }
 
     fn poll_bridge(&self, id: u64, poll: BridgePoll, connection: Option<(u16, u16)>) -> Value {
@@ -2816,9 +3171,32 @@ impl ControlHandler for Control {
             return Ok(json!({ "bridge": installed, "instances": self.0.studio_instances() }));
         };
         let action = body.get("action").and_then(Value::as_str).unwrap_or_default();
-        if action == "output" {
-            let (since, count, level) = parse_output_query(body)?;
-            return self.0.studio_output(instance, since, level, count);
+        // Done by Rojo Manager itself; the rest is passed to the bridge.
+        match action {
+            "output" => {
+                let (since, count, level) = parse_output_query(body)?;
+                return self.0.studio_output(instance, since, level, count);
+            }
+            "show" | "hide" => {
+                self.0.set_studio_hidden(instance, action == "hide")?;
+                return Ok(json!({}));
+            }
+            "close" => {
+                self.0.close_studio(instance)?;
+                self.0.notice("Studio closed by an agent");
+                return Ok(json!({ "closed": instance }));
+            }
+            "idle-close" => {
+                let minutes = body.get("minutes").and_then(Value::as_u64);
+                self.0.set_studio_idle(instance, minutes.ok_or_else(|| ControlError::bad("Pass minutes"))?)?;
+                return Ok(json!({}));
+            }
+            "keep-cursor" => {
+                let keep = body.get("keep").and_then(Value::as_bool);
+                self.0.set_studio_keep_cursor(instance, keep.ok_or_else(|| ControlError::bad("Pass keep"))?)?;
+                return Ok(json!({ "setting": self.0.settings().keep_cursor }));
+            }
+            _ => {}
         }
         let valid = match action {
             "status" | "disconnect" | "accept" | "abort" => true,
@@ -2829,10 +3207,49 @@ impl ControlHandler for Control {
         if !valid {
             return Err(ControlError::bad(
                 "Pass action status, disconnect, accept, abort, connect (with port), luau (with code), output, \
-                 show, or hide",
+                 show, hide, close, idle-close (with minutes), or keep-cursor (with keep)",
             ));
         }
         self.0.studio_command(instance, action, Value::Object(body.clone()))
+    }
+
+    fn open_studio(&self, body: &Map<String, Value>) -> Result<Value, ControlError> {
+        let hidden = match body.get("hidden") {
+            None | Some(Value::Null) => false,
+            Some(value) => value.as_bool().ok_or_else(|| ControlError::bad("hidden must be a bool"))?,
+        };
+        let id = |key: &str| body.get(key).and_then(Value::as_u64).filter(|id| *id > 0);
+        let target = match (body.get("file"), body.get("baseplate"), id("placeId"), id("universeId")) {
+            (Some(file), None, None, None) => {
+                let path = PathBuf::from(file.as_str().unwrap_or_default());
+                let place = path.extension().is_some_and(|ext| ext == "rbxl" || ext == "rbxlx");
+                if !path.is_absolute() || !place || !path.is_file() {
+                    return Err(ControlError::new(
+                        format!("No .rbxl or .rbxlx file at {}. Pass an absolute path.", path.display()),
+                        404,
+                    ));
+                }
+                StudioTarget::File(path)
+            }
+            (None, Some(Value::Bool(true)), None, None) => StudioTarget::Baseplate,
+            (None, None, Some(place_id), Some(universe_id)) => {
+                let place = Place { place_id, universe_id };
+                match body.get("version") {
+                    None | Some(Value::Null) => StudioTarget::Place(place),
+                    Some(version) => {
+                        let version = version.as_u64().filter(|v| *v > 0);
+                        StudioTarget::Revision(
+                            place,
+                            version.ok_or_else(|| ControlError::bad("version must be 1 or more"))?,
+                        )
+                    }
+                }
+            }
+            _ => return Err(ControlError::bad("Pass one of: file, baseplate true, or placeId and universeId")),
+        };
+        let file = self.0.open_target(target, hidden).map_err(|e| ControlError::new(e, 500))?;
+        self.0.notice("Studio opened by an agent");
+        Ok(json!({ "file": file }))
     }
 
     fn updates(&self, install: Option<&str>) -> Result<Value, ControlError> {
@@ -3078,11 +3495,18 @@ mod tests {
         std::fs::write(&stray, "left by a crash").unwrap();
         let lock = place.path().with_file_name("Stray-00000000.rbxl.lock");
         std::fs::write(&lock, "left by a force-closed Studio").unwrap();
+        // An agent's baseplate goes; a place the user saved beside it stays.
+        let baseplate = place.path().with_file_name("Baseplate-00000000.rbxlx");
+        std::fs::write(&baseplate, "baseplate").unwrap();
+        record_baseplate("Baseplate-00000000.rbxlx").unwrap();
+        let saved = place.path().with_file_name("Baseplate-deadbeef.rbxlx");
+        std::fs::write(&saved, "saved with Save As").unwrap();
         std::fs::remove_dir_all(&lane_folder).unwrap();
         engine.end_orphaned_lanes();
         assert!(engine.project("MyGame 2").is_none() && !place.path().exists());
         engine.sweep_places();
-        assert!(!stray.exists() && !lock.exists());
+        assert!(!stray.exists() && !lock.exists() && !baseplate.exists());
+        assert!(saved.exists() && !baseplate_list().exists());
     }
 
     #[test]
@@ -3163,6 +3587,74 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_gives_idle_close_to_a_studio_without_a_project() {
+        let (engine, alerts) = idle_close_engine();
+        let report = |id, place_id, idle| {
+            engine.report_bridge(
+                id,
+                place_id,
+                None,
+                0,
+                json!({}),
+                PollExtra { idle: Some(idle), ..PollExtra::default() },
+            )
+        };
+        report(7, 100, 0);
+        report(8, 200, 0);
+        // The project's own idle close covers the Studio with its place.
+        assert_eq!(engine.set_studio_idle("7", 5).unwrap_err().status, 409);
+        engine.set_studio_idle("8", 1).unwrap();
+        assert_eq!(engine.studio_instances()[1]["idleClose"], 1);
+        // Setting it counts from then.
+        engine.lock().bridges.get_mut(&8).unwrap().active =
+            Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+        report(8, 200, 61);
+        // Its process is unknown here, so closing it fails, and the user is told.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alerts.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            *alerts.lock().unwrap(),
+            ["Studio with place 200 is idle, but its process was not found to close it."]
+        );
+        engine.lock().config.settings.idle_close = false;
+        assert_eq!(engine.set_studio_idle("8", 5).unwrap_err().status, 403);
+    }
+
+    #[test]
+    fn a_new_bridge_claims_the_file_launch_it_came_from_once() {
+        let (engine, _) = idle_close_engine();
+        // Built from parts so the file name splits off on every platform.
+        let path = Path::new("Places").join("B").join("Lobby.rbxl");
+        engine.lock().launched_files.push(LaunchedFile { path: path.clone(), pid: None, at: Instant::now() });
+        let report = |id| engine.report_bridge(id, 0, Some("Lobby.rbxl".into()), 0, json!({}), PollExtra::default());
+        report(7);
+        report(8); // another Lobby.rbxl, such as one the user opened: not the launched file
+        let files: Vec<Value> = engine.studio_instances().iter().map(|instance| instance["file"].clone()).collect();
+        assert_eq!(files, [json!(path), Value::Null]);
+        assert!(engine.lock().launched_files.is_empty());
+        // A launch whose process is known goes only to a bridge from that process, so another
+        // window with a file of the same name, reporting first, does not take it.
+        engine.lock().launched_files.push(LaunchedFile { path: path.clone(), pid: Some(4242), at: Instant::now() });
+        report(9);
+        assert_eq!(engine.studio_instances()[2]["file"], Value::Null);
+        assert_eq!(engine.lock().launched_files.len(), 1);
+        // After a restart of Rojo Manager, a bridge that reports again gets back what an agent set.
+        let kept = KeptStudio { pid: None, idle_close: Some(30), keep_cursor: Some(false), file: Some(path.clone()) };
+        engine.lock().restored.insert(10, kept);
+        report(10);
+        let restored = &engine.studio_instances()[3];
+        assert_eq!((&restored["idleClose"], &restored["keepCursor"]), (&json!(30), &json!(false)));
+        assert_eq!(restored["file"], json!(path));
+        // Once a bridge's process is known, a later poll claims its launch.
+        engine.lock().bridges.get_mut(&9).unwrap().pid = Some(4242);
+        report(9);
+        assert_eq!(engine.studio_instances()[2]["file"], json!(path));
+        assert!(engine.lock().launched_files.is_empty());
+    }
+
+    #[test]
     fn idle_close_turned_off_in_settings_is_off_for_projects_and_agents() {
         let (engine, alerts) = idle_close_engine();
         engine.lock().config.settings.idle_close = false;
@@ -3181,6 +3673,9 @@ mod tests {
         let changes = json!({"idle_close": true});
         let error = Control(Arc::clone(&engine)).settings(changes.as_object()).unwrap_err();
         assert_eq!((error.status, engine.settings().idle_close), (403, false));
+        // Nor change keep_cursor, which only the user sets.
+        let changes = json!({"keep_cursor": "never"});
+        assert_eq!(Control(Arc::clone(&engine)).settings(changes.as_object()).unwrap_err().status, 403);
     }
 
     #[test]

@@ -22,17 +22,28 @@
 -- In Edit mode and in a playtest's server it also sends Studio's Output to Rojo Manager in small
 -- batches as lines appear, so agents can read prints, warnings, and errors. A playtest's client
 -- cannot make HTTP requests, so its Output stays in Studio.
+--
+-- In a Studio Rojo Manager hides, Studio moves the user's cursor to the hidden game view when a
+-- playtest's client starts with mouse lock on (first person, shift lock). So the playtest's server
+-- asks Rojo Manager whether its Studio is hidden (and the keep_cursor setting is on), and until it
+-- is shown, flags each player; the client then keeps an invisible modal button, which frees the mouse.
 
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local RunService = game:GetService("RunService")
 
-local VERSION = 13
+local VERSION = 14
 local POLL_URL = "http://localhost:34871/bridge/"
 local REPORT_URL = "http://localhost:34871/rojo-plugins/"
 local OUTPUT_URL = "http://localhost:34871/output"
 local BACKUP_URL = "http://localhost:34871/backup"
 local CAPTURE_URL = "http://localhost:34871/capture/"
+local KEEP_CURSOR_URL = "http://localhost:34871/keep-cursor"
+-- Set on each Player in a hidden Studio's playtest; the client then keeps a ScreenGui of this name
+-- in PlayerGui. Both exist only while the playtest runs.
+local KEEP_CURSOR_ATTRIBUTE = "RojoManagerKeepCursor"
+-- How often a hidden playtest's server asks whether its Studio has been shown.
+local HIDDEN_RECHECK_SECONDS = 2
 -- The largest backup or capture Rojo Manager accepts, base64 included.
 local MAX_BACKUP_BYTES = 64 * 1024 * 1024
 -- Marks each copy in a backup with the full name it had, so restore finds its parent.
@@ -712,14 +723,100 @@ local function forwardOutput(app, context: string)
 	outputs[app] = LogService.MessageOut:Connect(add)
 end
 
+-- Whether Rojo Manager says to keep the user's cursor: this Studio's window is hidden and its
+-- keep_cursor setting is on. nil when it does not answer.
+local function keepCursor(): boolean?
+	local ok, response = pcall(HttpService.RequestAsync, HttpService, { Url = KEEP_CURSOR_URL, Method = "GET" })
+	if not ok or not response.Success then
+		return nil
+	end
+	local decoded, answer = pcall(HttpService.JSONDecode, HttpService, response.Body)
+	return decoded and type(answer) == "table" and answer.keep == true
+end
+
+-- An invisible modal button: while it is in PlayerGui and enabled, Roblox keeps the mouse free.
+local function modalGui(): ScreenGui
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.fromOffset(0, 0)
+	button.BackgroundTransparency = 1
+	button.Text = ""
+	button.AutoButtonColor = false
+	button.Selectable = false
+	button.Modal = true
+	local screen = Instance.new("ScreenGui")
+	screen.Name = KEEP_CURSOR_ATTRIBUTE
+	screen.ResetOnSpawn = false
+	button.Parent = screen
+	return screen
+end
+
+-- In a playtest's server: while Rojo Manager says to keep the cursor, flag each player. Asked again
+-- every few seconds only while flagged; once the window is shown or the setting is off, the flags go.
+local function keepCursorWhileHidden()
+	if keepCursor() ~= true then
+		return
+	end
+	local players = game:GetService("Players")
+	local function flag(player: Player)
+		player:SetAttribute(KEEP_CURSOR_ATTRIBUTE, true)
+	end
+	local added = players.PlayerAdded:Connect(flag)
+	for _, player in players:GetPlayers() do
+		flag(player)
+	end
+	while keepCursor() ~= false do
+		task.wait(HIDDEN_RECHECK_SECONDS)
+	end
+	added:Disconnect()
+	for _, player in players:GetPlayers() do
+		player:SetAttribute(KEEP_CURSOR_ATTRIBUTE, nil)
+	end
+end
+
+-- In a playtest's client: while the local player is flagged, keep the modal button in PlayerGui, so
+-- mouse lock never starts and Studio leaves the user's cursor alone. The game's own UI code may clear
+-- PlayerGui or turn its ScreenGuis off, so a removed button is made again and a disabled one enabled.
+local function freeMouseWhileFlagged()
+	local players = game:GetService("Players")
+	local player = players.LocalPlayer or players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+	local playerGui = player:WaitForChild("PlayerGui")
+	local gui: ScreenGui? = nil
+	local function update()
+		local keep = player:GetAttribute(KEEP_CURSOR_ATTRIBUTE) == true
+		if keep and not gui then
+			local screen = modalGui()
+			gui = screen
+			screen:GetPropertyChangedSignal("Enabled"):Connect(function()
+				screen.Enabled = true
+			end)
+			screen.AncestryChanged:Connect(function()
+				if gui == screen and screen.Parent ~= playerGui then
+					gui = nil
+					task.defer(update)
+				end
+			end)
+			screen.Parent = playerGui
+		elseif not keep and gui then
+			local screen = gui
+			gui = nil
+			screen:Destroy()
+		end
+	end
+	player:GetAttributeChangedSignal(KEEP_CURSOR_ATTRIBUTE):Connect(update)
+	update()
+end
+
 local Bridge = {}
 
 -- Called from App:init. Only the Edit-mode plugin is controllable; it and a playtest's server
--- forward Output.
+-- forward Output. In a hidden Studio, a playtest also keeps the user's cursor where it is.
 function Bridge.attach(app)
 	if not RunService:IsEdit() then
 		if RunService:IsServer() then
+			task.spawn(keepCursorWhileHidden)
 			forwardOutput(app, "server")
+		else
+			task.spawn(freeMouseWhileFlagged)
 		end
 		return
 	end
