@@ -3625,7 +3625,8 @@ mod tests {
     #[test]
     fn a_new_bridge_claims_the_file_launch_it_came_from_once() {
         let (engine, _) = idle_close_engine();
-        let path = PathBuf::from("C:\\Places\\B\\Lobby.rbxl");
+        // Built from parts so the file name splits off on every platform.
+        let path = Path::new("Places").join("B").join("Lobby.rbxl");
         engine.lock().launched_files.push(LaunchedFile { path: path.clone(), pid: None, at: Instant::now() });
         let report = |id| engine.report_bridge(id, 0, Some("Lobby.rbxl".into()), 0, json!({}), PollExtra::default());
         report(7);
@@ -3649,7 +3650,7 @@ mod tests {
         // Once a bridge's process is known, a later poll claims its launch.
         engine.lock().bridges.get_mut(&9).unwrap().pid = Some(4242);
         report(9);
-        assert_eq!(engine.studio_instances()[2]["file"], json!("C:\\Places\\B\\Lobby.rbxl"));
+        assert_eq!(engine.studio_instances()[2]["file"], json!(path));
         assert!(engine.lock().launched_files.is_empty());
     }
 
