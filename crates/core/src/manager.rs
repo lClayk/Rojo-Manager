@@ -3271,9 +3271,12 @@ impl ControlHandler for Control {
         };
         // The servers need Rojo; installing the bridge installs it.
         let rojo = tooling::tool_version("Rojo", None).ok();
-        let state = self.0.lock();
+        let (plugins, setup_done) = {
+            let state = self.0.lock();
+            (state.studio_rojo_plugins, state.config.setup_done)
+        };
         // As in Settings: the bridge's count of running Rojo plugins, else whether the Creator Store copy is there.
-        let warning = match state.studio_rojo_plugins {
+        let warning = match plugins {
             Some(count) if installed && count > 1 => Some(
                 "Two Rojo plugins run in Studio. Ask the user to turn off the Creator Store Rojo under Plugins > Manage Plugins.",
             ),
@@ -3287,7 +3290,7 @@ impl ControlHandler for Control {
             "bridge": bridge,
             "rojo": rojo,
             "agents": studio::rojo_manager_agents(),
-            "setupDone": state.config.setup_done,
+            "setupDone": setup_done,
         });
         if let Some(warning) = warning {
             answer["warning"] = json!(warning);

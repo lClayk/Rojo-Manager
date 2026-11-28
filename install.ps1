@@ -7,6 +7,8 @@
 # Another folder: & ([scriptblock]::Create((irm <that url>))) -Path 'D:\Tools\RojoManager'
 param([string]$Path)
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 downloads and extracts far slower while it draws progress.
+$ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Without -Path: the running Rojo Manager's folder, so agents get the copy that is in use.
@@ -26,7 +28,9 @@ if (Test-Path -LiteralPath $app) {
     $zip = $release.assets | Where-Object name -like 'RojoManager-*-windows-x64.zip' | Select-Object -First 1
     $sums = $release.assets | Where-Object name -eq 'SHA256SUMS.txt' | Select-Object -First 1
     if (-not $zip -or -not $sums) { throw "Release $($release.tag_name) has no Windows download." }
-    $temp = Join-Path ([IO.Path]::GetTempPath()) "rojo-manager-install-$PID"
+    # Beside the destination, as Windows PowerShell 5.1 cannot move a folder to another drive.
+    New-Item -ItemType Directory -Force (Split-Path $Path) | Out-Null
+    $temp = Join-Path (Split-Path $Path) ".rojo-manager-install-$PID"
     New-Item -ItemType Directory -Force $temp | Out-Null
     try {
         Write-Host "Downloading $($zip.name)..."
@@ -35,25 +39,27 @@ if (Test-Path -LiteralPath $app) {
         $sumsFile = Join-Path $temp $sums.name
         Invoke-WebRequest $sums.browser_download_url -OutFile $sumsFile -UseBasicParsing
         $line = "^([0-9a-f]{64})\s+$([regex]::Escape($zip.name))$"
-        $expected = Get-Content $sumsFile | ForEach-Object { if ($_.Trim() -match $line) { $Matches[1] } }
-        $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+        $expected = Get-Content -LiteralPath $sumsFile | ForEach-Object { if ($_.Trim() -match $line) { $Matches[1] } }
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
         if (-not $expected -or $actual -ne $expected) { throw "$($zip.name) does not match SHA256SUMS.txt." }
-        Expand-Archive $archive $temp
+        Expand-Archive -LiteralPath $archive -DestinationPath $temp
         # The archive holds one RojoManager folder, which becomes $Path: an empty folder there is replaced.
         if (Test-Path -LiteralPath $Path) {
             if (Get-ChildItem -Force -LiteralPath $Path) { throw "$Path is not empty. Pass an empty or new folder with -Path." }
             Remove-Item -LiteralPath $Path
         }
-        New-Item -ItemType Directory -Force (Split-Path $Path) | Out-Null
         Move-Item -LiteralPath (Join-Path $temp 'RojoManager') -Destination $Path
     } finally {
-        Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force -LiteralPath $temp -ErrorAction SilentlyContinue
     }
     Write-Host "Installed Rojo Manager $($release.tag_name) in $Path"
 }
 
 Start-Process $app
 # Each agent's CLI registers the server itself; an old entry is replaced so a moved app is found.
+# Their exit codes say how it went: under Stop, Windows PowerShell 5.1 would end the script on the
+# first line they write to stderr, such as remove saying there was nothing to remove.
+$ErrorActionPreference = 'Continue'
 $added = @()
 foreach ($agent in @(@{ Name = 'Claude Code'; Cli = 'claude'; Scope = @('--scope', 'user') },
         @{ Name = 'Codex'; Cli = 'codex'; Scope = @() })) {
